@@ -32,7 +32,7 @@ pub fn generate_env_sh_content(vars: &[EffectiveVar]) -> String {
         }
     }
 
-    lines.push(format!("_ENVMGR_KEYS=\"{}\"", valid_keys.join(" ")));
+    lines.push(format!("export _ENVMGR_KEYS=\"{}\"", valid_keys.join(" ")));
     lines.push(String::new());
     lines.join("\n")
 }
@@ -64,11 +64,35 @@ pub fn build_bashrc_snippet() -> String {
          \x20   eval \"$({bin} export 2>/dev/null)\"\n\
          fi\n\
          envmgr() {{\n\
-         \x20   {bin} \"$@\"\n\
+         \x20   _ENVMGR_WRAPPER=1 {bin} \"$@\"\n\
          \x20   local _envmgr_ec=$?\n\
          \x20   eval \"$({bin} export 2>/dev/null)\"\n\
+         \x20   _ENVMGR_SYNC_MARKER=\"${{XDG_RUNTIME_DIR:-/tmp}}/.envmgr_sync_${{UID:-$(id -u)}}_$$\"\n\
+         \x20   touch \"$_ENVMGR_SYNC_MARKER\" 2>/dev/null\n\
          \x20   return $_envmgr_ec\n\
          }}\n\
+         export -f envmgr 2>/dev/null\n\
+         _envmgr_prompt_hook() {{\n\
+         \x20   local _sf=\"${{ENVMGR_CONFIG_DIR:-$HOME/.config/envmgr}}/state.enc\"\n\
+         \x20   if [ -f \"$_sf\" ]; then\n\
+         \x20       if [ ! -f \"${{_ENVMGR_SYNC_MARKER:-}}\" ] || [ \"$_sf\" -nt \"$_ENVMGR_SYNC_MARKER\" ]; then\n\
+         \x20           _ENVMGR_SYNC_MARKER=\"${{XDG_RUNTIME_DIR:-/tmp}}/.envmgr_sync_${{UID:-$(id -u)}}_$$\"\n\
+         \x20           touch \"$_ENVMGR_SYNC_MARKER\" 2>/dev/null\n\
+         \x20           eval \"$({bin} export 2>/dev/null)\"\n\
+         \x20       fi\n\
+         \x20   fi\n\
+         }}\n\
+         if [[ \"$(declare -p PROMPT_COMMAND 2>/dev/null)\" == \"declare -a\"* ]]; then\n\
+         \x20   case \" ${{PROMPT_COMMAND[*]}} \" in\n\
+         \x20       *\" _envmgr_prompt_hook \"*) ;;\n\
+         \x20       *) PROMPT_COMMAND+=(_envmgr_prompt_hook) ;;\n\
+         \x20   esac\n\
+         else\n\
+         \x20   case \";${{PROMPT_COMMAND:-}};\" in\n\
+         \x20       *\";_envmgr_prompt_hook;\"*) ;;\n\
+         \x20       *) PROMPT_COMMAND=\"_envmgr_prompt_hook${{PROMPT_COMMAND:+;$PROMPT_COMMAND}}\" ;;\n\
+         \x20   esac\n\
+         fi\n\
          {end}",
         start = BASHRC_START_MARKER,
         bin = bin,
@@ -323,6 +347,84 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&out3.stdout), "val_default");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_bashrc_snippet_includes_hook_and_exported_function() {
+        let snippet = build_bashrc_snippet();
+        assert!(snippet.contains("_ENVMGR_WRAPPER=1"));
+        assert!(snippet.contains("export -f envmgr"));
+        assert!(snippet.contains("_envmgr_prompt_hook"));
+        assert!(snippet.contains("PROMPT_COMMAND"));
+    }
+
+    #[test]
+    fn test_prompt_hook_sync_logic() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("envmgr_hook_test_{}", uniq));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let state_file = temp_dir.join("state.enc");
+        fs::write(&state_file, "initial").unwrap();
+
+        let marker = temp_dir.join(".sync_marker");
+
+        let bash_test = format!(
+            r#"
+            _ENVMGR_SYNC_MARKER="{marker}"
+            _sf="{state_file}"
+            eval_count=0
+
+            _mock_export() {{
+                eval_count=$((eval_count + 1))
+            }}
+
+            _envmgr_prompt_hook() {{
+                if [ -f "$_sf" ]; then
+                    if [ ! -f "${{_ENVMGR_SYNC_MARKER:-}}" ] || [ "$_sf" -nt "$_ENVMGR_SYNC_MARKER" ]; then
+                        touch "$_ENVMGR_SYNC_MARKER" 2>/dev/null
+                        _mock_export
+                    fi
+                fi
+            }}
+
+            # First prompt: should trigger initial sync
+            _envmgr_prompt_hook
+            [ "$eval_count" -eq 1 ] || exit 1
+
+            # Second prompt without file change: should NOT trigger sync
+            _envmgr_prompt_hook
+            [ "$eval_count" -eq 1 ] || exit 2
+
+            # Simulate modification in another terminal
+            sleep 0.05
+            touch "$_sf"
+
+            # Third prompt after file change: MUST trigger sync
+            _envmgr_prompt_hook
+            [ "$eval_count" -eq 2 ] || exit 3
+
+            # Fourth prompt without file change: should NOT trigger sync
+            _envmgr_prompt_hook
+            [ "$eval_count" -eq 2 ] || exit 4
+            "#,
+            marker = marker.display(),
+            state_file = state_file.display()
+        );
+
+        let status = Command::new("bash")
+            .arg("-c")
+            .arg(&bash_test)
+            .status()
+            .expect("bash should execute");
+        assert!(status.success());
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

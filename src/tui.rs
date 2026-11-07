@@ -128,7 +128,7 @@ impl App {
                 let effective = self.data.compute_effective_vars();
                 let _ = reload_shell_environment(&effective);
                 self.set_info(format!(
-                    "{} | Encrypted {} effective var(s) in state.enc & reloaded shell config",
+                    "{} | Encrypted {} effective var(s) in state.enc & synced shell environment",
                     action_desc, count
                 ));
             }
@@ -145,7 +145,7 @@ impl App {
                 match reload_shell_environment(&effective) {
                     Ok(()) => {
                         self.set_info(format!(
-                            "Reloaded .bashrc & shell environment ({} active variable(s) ready for session)",
+                            "Synced state.enc & shell environment ({} active variable(s) ready across sessions)",
                             count
                         ));
                     }

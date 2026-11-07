@@ -41,11 +41,27 @@ fn main() {
                         if let Err(e) = reload_shell_environment(&effective) {
                             eprintln!("Warning during shell verification: {}", e);
                         }
-                        println!(
-                            "Encrypted {} effective variable(s) in {} and reloaded ~/.bashrc",
-                            count,
-                            AppStateData::state_file_path().display()
-                        );
+                        let is_wrapped = std::env::var("_ENVMGR_WRAPPER").is_ok();
+                        if is_wrapped {
+                            println!(
+                                "Encrypted {} effective variable(s) in {} and reloaded active shell environment",
+                                count,
+                                AppStateData::state_file_path().display()
+                            );
+                        } else {
+                            println!(
+                                "Encrypted {} effective variable(s) in {}",
+                                count,
+                                AppStateData::state_file_path().display()
+                            );
+                            println!(
+                                "\nNotice: Active shell session has not loaded the envmgr shell hook.\n\
+                                 To apply variables to this active session, run:\n  \
+                                   source ~/.bashrc\n\
+                                 or:\n  \
+                                   eval \"$(envmgr export)\""
+                            );
+                        }
                     }
                     Err(e) => {
                         eprintln!("Error: {}", e);
