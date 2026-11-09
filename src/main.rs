@@ -85,7 +85,6 @@ fn main() {
                         "Not Configured"
                     }
                 );
-                println!("Default Vars   : {}", state.default_vars.len());
                 println!("Profiles ({})   :", state.profiles.len());
                 for (i, p) in state.profiles.iter().enumerate() {
                     let st = if p.enabled { "ON " } else { "OFF" };

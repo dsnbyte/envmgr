@@ -14,9 +14,8 @@
 ## Core Architecture Principles
 - **Keep it Lightweight**: Avoid adding heavy dependencies or large runtime frameworks (such as SQLite/C database engines). Maintain sub-millisecond startup, small binary size, and zero external runtime dependencies.
 - **Priority Resolution Rule**:
-  - `Default` variables serve as baseline values.
-  - Enabled profiles override `Default`.
-  - When multiple profiles are enabled, the profile highest in the list (index #1) takes precedence and overwrites duplicate keys from lower profiles.
+  - All variables belong to profiles. A predefined `default` profile is provided on initial setup and functions like any other profile (can be edited, renamed, deleted, or toggled).
+  - When multiple profiles are enabled, the profile highest in the list (index #1) takes precedence and overwrites duplicate keys from lower profiles. Reorder with `u` (up) and `d` (down).
 - **Encrypted State Storage & Runtime Shell Injection**:
   - All state (variables, keys, profiles, and Phase PAT tokens) is serialized as JSON and encrypted as a whole payload using **ChaCha20-Poly1305** AEAD (with a hardcoded master key in `src/model.rs`) into `~/.config/envmgr/state.enc` (or `$ENVMGR_CONFIG_DIR/state.enc`).
   - Never write plaintext variable names or values to disk or into `~/.bashrc`.

@@ -9,7 +9,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Row, Table, TableState, Wrap},
     Frame,
 };
 
@@ -61,13 +61,17 @@ pub enum Modal {
         var_idx: usize,
         var_key: String,
     },
+    EditProfile {
+        profile_idx: usize,
+        name: String,
+        error: Option<String>,
+    },
 }
 
 pub struct App {
     pub data: AppStateData,
     pub focus: FocusPane,
-    /// 0 = Default, 1..=N = profiles[idx - 1]
-    pub selected_target: usize,
+    pub selected_profile: usize,
     pub selected_var: usize,
     pub selected_effective: usize,
     pub show_values: bool,
@@ -93,20 +97,22 @@ impl App {
         let mut app = Self {
             data,
             focus: FocusPane::Profiles,
-            selected_target: 0,
+            selected_profile: 0,
             selected_var: 0,
             selected_effective: 0,
             show_values: false,
             modal: Modal::None,
-            status_message: "Ready. Press [a] Add Var, [n] New Profile, [Space] Toggle, [r] Reload Shell, [c] Phase.dev.".to_string(),
+            status_message: "Ready. Press [a] Add Var, [n] New Profile, [e] Edit, [Space] Toggle, [r] Reload Shell, [c] Phase.dev.".to_string(),
             is_error_status: false,
             should_quit: false,
             cached_apps: Vec::new(),
         };
 
         // Ensure env.sh and .bashrc are initialized right away
-        if let Err(e) = apply_state_to_system(&app.data) {
-            app.set_error(e);
+        if !cfg!(test) {
+            if let Err(e) = apply_state_to_system(&app.data) {
+                app.set_error(e);
+            }
         }
 
         app
@@ -123,6 +129,10 @@ impl App {
     }
 
     pub fn sync_to_system(&mut self, action_desc: &str) {
+        if cfg!(test) {
+            self.set_info(action_desc);
+            return;
+        }
         match apply_state_to_system(&self.data) {
             Ok(count) => {
                 let effective = self.data.compute_effective_vars();
@@ -160,28 +170,31 @@ impl App {
         }
     }
 
+    pub fn current_profile(&self) -> Option<&Profile> {
+        self.data.profiles.get(self.selected_profile)
+    }
+
+    pub fn current_profile_mut(&mut self) -> Option<&mut Profile> {
+        self.data.profiles.get_mut(self.selected_profile)
+    }
+
     pub fn current_vars(&self) -> &[EnvVar] {
-        if self.selected_target == 0 {
-            &self.data.default_vars
-        } else if let Some(prof) = self.data.profiles.get(self.selected_target - 1) {
+        if let Some(prof) = self.current_profile() {
             &prof.vars
         } else {
             &[]
         }
     }
 
-    pub fn current_vars_mut(&mut self) -> &mut Vec<EnvVar> {
-        if self.selected_target == 0 {
-            &mut self.data.default_vars
-        } else {
-            &mut self.data.profiles[self.selected_target - 1].vars
-        }
+    pub fn current_vars_mut(&mut self) -> Option<&mut Vec<EnvVar>> {
+        self.data
+            .profiles
+            .get_mut(self.selected_profile)
+            .map(|p| &mut p.vars)
     }
 
     pub fn current_target_title(&self) -> String {
-        if self.selected_target == 0 {
-            "Default (Always Loaded Baseline)".to_string()
-        } else if let Some(prof) = self.data.profiles.get(self.selected_target - 1) {
+        if let Some(prof) = self.current_profile() {
             let state_str = if prof.enabled { "ON" } else { "OFF" };
             let phase_str = match &prof.phase_binding {
                 Some(b) => format!(" | Phase: {}/{}", b.app_name, b.env_name),
@@ -189,17 +202,21 @@ impl App {
             };
             format!(
                 "Profile #{}: {} [{}]{}",
-                self.selected_target, prof.name, state_str, phase_str
+                self.selected_profile + 1,
+                prof.name,
+                state_str,
+                phase_str
             )
         } else {
-            "Unknown".to_string()
+            "No Profile Selected".to_string()
         }
     }
 
     pub fn clamp_selections(&mut self) {
-        let max_target = self.data.profiles.len(); // 0 is Default, 1..=len are profiles
-        if self.selected_target > max_target {
-            self.selected_target = max_target;
+        if self.data.profiles.is_empty() {
+            self.selected_profile = 0;
+        } else if self.selected_profile >= self.data.profiles.len() {
+            self.selected_profile = self.data.profiles.len() - 1;
         }
         let vars_len = self.current_vars().len();
         if vars_len == 0 {
@@ -280,22 +297,31 @@ impl App {
                 };
             }
             KeyCode::Char('a') => {
-                self.modal = Modal::VarEditor {
-                    is_edit: false,
-                    original_index: None,
-                    var_key: String::new(),
-                    var_value: String::new(),
-                    active_field: 0,
-                    error: None,
-                };
+                if self.data.profiles.is_empty() {
+                    self.set_error("No profile available. Create a profile first with [n].");
+                } else {
+                    self.modal = Modal::VarEditor {
+                        is_edit: false,
+                        original_index: None,
+                        var_key: String::new(),
+                        var_value: String::new(),
+                        active_field: 0,
+                        error: None,
+                    };
+                }
+            }
+            KeyCode::Char('e') => {
+                self.handle_edit_action();
+            }
+            KeyCode::Char('x') | KeyCode::Delete => {
+                self.handle_delete_action();
             }
             KeyCode::Char('p') => {
-                let target_profile = if self.selected_target == 0 {
-                    None
+                if self.data.profiles.is_empty() {
+                    self.open_phase_picker(None, None);
                 } else {
-                    Some(self.selected_target - 1)
-                };
-                self.open_phase_picker(target_profile, None);
+                    self.open_phase_picker(Some(self.selected_profile), None);
+                }
             }
             KeyCode::Char('r') => {
                 self.reload_shell();
@@ -308,87 +334,159 @@ impl App {
         }
     }
 
+    fn handle_edit_action(&mut self) {
+        match self.focus {
+            FocusPane::Profiles => {
+                self.open_edit_profile();
+            }
+            FocusPane::Vars => {
+                self.open_edit_var();
+            }
+            FocusPane::Effective => {
+                self.open_edit_effective_var();
+            }
+        }
+    }
+
+    fn open_edit_profile(&mut self) {
+        if let Some(prof) = self.current_profile() {
+            self.modal = Modal::EditProfile {
+                profile_idx: self.selected_profile,
+                name: prof.name.clone(),
+                error: None,
+            };
+        } else {
+            self.set_info("No profile selected to edit.");
+        }
+    }
+
+    fn open_edit_var(&mut self) {
+        if let Some(var) = self.current_vars().get(self.selected_var) {
+            self.modal = Modal::VarEditor {
+                is_edit: true,
+                original_index: Some(self.selected_var),
+                var_key: var.key.clone(),
+                var_value: var.value.clone(),
+                active_field: 1, // Focus value by default when editing
+                error: None,
+            };
+        } else {
+            self.set_info("No variable selected to edit.");
+        }
+    }
+
+    fn open_edit_effective_var(&mut self) {
+        let eff = self.data.compute_effective_vars();
+        if let Some(ev) = eff.get(self.selected_effective) {
+            for (p_idx, prof) in self.data.profiles.iter().enumerate() {
+                if !prof.enabled {
+                    continue;
+                }
+                if let Some(v_idx) = prof.vars.iter().position(|v| v.key == ev.key) {
+                    self.selected_profile = p_idx;
+                    self.selected_var = v_idx;
+                    self.focus = FocusPane::Vars;
+                    self.modal = Modal::VarEditor {
+                        is_edit: true,
+                        original_index: Some(v_idx),
+                        var_key: prof.vars[v_idx].key.clone(),
+                        var_value: prof.vars[v_idx].value.clone(),
+                        active_field: 1,
+                        error: None,
+                    };
+                    return;
+                }
+            }
+        }
+        self.set_info("No effective variable selected to edit.");
+    }
+
+    fn handle_delete_action(&mut self) {
+        match self.focus {
+            FocusPane::Profiles => {
+                if let Some(prof) = self.current_profile() {
+                    self.modal = Modal::ConfirmDeleteProfile {
+                        profile_idx: self.selected_profile,
+                        profile_name: prof.name.clone(),
+                    };
+                }
+            }
+            FocusPane::Vars => {
+                if let Some(var) = self.current_vars().get(self.selected_var) {
+                    self.modal = Modal::ConfirmDeleteVar {
+                        var_idx: self.selected_var,
+                        var_key: var.key.clone(),
+                    };
+                }
+            }
+            FocusPane::Effective => {
+                self.set_info("Cannot delete from Effective pane directly. Switch to Profiles or Variables pane.");
+            }
+        }
+    }
+
     fn handle_profiles_pane_key(&mut self, key: KeyEvent) {
-        let total_items = 1 + self.data.profiles.len(); // 0 = Default
+        let total_items = self.data.profiles.len();
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
-                if key.modifiers.contains(KeyModifiers::SHIFT)
-                    || key.modifiers.contains(KeyModifiers::ALT)
-                {
-                    self.move_selected_profile_up();
-                } else if self.selected_target > 0 {
-                    self.selected_target -= 1;
+                if self.selected_profile > 0 {
+                    self.selected_profile -= 1;
                     self.selected_var = 0;
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if key.modifiers.contains(KeyModifiers::SHIFT)
-                    || key.modifiers.contains(KeyModifiers::ALT)
-                {
-                    self.move_selected_profile_down();
-                } else if self.selected_target + 1 < total_items {
-                    self.selected_target += 1;
+                if self.selected_profile + 1 < total_items {
+                    self.selected_profile += 1;
                     self.selected_var = 0;
                 }
             }
-            KeyCode::Char('K') | KeyCode::Char('u') => {
+            KeyCode::Char('u') => {
                 self.move_selected_profile_up();
             }
-            KeyCode::Char('J') | KeyCode::Char('d') => {
+            KeyCode::Char('d') => {
                 self.move_selected_profile_down();
             }
-            KeyCode::Char(' ') | KeyCode::Enter => {
-                if self.selected_target == 0 {
-                    self.set_info("Default profile is always active by design.");
-                } else if let Some(prof) = self.data.profiles.get_mut(self.selected_target - 1) {
+            KeyCode::Char(' ') => {
+                if let Some(prof) = self.current_profile_mut() {
                     prof.enabled = !prof.enabled;
                     let name = prof.name.clone();
                     let status = if prof.enabled { "ON" } else { "OFF" };
                     self.sync_to_system(&format!("Toggled profile '{}' {}", name, status));
                 }
             }
-            KeyCode::Char('x') | KeyCode::Delete => {
-                if self.selected_target == 0 {
-                    self.set_error("Cannot delete Default profile.");
-                } else if let Some(prof) = self.data.profiles.get(self.selected_target - 1) {
-                    self.modal = Modal::ConfirmDeleteProfile {
-                        profile_idx: self.selected_target - 1,
-                        profile_name: prof.name.clone(),
-                    };
-                }
+            KeyCode::Enter => {
+                self.open_edit_profile();
             }
             _ => {}
         }
     }
 
     fn move_selected_profile_up(&mut self) {
-        if self.selected_target <= 1 {
-            if self.selected_target == 1 {
+        if self.selected_profile == 0 {
+            if !self.data.profiles.is_empty() {
                 self.set_info("Profile is already at top priority (#1).");
             }
             return;
         }
-        let idx = self.selected_target - 1;
-        self.data.profiles.swap(idx, idx - 1);
-        self.selected_target -= 1;
-        let name = self.data.profiles[self.selected_target - 1].name.clone();
+        self.data.profiles.swap(self.selected_profile, self.selected_profile - 1);
+        self.selected_profile -= 1;
+        let name = self.data.profiles[self.selected_profile].name.clone();
         self.sync_to_system(&format!(
             "Moved profile '{}' up to priority #{}",
-            name, self.selected_target
+            name, self.selected_profile + 1
         ));
     }
 
     fn move_selected_profile_down(&mut self) {
-        if self.selected_target == 0 || self.selected_target >= self.data.profiles.len() {
+        if self.data.profiles.is_empty() || self.selected_profile + 1 >= self.data.profiles.len() {
             return;
         }
-        let idx = self.selected_target - 1;
-        self.data.profiles.swap(idx, idx + 1);
-        self.selected_target += 1;
-        let name = self.data.profiles[self.selected_target - 1].name.clone();
+        self.data.profiles.swap(self.selected_profile, self.selected_profile + 1);
+        self.selected_profile += 1;
+        let name = self.data.profiles[self.selected_profile].name.clone();
         self.sync_to_system(&format!(
             "Moved profile '{}' down to priority #{}",
-            name, self.selected_target
+            name, self.selected_profile + 1
         ));
     }
 
@@ -405,25 +503,8 @@ impl App {
                     self.selected_var += 1;
                 }
             }
-            KeyCode::Char('e') | KeyCode::Enter => {
-                if let Some(var) = self.current_vars().get(self.selected_var) {
-                    self.modal = Modal::VarEditor {
-                        is_edit: true,
-                        original_index: Some(self.selected_var),
-                        var_key: var.key.clone(),
-                        var_value: var.value.clone(),
-                        active_field: 1, // Focus value by default when editing
-                        error: None,
-                    };
-                }
-            }
-            KeyCode::Char('x') | KeyCode::Delete => {
-                if let Some(var) = self.current_vars().get(self.selected_var) {
-                    self.modal = Modal::ConfirmDeleteVar {
-                        var_idx: self.selected_var,
-                        var_key: var.key.clone(),
-                    };
-                }
+            KeyCode::Enter => {
+                self.open_edit_var();
             }
             _ => {}
         }
@@ -441,6 +522,9 @@ impl App {
                 if self.selected_effective + 1 < len {
                     self.selected_effective += 1;
                 }
+            }
+            KeyCode::Enter => {
+                self.open_edit_effective_var();
             }
             _ => {}
         }
@@ -674,7 +758,7 @@ impl App {
                                     vars: Vec::new(),
                                 },
                             );
-                            self.selected_target = 1;
+                            self.selected_profile = 0;
                             self.selected_var = 0;
                             self.sync_to_system(&format!(
                                 "Created custom profile '{}' at priority #1",
@@ -777,7 +861,7 @@ impl App {
                                                     vars,
                                                 },
                                             );
-                                            self.selected_target = 1;
+                                            self.selected_profile = 0;
                                             self.selected_var = 0;
                                             self.sync_to_system(&format!(
                                                 "Created profile '{}' with {} var(s) from Phase ({}/{})",
@@ -798,16 +882,18 @@ impl App {
                                                     fetched_len, app.name, env.name, pname
                                                 ));
                                             }
-                                        } else {
+                                        } else if let Some(prof) = self.current_profile_mut() {
+                                            prof.phase_binding = Some(binding);
                                             AppStateData::merge_phase_vars(
-                                                &mut self.data.default_vars,
+                                                &mut prof.vars,
                                                 &app.name,
                                                 &env.name,
                                                 fetched_pairs,
                                             );
+                                            let pname = prof.name.clone();
                                             self.sync_to_system(&format!(
-                                                "Pulled {} var(s) from Phase ({}/{}) into Default",
-                                                fetched_len, app.name, env.name
+                                                "Pulled {} var(s) from Phase ({}/{}) into '{}'",
+                                                fetched_len, app.name, env.name, pname
                                             ));
                                         }
                                         self.clamp_selections();
@@ -879,26 +965,21 @@ impl App {
                                 "Invalid variable name. Use letters, digits, '_' (cannot start with digit)."
                                     .to_string(),
                             );
-                        } else {
-                            let vars = self.current_vars_mut();
+                        } else if let Some(vars) = self.current_vars_mut() {
                             if is_edit {
                                 if let Some(idx) = original_index {
                                     if let Some(v) = vars.get_mut(idx) {
                                         v.key = k.clone();
-                                        v.value = var_value.clone();
+                                        v.set_value(var_value.clone());
                                     }
                                 }
                             } else {
                                 AppStateData::upsert_custom_var(vars, k.clone(), var_value.clone());
                             }
                             self.clamp_selections();
-                            let target_name = if self.selected_target == 0 {
-                                "Default".to_string()
-                            } else {
-                                self.data.profiles[self.selected_target - 1].name.clone()
-                            };
+                            let target_name = self.current_target_title();
                             self.sync_to_system(&format!(
-                                "Saved variable '{}' in '{}'",
+                                "Saved variable '{}' in {}",
                                 k, target_name
                             ));
                             return;
@@ -939,11 +1020,12 @@ impl App {
 
             Modal::ConfirmDeleteVar { var_idx, var_key } => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    let vars = self.current_vars_mut();
-                    if var_idx < vars.len() {
-                        vars.remove(var_idx);
-                        self.clamp_selections();
-                        self.sync_to_system(&format!("Deleted variable '{}'", var_key));
+                    if let Some(vars) = self.current_vars_mut() {
+                        if var_idx < vars.len() {
+                            vars.remove(var_idx);
+                            self.clamp_selections();
+                            self.sync_to_system(&format!("Deleted variable '{}'", var_key));
+                        }
                     }
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {}
@@ -951,6 +1033,60 @@ impl App {
                     self.modal = Modal::ConfirmDeleteVar { var_idx, var_key };
                 }
             },
+
+            Modal::EditProfile {
+                profile_idx,
+                mut name,
+                mut error,
+            } => {
+                match key.code {
+                    KeyCode::Esc => {
+                        return;
+                    }
+                    KeyCode::Backspace => {
+                        name.pop();
+                        error = None;
+                    }
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        name.clear();
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        name.push(c);
+                        error = None;
+                    }
+                    KeyCode::Enter => {
+                        let trimmed = name.trim().to_string();
+                        if trimmed.is_empty() {
+                            error = Some("Profile name cannot be empty.".to_string());
+                        } else if self
+                            .data
+                            .profiles
+                            .iter()
+                            .enumerate()
+                            .any(|(i, p)| i != profile_idx && p.name.eq_ignore_ascii_case(&trimmed))
+                        {
+                            error = Some(format!("Profile '{}' already exists.", trimmed));
+                        } else {
+                            if let Some(prof) = self.data.profiles.get_mut(profile_idx) {
+                                let old_name = prof.name.clone();
+                                prof.name = trimmed.clone();
+                                self.sync_to_system(&format!(
+                                    "Renamed profile '{}' to '{}'",
+                                    old_name, trimmed
+                                ));
+                            }
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+
+                self.modal = Modal::EditProfile {
+                    profile_idx,
+                    name,
+                    error,
+                };
+            }
         }
     }
 
@@ -1016,11 +1152,13 @@ impl App {
     fn draw_body(&self, frame: &mut Frame, area: Rect) {
         let main_chunks = Layout::default()
             .direction(Direction::Horizontal)
+            .spacing(1)
             .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
             .split(area);
 
         let right_chunks = Layout::default()
             .direction(Direction::Vertical)
+            .spacing(1)
             .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
             .split(main_chunks[1]);
 
@@ -1037,23 +1175,8 @@ impl App {
             Style::default().fg(Color::DarkGray)
         };
 
-        let mut items: Vec<ListItem> = Vec::with_capacity(1 + self.data.profiles.len());
+        let mut items: Vec<ListItem> = Vec::with_capacity(self.data.profiles.len());
 
-        // Item 0: Default
-        let default_line = Line::from(vec![
-            Span::styled("[★] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(
-                "Default",
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" ({} vars, base)", self.data.default_vars.len()),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]);
-        items.push(ListItem::new(default_line));
-
-        // Profiles 1..=N (Top wins priority)
         for (idx, prof) in self.data.profiles.iter().enumerate() {
             let check = if prof.enabled { "[✓] " } else { "[ ] " };
             let check_style = if prof.enabled {
@@ -1086,12 +1209,20 @@ impl App {
             items.push(ListItem::new(line));
         }
 
-        let title = " 1. Default & Profiles (Top #1 Wins Priority) ";
+        if items.is_empty() {
+            items.push(ListItem::new(Line::from(Span::styled(
+                "No profiles. Press [n] to create one.",
+                Style::default().fg(Color::DarkGray),
+            ))));
+        }
+
+        let title = " Profiles (Top #1 Wins Priority) ";
         let list = List::new(items)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(border_style)
+                    .padding(Padding::horizontal(1))
                     .title(title),
             )
             .highlight_style(
@@ -1102,7 +1233,9 @@ impl App {
             .highlight_symbol("▶ ");
 
         let mut state = ListState::default();
-        state.select(Some(self.selected_target));
+        if !self.data.profiles.is_empty() {
+            state.select(Some(self.selected_profile));
+        }
         frame.render_stateful_widget(list, area, &mut state);
     }
 
@@ -1118,13 +1251,7 @@ impl App {
         let rows: Vec<Row> = vars
             .iter()
             .map(|v| {
-                let val_display = if self.show_values {
-                    v.value.clone()
-                } else if v.value.is_empty() {
-                    "<empty>".to_string()
-                } else {
-                    "••••••••".to_string()
-                };
+                let val_display = v.masked_display(self.show_values);
                 Row::new(vec![v.key.clone(), val_display, v.source.label()])
             })
             .collect();
@@ -1149,7 +1276,8 @@ impl App {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style)
-                .title(format!(" 2. Variables in {} ", self.current_target_title())),
+                .padding(Padding::horizontal(1))
+                .title(format!(" Variables in {} ", self.current_target_title())),
         )
         .row_highlight_style(
             Style::default()
@@ -1177,13 +1305,7 @@ impl App {
         let rows: Vec<Row> = effective
             .iter()
             .map(|ev| {
-                let val_display = if self.show_values {
-                    ev.value.clone()
-                } else if ev.value.is_empty() {
-                    "<empty>".to_string()
-                } else {
-                    "••••••••".to_string()
-                };
+                let val_display = ev.masked_display(self.show_values);
                 Row::new(vec![
                     ev.key.clone(),
                     val_display,
@@ -1214,10 +1336,8 @@ impl App {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style)
-                .title(format!(
-                    " 3. Active System Environment ({} encrypted in state.enc, injected at runtime) ",
-                    effective.len()
-                )),
+                .padding(Padding::horizontal(1))
+                .title(" Active System Environment "),
         )
         .row_highlight_style(
             Style::default()
@@ -1246,12 +1366,12 @@ impl App {
                     "[Space]",
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(" Toggle ON/OFF  "),
+                Span::raw(" Toggle  "),
                 Span::styled(
-                    "[K/J or u/d]",
+                    "[u/d]",
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(" Move Priority Up/Down  "),
+                Span::raw(" Move Priority  "),
                 Span::styled(
                     "[n]",
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -1261,7 +1381,7 @@ impl App {
                     "[a]",
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(" Add Custom Var  "),
+                Span::raw(" Add Var  "),
                 Span::styled(
                     "[e]",
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -1276,7 +1396,7 @@ impl App {
                     "[p]",
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(" Pull Phase.dev  "),
+                Span::raw(" Phase Pull  "),
                 Span::styled(
                     "[c]",
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -1667,6 +1787,45 @@ impl App {
                     .title(" Confirm Delete Variable ");
                 frame.render_widget(Paragraph::new(lines).block(block), popup);
             }
+
+            Modal::EditProfile { name, error, .. } => {
+                let popup = centered_rect(50, 24, area);
+                frame.render_widget(Clear, popup);
+                let mut lines = vec![
+                    Line::from(Span::styled(
+                        "Rename Profile:",
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        format!(" > {}█", name),
+                        field_style(true),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "[Enter] Save  |  [Esc] Cancel",
+                        Style::default().fg(Color::Gray),
+                    )),
+                ];
+
+                if let Some(err) = error {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        format!("Error: {}", err),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    )));
+                }
+
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .padding(Padding::horizontal(1))
+                    .title(" Rename Profile ");
+                frame.render_widget(
+                    Paragraph::new(lines).wrap(Wrap { trim: false }).block(block),
+                    popup,
+                );
+            }
         }
     }
     pub fn handle_paste(&mut self, pasted: &str) {
@@ -1712,6 +1871,10 @@ impl App {
                 } else {
                     var_value.push_str(clean);
                 }
+                *error = None;
+            }
+            Modal::EditProfile { name, error, .. } => {
+                name.push_str(clean);
                 *error = None;
             }
             _ => {}
@@ -1803,4 +1966,179 @@ pub fn run_tui() -> Result<(), String> {
     let _ = apply_state_to_system(&app.data);
 
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::VarSource;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn make_test_app() -> App {
+        let mut data = AppStateData::default();
+        data.profiles[0].vars.push(EnvVar::new(
+            "API_KEY".to_string(),
+            "sk-123456789xyz".to_string(),
+            VarSource::Custom,
+        ));
+        App {
+            data,
+            focus: FocusPane::Profiles,
+            selected_profile: 0,
+            selected_var: 0,
+            selected_effective: 0,
+            show_values: false,
+            modal: Modal::None,
+            status_message: "Ready".to_string(),
+            is_error_status: false,
+            should_quit: false,
+            cached_apps: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_default_profile_can_be_edited_renamed_toggled_deleted() {
+        let mut app = make_test_app();
+        assert_eq!(app.data.profiles[0].name, "default");
+        assert!(app.data.profiles[0].enabled);
+
+        // 1. Toggle OFF
+        app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert!(!app.data.profiles[0].enabled);
+
+        // 2. Toggle ON
+        app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert!(app.data.profiles[0].enabled);
+
+        // 3. Edit (Rename) via 'e'
+        app.handle_key(KeyEvent::from(KeyCode::Char('e')));
+        match &app.modal {
+            Modal::EditProfile { profile_idx, name, .. } => {
+                assert_eq!(*profile_idx, 0);
+                assert_eq!(name, "default");
+            }
+            _ => panic!("Expected Modal::EditProfile"),
+        }
+
+        // Type new name: Ctrl+u to clear, type "staging", Enter
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        for c in "staging".chars() {
+            app.handle_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.modal, Modal::None));
+        assert_eq!(app.data.profiles[0].name, "staging");
+
+        // 4. Delete via 'x'
+        app.handle_key(KeyEvent::from(KeyCode::Char('x')));
+        assert!(matches!(app.modal, Modal::ConfirmDeleteProfile { .. }));
+        app.handle_key(KeyEvent::from(KeyCode::Char('y')));
+        assert!(app.data.profiles.is_empty());
+    }
+
+    #[test]
+    fn test_move_priority_shortcut_u_d() {
+        let mut app = make_test_app();
+        app.data.profiles.push(Profile {
+            name: "second_profile".to_string(),
+            enabled: true,
+            phase_binding: None,
+            vars: Vec::new(),
+        });
+        assert_eq!(app.data.profiles[0].name, "default");
+        assert_eq!(app.data.profiles[1].name, "second_profile");
+
+        // Select second profile
+        app.selected_profile = 1;
+
+        // Move UP using 'u'
+        app.handle_key(KeyEvent::from(KeyCode::Char('u')));
+        assert_eq!(app.data.profiles[0].name, "second_profile");
+        assert_eq!(app.data.profiles[1].name, "default");
+        assert_eq!(app.selected_profile, 0);
+
+        // Move DOWN using 'd'
+        app.handle_key(KeyEvent::from(KeyCode::Char('d')));
+        assert_eq!(app.data.profiles[0].name, "default");
+        assert_eq!(app.data.profiles[1].name, "second_profile");
+        assert_eq!(app.selected_profile, 1);
+
+        // Verify 'K' and 'J' do NOT move priority
+        app.handle_key(KeyEvent::from(KeyCode::Char('K')));
+        assert_eq!(app.data.profiles[1].name, "second_profile");
+        app.handle_key(KeyEvent::from(KeyCode::Char('J')));
+        assert_eq!(app.data.profiles[1].name, "second_profile");
+    }
+
+    #[test]
+    fn test_edit_action_works_across_panes() {
+        let mut app = make_test_app();
+
+        // 1. Focus on Profiles -> 'e' opens EditProfile
+        app.focus = FocusPane::Profiles;
+        app.handle_key(KeyEvent::from(KeyCode::Char('e')));
+        assert!(matches!(app.modal, Modal::EditProfile { .. }));
+        app.modal = Modal::None;
+
+        // 2. Focus on Vars -> 'e' opens VarEditor
+        app.focus = FocusPane::Vars;
+        app.handle_key(KeyEvent::from(KeyCode::Char('e')));
+        match &app.modal {
+            Modal::VarEditor { is_edit, var_key, var_value, .. } => {
+                assert!(*is_edit);
+                assert_eq!(var_key, "API_KEY");
+                assert_eq!(var_value, "sk-123456789xyz");
+            }
+            _ => panic!("Expected Modal::VarEditor"),
+        }
+        app.modal = Modal::None;
+
+        // 3. Focus on Effective -> 'e' opens VarEditor targeting the winning profile var
+        app.focus = FocusPane::Effective;
+        app.handle_key(KeyEvent::from(KeyCode::Char('e')));
+        match &app.modal {
+            Modal::VarEditor { is_edit, var_key, .. } => {
+                assert!(*is_edit);
+                assert_eq!(var_key, "API_KEY");
+            }
+            _ => panic!("Expected Modal::VarEditor from Effective pane"),
+        }
+    }
+
+    #[test]
+    fn test_ui_titles_padding_and_masked_keys() {
+        let app = make_test_app();
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let content: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.get(x, y).symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Titles must NOT have numbers
+        assert!(content.contains("Profiles (Top #1 Wins Priority)"));
+        assert!(!content.contains("1. Default & Profiles"));
+        assert!(content.contains("Variables in Profile #1: default [ON]"));
+        assert!(!content.contains("2. Variables in"));
+        assert!(content.contains("Active System Environment"));
+        assert!(!content.contains("3. Active System Environment"));
+
+        // Pane 3 title must NOT have "(x encrypted..."
+        assert!(!content.contains("encrypted in state.enc"));
+
+        // Footer must have "[u/d] Move Priority" and not "[K/J"
+        assert!(content.contains("[u/d] Move Priority"));
+        assert!(!content.contains("[K/J"));
+
+        // Masked key display shows 3 prefix and 3 suffix: "sk-••••xyz"
+        assert!(content.contains("sk-••••xyz"));
+    }
 }

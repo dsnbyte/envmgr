@@ -118,7 +118,54 @@ impl VarSource {
 pub struct EnvVar {
     pub key: String,
     pub value: String,
+    #[serde(default)]
+    pub prefix: String,
+    #[serde(default)]
+    pub suffix: String,
     pub source: VarSource,
+}
+
+pub fn compute_prefix_suffix(value: &str) -> (String, String) {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() >= 6 {
+        let prefix: String = chars[..3].iter().collect();
+        let suffix: String = chars[chars.len() - 3..].iter().collect();
+        (prefix, suffix)
+    } else {
+        (String::new(), String::new())
+    }
+}
+
+impl EnvVar {
+    pub fn new(key: String, value: String, source: VarSource) -> Self {
+        let (prefix, suffix) = compute_prefix_suffix(&value);
+        Self {
+            key,
+            value,
+            prefix,
+            suffix,
+            source,
+        }
+    }
+
+    pub fn set_value(&mut self, new_val: String) {
+        let (prefix, suffix) = compute_prefix_suffix(&new_val);
+        self.value = new_val;
+        self.prefix = prefix;
+        self.suffix = suffix;
+    }
+
+    pub fn masked_display(&self, show_raw: bool) -> String {
+        if show_raw {
+            self.value.clone()
+        } else if self.value.is_empty() {
+            "<empty>".to_string()
+        } else if !self.prefix.is_empty() && !self.suffix.is_empty() {
+            format!("{}••••{}", self.prefix, self.suffix)
+        } else {
+            "••••••••".to_string()
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,15 +188,57 @@ pub struct Profile {
 pub struct EffectiveVar {
     pub key: String,
     pub value: String,
+    pub prefix: String,
+    pub suffix: String,
     pub winning_owner: String,
     pub source_label: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+impl EffectiveVar {
+    #[cfg(test)]
+    pub fn new(key: String, value: String, winning_owner: String, source_label: String) -> Self {
+        let (prefix, suffix) = compute_prefix_suffix(&value);
+        Self {
+            key,
+            value,
+            prefix,
+            suffix,
+            winning_owner,
+            source_label,
+        }
+    }
+
+    pub fn masked_display(&self, show_raw: bool) -> String {
+        if show_raw {
+            self.value.clone()
+        } else if self.value.is_empty() {
+            "<empty>".to_string()
+        } else if !self.prefix.is_empty() && !self.suffix.is_empty() {
+            format!("{}••••{}", self.prefix, self.suffix)
+        } else {
+            "••••••••".to_string()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppStateData {
     pub phase: PhaseConfig,
-    pub default_vars: Vec<EnvVar>,
     pub profiles: Vec<Profile>,
+}
+
+impl Default for AppStateData {
+    fn default() -> Self {
+        Self {
+            phase: PhaseConfig::default(),
+            profiles: vec![Profile {
+                name: "default".to_string(),
+                enabled: true,
+                phase_binding: None,
+                vars: Vec::new(),
+            }],
+        }
+    }
 }
 
 impl AppStateData {
@@ -179,7 +268,17 @@ impl AppStateData {
         let Ok(decrypted) = decrypt_bytes(&encrypted) else {
             return Self::default();
         };
-        serde_json::from_slice(&decrypted).unwrap_or_default()
+        let mut state: Self = serde_json::from_slice(&decrypted).unwrap_or_default();
+        for prof in &mut state.profiles {
+            for var in &mut prof.vars {
+                if var.prefix.is_empty() && var.suffix.is_empty() && !var.value.is_empty() {
+                    let (p, s) = compute_prefix_suffix(&var.value);
+                    var.prefix = p;
+                    var.suffix = s;
+                }
+            }
+        }
+        state
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -205,46 +304,33 @@ impl AppStateData {
 
     /// Computes the final effective environment variables.
     /// Rules:
-    /// 1. `default_vars` are always loaded as baseline.
-    /// 2. Enabled profiles override `default_vars`.
-    /// 3. Among enabled profiles, the profile highest in the list (smallest index, e.g. #1 at top) wins!
+    /// 1. Only enabled profiles contribute variables.
+    /// 2. Among enabled profiles, the profile highest in the list (smallest index, e.g. #1 at top) wins!
     pub fn compute_effective_vars(&self) -> Vec<EffectiveVar> {
         let mut map: HashMap<String, EffectiveVar> = HashMap::new();
         let mut order: Vec<String> = Vec::new();
 
-        let mut upsert = |key: &str, value: &str, owner: String, source_label: String| {
-            if !map.contains_key(key) {
-                order.push(key.to_string());
-            }
-            map.insert(
-                key.to_string(),
-                EffectiveVar {
-                    key: key.to_string(),
-                    value: value.to_string(),
-                    winning_owner: owner,
-                    source_label,
-                },
-            );
-        };
-
-        // 1. Apply Default variables first (lowest precedence)
-        for var in &self.default_vars {
-            upsert(
-                &var.key,
-                &var.value,
-                "Default".to_string(),
-                var.source.label(),
-            );
-        }
-
-        // 2. Apply enabled profiles from bottom to top so the topmost enabled profile overwrites lower ones
+        // Apply enabled profiles from bottom to top so the topmost enabled profile overwrites lower ones
         for (idx, profile) in self.profiles.iter().enumerate().rev() {
             if !profile.enabled {
                 continue;
             }
             let owner = format!("Profile #{}: {}", idx + 1, profile.name);
             for var in &profile.vars {
-                upsert(&var.key, &var.value, owner.clone(), var.source.label());
+                if !map.contains_key(&var.key) {
+                    order.push(var.key.clone());
+                }
+                map.insert(
+                    var.key.clone(),
+                    EffectiveVar {
+                        key: var.key.clone(),
+                        value: var.value.clone(),
+                        prefix: var.prefix.clone(),
+                        suffix: var.suffix.clone(),
+                        winning_owner: owner.clone(),
+                        source_label: var.source.label(),
+                    },
+                );
             }
         }
 
@@ -268,27 +354,23 @@ impl AppStateData {
         target.retain(|v| matches!(v.source, VarSource::Custom) && !fetched_keys.contains(v.key.as_str()));
 
         for (k, v) in fetched {
-            target.push(EnvVar {
-                key: k,
-                value: v,
-                source: VarSource::Phase {
+            target.push(EnvVar::new(
+                k,
+                v,
+                VarSource::Phase {
                     app_name: app_name.to_string(),
                     env_name: env_name.to_string(),
                 },
-            });
+            ));
         }
     }
 
     pub fn upsert_custom_var(target: &mut Vec<EnvVar>, key: String, value: String) {
         if let Some(existing) = target.iter_mut().find(|v| v.key == key) {
-            existing.value = value;
+            existing.set_value(value);
             existing.source = VarSource::Custom;
         } else {
-            target.push(EnvVar {
-                key,
-                value,
-                source: VarSource::Custom,
-            });
+            target.push(EnvVar::new(key, value, VarSource::Custom));
         }
     }
 }
@@ -318,6 +400,28 @@ mod tests {
     }
 
     #[test]
+    fn test_prefix_suffix_and_masked_display() {
+        let (p, s) = compute_prefix_suffix("sk-123456789xyz");
+        assert_eq!(p, "sk-");
+        assert_eq!(s, "xyz");
+
+        let var = EnvVar::new("API_KEY".to_string(), "sk-123456789xyz".to_string(), VarSource::Custom);
+        assert_eq!(var.prefix, "sk-");
+        assert_eq!(var.suffix, "xyz");
+        assert_eq!(var.masked_display(false), "sk-••••xyz");
+        assert_eq!(var.masked_display(true), "sk-123456789xyz");
+
+        let short_var = EnvVar::new("SHORT".to_string(), "12345".to_string(), VarSource::Custom);
+        assert_eq!(short_var.prefix, "");
+        assert_eq!(short_var.suffix, "");
+        assert_eq!(short_var.masked_display(false), "••••••••");
+        assert_eq!(short_var.masked_display(true), "12345");
+
+        let empty_var = EnvVar::new("EMPTY".to_string(), "".to_string(), VarSource::Custom);
+        assert_eq!(empty_var.masked_display(false), "<empty>");
+    }
+
+    #[test]
     fn test_encrypted_state_file_never_stores_plaintext_on_disk() {
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -338,24 +442,31 @@ mod tests {
                 custom_url: String::new(),
                 pat_token: "pss_user:v1:secret_pat_token_12345".to_string(),
             },
-            default_vars: vec![EnvVar {
-                key: plaintext_key.to_string(),
-                value: plaintext_secret_1.to_string(),
-                source: VarSource::Custom,
-            }],
-            profiles: vec![Profile {
-                name: "prod_profile_secret".to_string(),
-                enabled: true,
-                phase_binding: None,
-                vars: vec![EnvVar {
-                    key: "API_TOKEN".to_string(),
-                    value: plaintext_secret_2.to_string(),
-                    source: VarSource::Phase {
-                        app_name: "my-app".to_string(),
-                        env_name: "production".to_string(),
-                    },
-                }],
-            }],
+            profiles: vec![
+                Profile {
+                    name: "default".to_string(),
+                    enabled: true,
+                    phase_binding: None,
+                    vars: vec![EnvVar::new(
+                        plaintext_key.to_string(),
+                        plaintext_secret_1.to_string(),
+                        VarSource::Custom,
+                    )],
+                },
+                Profile {
+                    name: "prod_profile_secret".to_string(),
+                    enabled: true,
+                    phase_binding: None,
+                    vars: vec![EnvVar::new(
+                        "API_TOKEN".to_string(),
+                        plaintext_secret_2.to_string(),
+                        VarSource::Phase {
+                            app_name: "my-app".to_string(),
+                            env_name: "production".to_string(),
+                        },
+                    )],
+                },
+            ],
         };
 
         state.save_to_dir(&temp_dir).expect("should save state.enc");
@@ -388,57 +499,37 @@ mod tests {
 
         let loaded = AppStateData::load_from_dir(&temp_dir);
         assert_eq!(loaded.phase.pat_token, "pss_user:v1:secret_pat_token_12345");
-        assert_eq!(loaded.default_vars.len(), 1);
-        assert_eq!(loaded.default_vars[0].key, plaintext_key);
-        assert_eq!(loaded.default_vars[0].value, plaintext_secret_1);
-        assert_eq!(loaded.profiles.len(), 1);
-        assert_eq!(loaded.profiles[0].vars[0].value, plaintext_secret_2);
+        assert_eq!(loaded.profiles.len(), 2);
+        assert_eq!(loaded.profiles[0].vars[0].key, plaintext_key);
+        assert_eq!(loaded.profiles[0].vars[0].value, plaintext_secret_1);
+        assert_eq!(loaded.profiles[0].vars[0].prefix, "MY_");
+        assert_eq!(loaded.profiles[0].vars[0].suffix, "999");
+        assert_eq!(loaded.profiles[1].vars[0].value, plaintext_secret_2);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
-    fn test_priority_top_profile_wins_over_lower_and_default() {
+    fn test_priority_top_profile_wins_over_lower() {
         let state = AppStateData {
             phase: PhaseConfig::default(),
-            default_vars: vec![
-                EnvVar {
-                    key: "A".to_string(),
-                    value: "from_default".to_string(),
-                    source: VarSource::Custom,
-                },
-                EnvVar {
-                    key: "DEFAULT_ONLY".to_string(),
-                    value: "yes".to_string(),
-                    source: VarSource::Custom,
-                },
-            ],
             profiles: vec![
-                Profile {
-                    name: "profile_dua".to_string(),
-                    enabled: true,
-                    phase_binding: None,
-                    vars: vec![EnvVar {
-                        key: "A".to_string(),
-                        value: "from_profile_dua".to_string(),
-                        source: VarSource::Custom,
-                    }],
-                },
                 Profile {
                     name: "profile_satu".to_string(),
                     enabled: true,
                     phase_binding: None,
                     vars: vec![
-                        EnvVar {
-                            key: "A".to_string(),
-                            value: "from_profile_satu".to_string(),
-                            source: VarSource::Custom,
-                        },
-                        EnvVar {
-                            key: "B".to_string(),
-                            value: "b_from_satu".to_string(),
-                            source: VarSource::Custom,
-                        },
+                        EnvVar::new("A".to_string(), "from_profile_satu".to_string(), VarSource::Custom),
+                        EnvVar::new("B".to_string(), "b_from_satu".to_string(), VarSource::Custom),
+                    ],
+                },
+                Profile {
+                    name: "profile_dua".to_string(),
+                    enabled: true,
+                    phase_binding: None,
+                    vars: vec![
+                        EnvVar::new("A".to_string(), "from_profile_dua".to_string(), VarSource::Custom),
+                        EnvVar::new("C".to_string(), "c_from_dua".to_string(), VarSource::Custom),
                     ],
                 },
             ],
@@ -447,52 +538,41 @@ mod tests {
         let effective = state.compute_effective_vars();
         let map: HashMap<_, _> = effective.into_iter().map(|v| (v.key.clone(), v)).collect();
 
-        assert_eq!(map["A"].value, "from_profile_dua");
-        assert_eq!(map["A"].winning_owner, "Profile #1: profile_dua");
+        // Profile #1 (profile_satu) wins over Profile #2 for key A
+        assert_eq!(map["A"].value, "from_profile_satu");
+        assert_eq!(map["A"].winning_owner, "Profile #1: profile_satu");
         assert_eq!(map["B"].value, "b_from_satu");
-        assert_eq!(map["B"].winning_owner, "Profile #2: profile_satu");
-        assert_eq!(map["DEFAULT_ONLY"].value, "yes");
-        assert_eq!(map["DEFAULT_ONLY"].winning_owner, "Default");
+        assert_eq!(map["B"].winning_owner, "Profile #1: profile_satu");
+        assert_eq!(map["C"].value, "c_from_dua");
+        assert_eq!(map["C"].winning_owner, "Profile #2: profile_dua");
     }
 
     #[test]
-    fn test_disabled_top_profile_falls_back_to_next_enabled_or_default() {
+    fn test_disabled_top_profile_falls_back_to_next_enabled() {
         let mut state = AppStateData {
             phase: PhaseConfig::default(),
-            default_vars: vec![EnvVar {
-                key: "A".to_string(),
-                value: "from_default".to_string(),
-                source: VarSource::Custom,
-            }],
             profiles: vec![
                 Profile {
-                    name: "profile_dua".to_string(),
+                    name: "profile_satu".to_string(),
                     enabled: false,
                     phase_binding: None,
-                    vars: vec![EnvVar {
-                        key: "A".to_string(),
-                        value: "from_profile_dua".to_string(),
-                        source: VarSource::Custom,
-                    }],
+                    vars: vec![EnvVar::new("A".to_string(), "from_profile_satu".to_string(), VarSource::Custom)],
                 },
                 Profile {
-                    name: "profile_satu".to_string(),
+                    name: "profile_dua".to_string(),
                     enabled: true,
                     phase_binding: None,
-                    vars: vec![EnvVar {
-                        key: "A".to_string(),
-                        value: "from_profile_satu".to_string(),
-                        source: VarSource::Custom,
-                    }],
+                    vars: vec![EnvVar::new("A".to_string(), "from_profile_dua".to_string(), VarSource::Custom)],
                 },
             ],
         };
 
         let effective = state.compute_effective_vars();
-        assert_eq!(effective[0].value, "from_profile_satu");
+        assert_eq!(effective.len(), 1);
+        assert_eq!(effective[0].value, "from_profile_dua");
 
         state.profiles[1].enabled = false;
         let effective2 = state.compute_effective_vars();
-        assert_eq!(effective2[0].value, "from_default");
+        assert!(effective2.is_empty());
     }
 }

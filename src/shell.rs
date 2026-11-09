@@ -193,29 +193,29 @@ mod tests {
     #[test]
     fn test_generate_env_sh_and_source_in_bash() {
         let vars = vec![
-            EffectiveVar {
-                key: "APP_ENV".to_string(),
-                value: "production".to_string(),
-                winning_owner: "Profile #1: prod".to_string(),
-                source_label: "Custom".to_string(),
-            },
-            EffectiveVar {
-                key: "SPECIAL_CHARS".to_string(),
-                value: "hello 'world' $HOME `date`".to_string(),
-                winning_owner: "Default".to_string(),
-                source_label: "Custom".to_string(),
-            },
+            EffectiveVar::new(
+                "APP_ENV".to_string(),
+                "production".to_string(),
+                "Profile #1: prod".to_string(),
+                "Custom".to_string(),
+            ),
+            EffectiveVar::new(
+                "SPECIAL_CHARS".to_string(),
+                "hello 'world' $HOME `date`".to_string(),
+                "Default".to_string(),
+                "Custom".to_string(),
+            ),
         ];
 
         let script = generate_env_sh_content(&vars);
         assert!(script.contains("export APP_ENV='production'"));
 
-        let vars_after_disable = vec![EffectiveVar {
-            key: "SPECIAL_CHARS".to_string(),
-            value: "hello 'world' $HOME `date`".to_string(),
-            winning_owner: "Default".to_string(),
-            source_label: "Custom".to_string(),
-        }];
+        let vars_after_disable = vec![EffectiveVar::new(
+            "SPECIAL_CHARS".to_string(),
+            "hello 'world' $HOME `date`".to_string(),
+            "Default".to_string(),
+            "Custom".to_string(),
+        )];
         let script2 = generate_env_sh_content(&vars_after_disable);
 
         let test_cmd = format!(
@@ -255,38 +255,30 @@ mod tests {
 
         let mut state = AppStateData {
             phase: PhaseConfig::default(),
-            default_vars: vec![
-                EnvVar {
-                    key: "A".to_string(),
-                    value: "val_default".to_string(),
-                    source: VarSource::Custom,
-                },
-                EnvVar {
-                    key: "BASE_VAR".to_string(),
-                    value: "always_here".to_string(),
-                    source: VarSource::Custom,
-                },
-            ],
             profiles: vec![
                 Profile {
                     name: "profile_dua".to_string(),
                     enabled: true,
                     phase_binding: None,
-                    vars: vec![EnvVar {
-                        key: "A".to_string(),
-                        value: "val_profile_dua".to_string(),
-                        source: VarSource::Custom,
-                    }],
+                    vars: vec![
+                        EnvVar::new("A".to_string(), "val_profile_dua".to_string(), VarSource::Custom),
+                        EnvVar::new("BASE_VAR".to_string(), "always_here".to_string(), VarSource::Custom),
+                    ],
                 },
                 Profile {
                     name: "profile_satu".to_string(),
                     enabled: true,
                     phase_binding: None,
-                    vars: vec![EnvVar {
-                        key: "A".to_string(),
-                        value: "val_profile_satu".to_string(),
-                        source: VarSource::Custom,
-                    }],
+                    vars: vec![EnvVar::new("A".to_string(), "val_profile_satu".to_string(), VarSource::Custom)],
+                },
+                Profile {
+                    name: "default".to_string(),
+                    enabled: true,
+                    phase_binding: None,
+                    vars: vec![
+                        EnvVar::new("A".to_string(), "val_default".to_string(), VarSource::Custom),
+                        EnvVar::new("BASE_VAR".to_string(), "always_here".to_string(), VarSource::Custom),
+                    ],
                 },
             ],
         };

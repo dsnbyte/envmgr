@@ -25,12 +25,9 @@ Super lightweight TUI environment manager written in Rust with whole-state AEAD 
 
 - **Encrypted State (`state.enc`)**:
   - Profiles, variable keys, values, and Phase.dev tokens are serialized and encrypted with `ChaCha20-Poly1305` using a hardcoded source key (`HARDCODED_MASTER_KEY` in `src/model.rs`). Changing the encryption key requires updating the source code and rebuilding.
-- **Default vs. Profiles**:
-  - `Default`: Baseline variables that are always exported.
-  - `Profiles`: Can be toggled on/off independently. You can activate multiple profiles at once.
-- **Priority (Top Wins)**:
-  - If variable `A` exists in `Default`, `Profile #2`, and `Profile #1`, and both profiles are ON: **Profile #1 wins** because it is higher in the list.
-  - Reorder profile priority anytime using `K` (move up) or `J` (move down).
+- **Profiles & Priority**:
+  - `Profiles`: Can be toggled on/off independently. A predefined `default` profile is provided on initial setup and can be edited, renamed, deleted, or toggled like any other profile.
+  - `Priority (Top Wins)`: When multiple profiles are enabled, the profile highest in the list (index #1) takes precedence and overwrites duplicate keys from lower profiles. Reorder profile priority anytime using `u` (move up) or `d` (move down).
 - **Clean Unsets**:
   - When you disable a profile, its variables don't linger in your shell session—`envmgr` tracks exported keys via `_ENVMGR_KEYS` and unsets removed ones on reload.
 
@@ -54,11 +51,11 @@ When you want to sync secrets from Phase.dev:
 | Key | Action |
 |---|---|
 | `Space` | Toggle selected profile ON / OFF |
-| `K` / `u` | Move profile **UP** (higher priority) |
-| `J` / `d` | Move profile **DOWN** (lower priority) |
+| `u` | Move profile **UP** (higher priority) |
+| `d` | Move profile **DOWN** (lower priority) |
 | `Tab` | Switch between Profiles, Variables, and Active System View |
 | `a` | Add custom manual variable |
-| `e` / `Enter` | Edit selected variable |
+| `e` / `Enter` | Edit selected profile (rename) or variable |
 | `x` / `Del` | Delete selected variable or profile |
 | `n` | Create new profile (manual or pull from Phase) |
 | `p` | Pull secrets from Phase.dev into current target |
