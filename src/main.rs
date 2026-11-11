@@ -4,6 +4,7 @@ mod shell;
 mod tui;
 
 use model::AppStateData;
+use phase::{detect_phase_cli, sync_phase_profiles};
 use shell::{apply_state_to_system, generate_env_sh_content, reload_shell_environment};
 
 fn print_help() {
@@ -12,9 +13,10 @@ fn print_help() {
          USAGE:\n\
          \x20 envmgr            Launch the interactive Terminal UI (TUI)\n\
          \x20 envmgr export     Decrypt active variables and print shell export statements to stdout\n\
+         \x20 envmgr sync       Synchronize Phase.dev profiles using configured Auth (CLI or API Token)\n\
          \x20 envmgr reload     Save encrypted state, ensure ~/.bashrc hook, and reload shell config\n\
          \x20 envmgr apply      Alias for `envmgr reload`\n\
-         \x20 envmgr status     Show active profiles and effective environment variables\n\
+         \x20 envmgr status     Show active profiles, data sources, settings, and effective variables\n\
          \x20 envmgr --help     Show this help message"
     );
 }
@@ -28,9 +30,37 @@ fn main() {
                 return;
             }
             "export" => {
-                let state = AppStateData::load();
+                let mut state = AppStateData::load();
+                let now = AppStateData::current_epoch_secs();
+                if state.is_auto_sync_due(now) {
+                    if sync_phase_profiles(&mut state, None).is_ok() {
+                        let _ = state.save();
+                    }
+                }
                 let effective = state.compute_effective_vars();
                 print!("{}", generate_env_sh_content(&effective));
+                return;
+            }
+            "sync" => {
+                let mut state = AppStateData::load();
+                match sync_phase_profiles(&mut state, None) {
+                    Ok((prof_count, var_count)) => {
+                        if let Err(e) = apply_state_to_system(&state) {
+                            eprintln!("Error saving synced state: {}", e);
+                            std::process::exit(1);
+                        }
+                        println!(
+                            "Synchronized {} Phase.dev profile(s) ({} total variables) via {}.",
+                            prof_count,
+                            var_count,
+                            state.phase.auth_method.label()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("Phase.dev sync error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
                 return;
             }
             "apply" | "reload" => {
@@ -72,33 +102,56 @@ fn main() {
             }
             "status" => {
                 let state = AppStateData::load();
+                let cli_status = detect_phase_cli();
                 println!(
                     "Encrypted Store: {}",
                     AppStateData::state_file_path().display()
                 );
                 println!("Phase.dev Host : {}", state.phase.effective_host());
                 println!(
-                    "Phase.dev Auth : {}",
+                    "Phase.dev Auth : {} ({})",
+                    state.phase.auth_method.label(),
                     if state.phase.is_configured() {
-                        "Configured (Encrypted)"
+                        "Configured"
                     } else {
                         "Not Configured"
+                    }
+                );
+                println!("Phase CLI      : {}", cli_status.summary_badge());
+                println!(
+                    "Auto-Sync      : {}",
+                    if state.settings.auto_sync_enabled {
+                        format!(
+                            "Enabled (every {} min, min 1 min)",
+                            state.settings.effective_interval_mins()
+                        )
+                    } else {
+                        "Disabled".to_string()
                     }
                 );
                 println!("Profiles ({})   :", state.profiles.len());
                 for p in &state.profiles {
                     let st = if p.enabled { "ON " } else { "OFF" };
-                    println!("  [{}] {} ({} vars)", st, p.name, p.vars.len());
+                    println!(
+                        "  [{}] {} ({} vars) [{}]",
+                        st,
+                        p.name,
+                        p.vars.len(),
+                        p.source_label()
+                    );
                 }
                 let eff = state.compute_effective_vars();
                 println!("\nEffective Variables ({}):", eff.len());
                 for v in eff {
-                    println!("  {} (from {})", v.key, v.winning_owner);
+                    println!("  {} (from {} | {})", v.key, v.winning_owner, v.source_label);
                 }
                 return;
             }
             _ => {
-                eprintln!("Unknown argument '{}'. Run `envmgr --help` for usage.", first);
+                eprintln!(
+                    "Unknown argument '{}'. Run `envmgr --help` for usage.",
+                    first
+                );
                 std::process::exit(1);
             }
         }

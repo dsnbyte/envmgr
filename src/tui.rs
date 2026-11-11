@@ -1,8 +1,11 @@
 use crate::model::{
-    is_valid_env_key, AppStateData, EnvVar, HostMode, PhaseBinding, PhaseConfig, Profile,
-    PHASE_CLOUD_HOST,
+    is_valid_env_key, AppSettings, AppStateData, EnvVar, HostMode, PhaseAuthMethod, PhaseBinding,
+    PhaseConfig, Profile, MIN_AUTO_SYNC_INTERVAL_MINS, PHASE_CLOUD_HOST,
 };
-use crate::phase::{fetch_apps_and_envs, fetch_secrets_for_env, try_detect_local_phase_cli_host, PhaseAppInfo};
+use crate::phase::{
+    detect_phase_cli_detailed, fetch_apps_and_envs, fetch_secrets_for_env, sync_phase_profiles,
+    try_detect_local_phase_cli_host, PhaseAppInfo, PhaseCliStatus,
+};
 use crate::shell::{apply_state_to_system, reload_shell_environment};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -12,9 +15,13 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{
+        Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Row, Table,
+        TableState, Wrap,
+    },
     Frame,
 };
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusPane {
@@ -27,21 +34,24 @@ pub enum FocusPane {
 pub enum Modal {
     None,
     PhaseConnect {
+        auth_method: PhaseAuthMethod,
         host_mode: HostMode,
         custom_url: String,
         pat_token: String,
-        active_field: usize, // 0 = mode, 1 = custom_url (if SelfHosted) or pat_token, 2 = pat_token
+        cli_status: PhaseCliStatus,
+        active_field: usize,
+        pending_new_profile: Option<String>,
         error: Option<String>,
     },
     NewProfile {
         name: String,
         pull_from_phase: bool,
-        active_field: usize, // 0 = name, 1 = source toggle
+        active_field: usize, // 0 = name, 1 = data source
         error: Option<String>,
     },
     PhasePicker {
-        target_profile_idx: Option<usize>, // None = Default, Some(idx) = profile index
-        new_profile_name: Option<String>,  // If creating a new profile
+        target_profile_idx: Option<usize>,
+        new_profile_name: Option<String>,
         apps: Vec<PhaseAppInfo>,
         selected_app: usize,
         selected_env: usize,
@@ -69,6 +79,12 @@ pub enum Modal {
         name: String,
         error: Option<String>,
     },
+    Settings {
+        draft: AppSettings,
+        interval_input: String,
+        active_field: usize, // 0..7
+        error: Option<String>,
+    },
 }
 
 pub struct App {
@@ -84,19 +100,24 @@ pub struct App {
     pub should_quit: bool,
     pub cached_apps: Vec<PhaseAppInfo>,
     pub last_area: Rect,
+    pub last_auto_sync_attempt: Option<Instant>,
 }
 
 impl App {
     pub fn new(mut data: AppStateData) -> Self {
-        // Pre-fill host from ~/.phase/config.json if not configured yet
+        data.settings.normalize();
+        data.phase.auto_detect_cli();
+
         if !data.phase.is_configured() {
             if let Some((mode, url)) = try_detect_local_phase_cli_host() {
                 data.phase.host_mode = mode;
-                if !url.is_empty() {
+                if !url.is_empty() && data.phase.custom_url.is_empty() {
                     data.phase.custom_url = url;
                 }
             }
         }
+
+        let show_values = !data.settings.mask_secrets_by_default;
 
         let mut app = Self {
             data,
@@ -104,16 +125,16 @@ impl App {
             selected_profile: 0,
             selected_var: 0,
             selected_effective: 0,
-            show_values: false,
+            show_values,
             modal: Modal::None,
             status_message: String::new(),
             is_error_status: false,
             should_quit: false,
             cached_apps: Vec::new(),
             last_area: Rect::default(),
+            last_auto_sync_attempt: None,
         };
 
-        // Ensure env.sh and .bashrc are initialized right away
         if !cfg!(test) {
             if let Err(e) = apply_state_to_system(&app.data) {
                 app.set_error(e);
@@ -175,6 +196,43 @@ impl App {
         }
     }
 
+    /// Checks if automatic Phase.dev sync is due and performs it if needed.
+    pub fn check_auto_sync(&mut self) {
+        if !matches!(self.modal, Modal::None) {
+            return;
+        }
+        if let Some(last_try) = self.last_auto_sync_attempt {
+            let backoff = Duration::from_secs(
+                (self.data.settings.effective_interval_mins() * 60).min(60),
+            );
+            if last_try.elapsed() < backoff {
+                return;
+            }
+        }
+
+        let now_epoch = AppStateData::current_epoch_secs();
+        if !self.data.is_auto_sync_due(now_epoch) {
+            return;
+        }
+
+        self.last_auto_sync_attempt = Some(Instant::now());
+        match sync_phase_profiles(&mut self.data, None) {
+            Ok((prof_count, var_count)) if prof_count > 0 => {
+                self.clamp_selections();
+                self.sync_to_system(&format!(
+                    "Auto-synced {} Phase.dev profile(s) ({} vars)",
+                    prof_count, var_count
+                ));
+            }
+            Ok(_) => {
+                self.data.last_phase_sync_epoch = now_epoch;
+            }
+            Err(e) => {
+                self.set_error(format!("Phase.dev auto-sync failed: {}", e));
+            }
+        }
+    }
+
     pub fn current_profile(&self) -> Option<&Profile> {
         self.data.profiles.get(self.selected_profile)
     }
@@ -191,13 +249,6 @@ impl App {
         }
     }
 
-    pub fn current_vars_mut(&mut self) -> Option<&mut Vec<EnvVar>> {
-        self.data
-            .profiles
-            .get_mut(self.selected_profile)
-            .map(|p| &mut p.vars)
-    }
-
     pub fn current_target_title(&self) -> String {
         if let Some(prof) = self.current_profile() {
             let state_str = if prof.enabled { "ON" } else { "OFF" };
@@ -205,12 +256,7 @@ impl App {
                 Some(b) => format!(" | Phase: {}/{}", b.app_name, b.env_name),
                 None => String::new(),
             };
-            format!(
-                "Profile: {} [{}]{}",
-                prof.name,
-                state_str,
-                phase_str
-            )
+            format!("Profile: {} [{}]{}", prof.name, state_str, phase_str)
         } else {
             "No Profile Selected".to_string()
         }
@@ -236,12 +282,41 @@ impl App {
         }
     }
 
+    pub fn open_phase_connect_modal(&mut self, pending_new_profile: Option<String>, error: Option<String>) {
+        let cli_status = detect_phase_cli_detailed();
+        let auth_method = if self.data.phase.pat_token.trim().is_empty() && cli_status.installed {
+            PhaseAuthMethod::Cli
+        } else {
+            self.data.phase.auth_method
+        };
+        self.modal = Modal::PhaseConnect {
+            auth_method,
+            host_mode: self.data.phase.host_mode,
+            custom_url: self.data.phase.custom_url.clone(),
+            pat_token: self.data.phase.pat_token.clone(),
+            cli_status,
+            active_field: 0,
+            pending_new_profile,
+            error,
+        };
+    }
+
+    pub fn open_settings_modal(&mut self) {
+        let draft = self.data.settings.clone();
+        let interval_input = draft.effective_interval_mins().to_string();
+        self.modal = Modal::Settings {
+            draft,
+            interval_input,
+            active_field: 0,
+            error: None,
+        };
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
         }
 
-        // Global Ctrl+C quit
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.should_quit = true;
             return;
@@ -284,25 +359,30 @@ impl App {
                 self.set_info(format!("Secret values are now {}.", state));
             }
             KeyCode::Char('c') => {
-                self.modal = Modal::PhaseConnect {
-                    host_mode: self.data.phase.host_mode,
-                    custom_url: self.data.phase.custom_url.clone(),
-                    pat_token: self.data.phase.pat_token.clone(),
-                    active_field: 0,
-                    error: None,
-                };
+                self.open_phase_connect_modal(None, None);
+            }
+            KeyCode::Char('s') => {
+                self.open_settings_modal();
             }
             KeyCode::Char('n') => {
                 self.modal = Modal::NewProfile {
                     name: String::new(),
-                    pull_from_phase: self.data.phase.is_configured(),
+                    pull_from_phase: false,
                     active_field: 0,
                     error: None,
                 };
             }
             KeyCode::Char('a') => {
-                if self.data.profiles.is_empty() {
+                let Some(prof) = self.current_profile() else {
                     self.set_error("No profile available. Create a profile first with [n].");
+                    return;
+                };
+                if prof.is_phase() {
+                    let pname = prof.name.clone();
+                    self.set_error(format!(
+                        "Profile '{}' uses Phase.dev synchronization. Sources cannot be mixed (create a Custom profile with [n]).",
+                        pname
+                    ));
                 } else {
                     self.modal = Modal::VarEditor {
                         is_edit: false,
@@ -321,11 +401,10 @@ impl App {
                 self.handle_delete_action();
             }
             KeyCode::Char('p') => {
-                if self.data.profiles.is_empty() {
-                    self.open_phase_picker(None, None);
-                } else {
-                    self.open_phase_picker(Some(self.selected_profile), None);
-                }
+                self.handle_phase_sync_action(false);
+            }
+            KeyCode::Char('P') => {
+                self.handle_phase_sync_action(true);
             }
             KeyCode::Char('r') => {
                 self.reload_shell();
@@ -335,6 +414,73 @@ impl App {
                 FocusPane::Vars => self.handle_vars_pane_key(key),
                 FocusPane::Effective => self.handle_effective_pane_key(key),
             },
+        }
+    }
+
+    fn handle_phase_sync_action(&mut self, force_rebind_picker: bool) {
+        let Some(prof) = self.current_profile() else {
+            self.set_error("No profile available. Press [n] to create a Phase.dev profile.");
+            return;
+        };
+
+        if prof.is_phase() {
+            let idx = self.selected_profile;
+            if force_rebind_picker {
+                self.open_phase_picker(Some(idx), None);
+                return;
+            }
+            if !self.data.phase.is_configured() {
+                self.open_phase_connect_modal(
+                    None,
+                    Some("Configure Phase.dev authentication to sync this profile.".to_string()),
+                );
+                return;
+            }
+            match sync_phase_profiles(&mut self.data, Some(idx)) {
+                Ok((_, vars_count)) => {
+                    self.clamp_selections();
+                    let pname = self.data.profiles[idx].name.clone();
+                    let src = self.data.profiles[idx].source_label();
+                    self.sync_to_system(&format!(
+                        "Synced {} var(s) from {} into '{}'",
+                        vars_count, src, pname
+                    ));
+                }
+                Err(e) => {
+                    self.set_error(format!("Phase.dev sync failed: {}", e));
+                }
+            }
+        } else {
+            // Selected profile is a Custom profile: never mix Phase vars into it.
+            // If other Phase profiles exist, sync all Phase profiles; otherwise inform the user.
+            let has_any_phase = self.data.profiles.iter().any(|p| p.is_phase());
+            if has_any_phase {
+                if !self.data.phase.is_configured() {
+                    self.open_phase_connect_modal(
+                        None,
+                        Some("Configure Phase.dev authentication to sync Phase profiles.".to_string()),
+                    );
+                    return;
+                }
+                match sync_phase_profiles(&mut self.data, None) {
+                    Ok((prof_count, vars_count)) => {
+                        self.clamp_selections();
+                        self.sync_to_system(&format!(
+                            "Synced {} Phase.dev profile(s) ({} vars)",
+                            prof_count, vars_count
+                        ));
+                    }
+                    Err(e) => {
+                        self.set_error(format!("Phase.dev sync failed: {}", e));
+                    }
+                }
+            } else {
+                let pname = prof.name.clone();
+                self.set_error(format!(
+                    "Profile '{}' uses a Custom environment (sources cannot be mixed). Create a Phase.dev profile with [n].",
+                    pname
+                ));
+            }
         }
     }
 
@@ -365,13 +511,25 @@ impl App {
     }
 
     fn open_edit_var(&mut self) {
+        let Some(prof) = self.current_profile() else {
+            self.set_info("No profile selected.");
+            return;
+        };
+        if prof.is_phase() {
+            let pname = prof.name.clone();
+            self.set_error(format!(
+                "Profile '{}' is synced with Phase.dev. Variables cannot be edited manually (press [p] to sync).",
+                pname
+            ));
+            return;
+        }
         if let Some(var) = self.current_vars().get(self.selected_var) {
             self.modal = Modal::VarEditor {
                 is_edit: true,
                 original_index: Some(self.selected_var),
                 var_key: var.key.clone(),
                 var_value: var.value.clone(),
-                active_field: 1, // Focus value by default when editing
+                active_field: 1,
                 error: None,
             };
         } else {
@@ -387,6 +545,15 @@ impl App {
                     continue;
                 }
                 if let Some(v_idx) = prof.vars.iter().position(|v| v.key == ev.key) {
+                    if prof.is_phase() {
+                        let pname = prof.name.clone();
+                        let vkey = ev.key.clone();
+                        self.set_error(format!(
+                            "Variable '{}' belongs to Phase.dev profile '{}' and cannot be edited manually.",
+                            vkey, pname
+                        ));
+                        return;
+                    }
                     self.selected_profile = p_idx;
                     self.selected_var = v_idx;
                     self.focus = FocusPane::Vars;
@@ -416,6 +583,17 @@ impl App {
                 }
             }
             FocusPane::Vars => {
+                let Some(prof) = self.current_profile() else {
+                    return;
+                };
+                if prof.is_phase() {
+                    let pname = prof.name.clone();
+                    self.set_error(format!(
+                        "Profile '{}' is synced with Phase.dev. Manage variables in Phase.dev and press [p] to sync.",
+                        pname
+                    ));
+                    return;
+                }
                 if let Some(var) = self.current_vars().get(self.selected_var) {
                     self.modal = Modal::ConfirmDeleteVar {
                         var_idx: self.selected_var,
@@ -472,26 +650,24 @@ impl App {
             }
             return;
         }
-        self.data.profiles.swap(self.selected_profile, self.selected_profile - 1);
+        self.data
+            .profiles
+            .swap(self.selected_profile, self.selected_profile - 1);
         self.selected_profile -= 1;
         let name = self.data.profiles[self.selected_profile].name.clone();
-        self.sync_to_system(&format!(
-            "Moved profile '{}' up",
-            name
-        ));
+        self.sync_to_system(&format!("Moved profile '{}' up", name));
     }
 
     fn move_selected_profile_down(&mut self) {
         if self.data.profiles.is_empty() || self.selected_profile + 1 >= self.data.profiles.len() {
             return;
         }
-        self.data.profiles.swap(self.selected_profile, self.selected_profile + 1);
+        self.data
+            .profiles
+            .swap(self.selected_profile, self.selected_profile + 1);
         self.selected_profile += 1;
         let name = self.data.profiles[self.selected_profile].name.clone();
-        self.sync_to_system(&format!(
-            "Moved profile '{}' down",
-            name
-        ));
+        self.sync_to_system(&format!("Moved profile '{}' down", name));
     }
 
     fn handle_vars_pane_key(&mut self, key: KeyEvent) {
@@ -539,21 +715,31 @@ impl App {
         target_profile_idx: Option<usize>,
         new_profile_name: Option<String>,
     ) {
+        if let Some(idx) = target_profile_idx {
+            if let Some(prof) = self.data.profiles.get(idx) {
+                if prof.is_custom() {
+                    let pname = prof.name.clone();
+                    self.set_error(format!(
+                        "Profile '{}' is a Custom profile; sources cannot be mixed.",
+                        pname
+                    ));
+                    return;
+                }
+            }
+        }
+
         if !self.data.phase.is_configured() {
-            self.modal = Modal::PhaseConnect {
-                host_mode: self.data.phase.host_mode,
-                custom_url: self.data.phase.custom_url.clone(),
-                pat_token: self.data.phase.pat_token.clone(),
-                active_field: 0,
-                error: Some("Please configure Phase.dev connection first.".to_string()),
-            };
+            self.open_phase_connect_modal(
+                new_profile_name,
+                Some("Please configure Phase.dev authentication first.".to_string()),
+            );
             return;
         }
 
         match fetch_apps_and_envs(&self.data.phase) {
             Ok(apps) => {
                 if apps.is_empty() {
-                    self.set_error("Connected to Phase.dev, but no Apps were found for this PAT.");
+                    self.set_error("Connected to Phase.dev, but no Apps were found.");
                     return;
                 }
                 self.cached_apps = apps.clone();
@@ -569,15 +755,20 @@ impl App {
             }
             Err(e) => {
                 self.set_error(format!("Phase.dev error: {}", e));
-                self.modal = Modal::PhaseConnect {
-                    host_mode: self.data.phase.host_mode,
-                    custom_url: self.data.phase.custom_url.clone(),
-                    pat_token: self.data.phase.pat_token.clone(),
-                    active_field: 0,
-                    error: Some(e),
-                };
+                self.open_phase_connect_modal(new_profile_name, Some(e));
             }
         }
+    }
+
+    fn insert_new_profile(&mut self, profile: Profile) {
+        if self.data.settings.insert_new_profile_at_top {
+            self.data.profiles.insert(0, profile);
+            self.selected_profile = 0;
+        } else {
+            self.data.profiles.push(profile);
+            self.selected_profile = self.data.profiles.len().saturating_sub(1);
+        }
+        self.selected_var = 0;
     }
 
     fn handle_modal_key(&mut self, key: KeyEvent) {
@@ -585,16 +776,28 @@ impl App {
         match modal {
             Modal::None => {}
             Modal::PhaseConnect {
+                mut auth_method,
                 mut host_mode,
                 mut custom_url,
                 mut pat_token,
+                mut cli_status,
                 mut active_field,
+                pending_new_profile,
                 mut error,
             } => {
-                let max_fields = match host_mode {
-                    HostMode::Cloud => 2,      // 0 = Mode, 1 = PAT
-                    HostMode::SelfHosted => 3, // 0 = Mode, 1 = URL, 2 = PAT
+                // Fields:
+                // When auth_method == Cli: 1 field (0 = Auth Method)
+                // When auth_method == Token & Cloud: 2 fields (0 = Auth Method, 1 = Server Mode, 2 = PAT) -> 3 fields
+                // When auth_method == Token & SelfHosted: 4 fields (0 = Auth Method, 1 = Server Mode, 2 = URL, 3 = PAT)
+                let max_fields = match auth_method {
+                    PhaseAuthMethod::Cli => 1,
+                    PhaseAuthMethod::Token => match host_mode {
+                        HostMode::Cloud => 3,
+                        HostMode::SelfHosted => 4,
+                    },
                 };
+
+                let pat_field_idx = if host_mode == HostMode::Cloud { 2 } else { 3 };
 
                 match key.code {
                     KeyCode::Esc => {
@@ -607,8 +810,25 @@ impl App {
                     KeyCode::BackTab | KeyCode::Up => {
                         active_field = (active_field + max_fields - 1) % max_fields;
                     }
+                    KeyCode::Char('r') if auth_method == PhaseAuthMethod::Cli => {
+                        cli_status = detect_phase_cli_detailed();
+                        error = None;
+                    }
                     KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
                         if active_field == 0 =>
+                    {
+                        auth_method = match auth_method {
+                            PhaseAuthMethod::Cli => PhaseAuthMethod::Token,
+                            PhaseAuthMethod::Token => PhaseAuthMethod::Cli,
+                        };
+                        if auth_method == PhaseAuthMethod::Cli {
+                            cli_status = detect_phase_cli_detailed();
+                        }
+                        active_field = 0;
+                        error = None;
+                    }
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                        if auth_method == PhaseAuthMethod::Token && active_field == 1 =>
                     {
                         host_mode = match host_mode {
                             HostMode::Cloud => HostMode::SelfHosted,
@@ -616,42 +836,93 @@ impl App {
                         };
                         error = None;
                     }
-                    KeyCode::Backspace => {
-                        if host_mode == HostMode::SelfHosted && active_field == 1 {
+                    KeyCode::Backspace if auth_method == PhaseAuthMethod::Token => {
+                        if host_mode == HostMode::SelfHosted && active_field == 2 {
                             custom_url.pop();
-                        } else if (host_mode == HostMode::Cloud && active_field == 1)
-                            || (host_mode == HostMode::SelfHosted && active_field == 2)
-                        {
+                            error = None;
+                        } else if active_field == pat_field_idx {
                             pat_token.pop();
+                            error = None;
                         }
                     }
-                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        if host_mode == HostMode::SelfHosted && active_field == 1 {
+                    KeyCode::Char('u')
+                        if auth_method == PhaseAuthMethod::Token
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        if host_mode == HostMode::SelfHosted && active_field == 2 {
                             custom_url.clear();
-                        } else if (host_mode == HostMode::Cloud && active_field == 1)
-                            || (host_mode == HostMode::SelfHosted && active_field == 2)
-                        {
+                        } else if active_field == pat_field_idx {
                             pat_token.clear();
                         }
                     }
-                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        if host_mode == HostMode::SelfHosted && active_field == 1 {
+                    KeyCode::Char(c)
+                        if auth_method == PhaseAuthMethod::Token
+                            && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        if host_mode == HostMode::SelfHosted && active_field == 2 {
                             custom_url.push(c);
                             error = None;
-                        } else if (host_mode == HostMode::Cloud && active_field == 1)
-                            || (host_mode == HostMode::SelfHosted && active_field == 2)
-                        {
+                        } else if active_field == pat_field_idx {
                             pat_token.push(c);
                             error = None;
                         }
                     }
                     KeyCode::Enter => {
-                        if host_mode == HostMode::SelfHosted && custom_url.trim().is_empty() {
+                        if auth_method == PhaseAuthMethod::Cli {
+                            cli_status = detect_phase_cli_detailed();
+                            if !cli_status.installed {
+                                error = Some(
+                                    "Phase CLI (`phase`) is not installed or not in PATH.".to_string(),
+                                );
+                            } else {
+                                let new_cfg = PhaseConfig {
+                                    auth_method: PhaseAuthMethod::Cli,
+                                    host_mode,
+                                    custom_url: custom_url.trim().to_string(),
+                                    pat_token: pat_token.trim().to_string(),
+                                };
+                                match fetch_apps_and_envs(&new_cfg) {
+                                    Ok(apps) => {
+                                        let app_count = apps.len();
+                                        self.cached_apps = apps.clone();
+                                        self.data.phase = new_cfg;
+                                        let _ = self.data.save();
+                                        if let Some(prof_name) = pending_new_profile {
+                                            self.modal = Modal::PhasePicker {
+                                                target_profile_idx: None,
+                                                new_profile_name: Some(prof_name),
+                                                apps,
+                                                selected_app: 0,
+                                                selected_env: 0,
+                                                selecting_env: false,
+                                                error: None,
+                                            };
+                                            return;
+                                        }
+                                        self.set_info(format!(
+                                            "Connected to Phase.dev via CLI ({})! Found {} app(s).",
+                                            self.data.phase.effective_host(),
+                                            app_count
+                                        ));
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        error = Some(format!(
+                                            "{} (Ensure `phase auth` is logged in, or press Ctrl+S to save)",
+                                            e
+                                        ));
+                                    }
+                                }
+                            }
+                        } else if host_mode == HostMode::SelfHosted && custom_url.trim().is_empty()
+                        {
                             error = Some("Self-hosted URL cannot be empty.".to_string());
                         } else if pat_token.trim().is_empty() {
-                            error = Some("Personal Access Token (PAT) cannot be empty.".to_string());
+                            error =
+                                Some("Personal Access Token (PAT) cannot be empty.".to_string());
                         } else {
                             let new_cfg = PhaseConfig {
+                                auth_method: PhaseAuthMethod::Token,
                                 host_mode,
                                 custom_url: custom_url.trim().to_string(),
                                 pat_token: pat_token.trim().to_string(),
@@ -659,18 +930,29 @@ impl App {
                             match fetch_apps_and_envs(&new_cfg) {
                                 Ok(apps) => {
                                     let app_count = apps.len();
-                                    self.cached_apps = apps;
+                                    self.cached_apps = apps.clone();
                                     self.data.phase = new_cfg;
                                     let _ = self.data.save();
+                                    if let Some(prof_name) = pending_new_profile {
+                                        self.modal = Modal::PhasePicker {
+                                            target_profile_idx: None,
+                                            new_profile_name: Some(prof_name),
+                                            apps,
+                                            selected_app: 0,
+                                            selected_env: 0,
+                                            selecting_env: false,
+                                            error: None,
+                                        };
+                                        return;
+                                    }
                                     self.set_info(format!(
-                                        "Connected to Phase.dev ({})! Found {} app(s).",
+                                        "Connected to Phase.dev via API Token ({})! Found {} app(s).",
                                         self.data.phase.effective_host(),
                                         app_count
                                     ));
                                     return;
                                 }
                                 Err(e) => {
-                                    // Allow saving with Ctrl+S if offline, otherwise show validation error
                                     error = Some(format!(
                                         "{} (Press Ctrl+S to save without testing)",
                                         e
@@ -682,28 +964,32 @@ impl App {
                     _ => {}
                 }
 
-                // Allow Ctrl+S to force save config without online verification
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && key.code == KeyCode::Char('s')
                 {
                     self.data.phase = PhaseConfig {
+                        auth_method,
                         host_mode,
                         custom_url: custom_url.trim().to_string(),
                         pat_token: pat_token.trim().to_string(),
                     };
                     let _ = self.data.save();
                     self.set_info(format!(
-                        "Saved Phase.dev config ({})",
+                        "Saved Phase.dev config ({}: {})",
+                        self.data.phase.auth_method.label(),
                         self.data.phase.effective_host()
                     ));
                     return;
                 }
 
                 self.modal = Modal::PhaseConnect {
+                    auth_method,
                     host_mode,
                     custom_url,
                     pat_token,
+                    cli_status,
                     active_field,
+                    pending_new_profile,
                     error,
                 };
             }
@@ -725,9 +1011,17 @@ impl App {
                         if active_field == 1 =>
                     {
                         pull_from_phase = !pull_from_phase;
+                        error = None;
                     }
                     KeyCode::Backspace if active_field == 0 => {
                         name.pop();
+                        error = None;
+                    }
+                    KeyCode::Char('u')
+                        if active_field == 0
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        name.clear();
                         error = None;
                     }
                     KeyCode::Char(c)
@@ -752,20 +1046,9 @@ impl App {
                             self.open_phase_picker(None, Some(trimmed));
                             return;
                         } else {
-                            // Insert at top of profile list so new profile is #1 or at end
-                            self.data.profiles.insert(
-                                0,
-                                Profile {
-                                    name: trimmed.clone(),
-                                    enabled: true,
-                                    phase_binding: None,
-                                    vars: Vec::new(),
-                                },
-                            );
-                            self.selected_profile = 0;
-                            self.selected_var = 0;
+                            self.insert_new_profile(Profile::new_custom(trimmed.clone()));
                             self.sync_to_system(&format!(
-                                "Created custom profile '{}' at top priority",
+                                "Created custom profile '{}'",
                                 trimmed
                             ));
                             return;
@@ -838,7 +1121,14 @@ impl App {
                             }
                         } else if let Some(app) = apps.get(selected_app) {
                             if let Some(env) = app.environments.get(selected_env) {
-                                match fetch_secrets_for_env(&self.data.phase, &app.id, &env.id) {
+                                let export_all = self.data.settings.phase_export_all_paths;
+                                match fetch_secrets_for_env(
+                                    &self.data.phase,
+                                    &app.id,
+                                    &env.id,
+                                    Some(&env.name),
+                                    export_all,
+                                ) {
                                     Ok(fetched_pairs) => {
                                         let fetched_len = fetched_pairs.len();
                                         let binding = PhaseBinding {
@@ -847,58 +1137,29 @@ impl App {
                                             env_id: env.id.clone(),
                                             env_name: env.name.clone(),
                                         };
+                                        self.data.last_phase_sync_epoch =
+                                            AppStateData::current_epoch_secs();
 
                                         if let Some(prof_name) = new_profile_name {
-                                            let mut vars = Vec::new();
-                                            AppStateData::merge_phase_vars(
-                                                &mut vars,
-                                                &app.name,
-                                                &env.name,
+                                            let new_prof = Profile::new_phase(
+                                                prof_name.clone(),
+                                                binding,
                                                 fetched_pairs,
                                             );
-                                            self.data.profiles.insert(
-                                                0,
-                                                Profile {
-                                                    name: prof_name.clone(),
-                                                    enabled: true,
-                                                    phase_binding: Some(binding),
-                                                    vars,
-                                                },
-                                            );
-                                            self.selected_profile = 0;
-                                            self.selected_var = 0;
+                                            self.insert_new_profile(new_prof);
                                             self.sync_to_system(&format!(
-                                                "Created profile '{}' with {} var(s) from Phase ({}/{})",
+                                                "Created Phase.dev profile '{}' with {} var(s) ({}/{})",
                                                 prof_name, fetched_len, app.name, env.name
                                             ));
                                         } else if let Some(idx) = target_profile_idx {
                                             if let Some(prof) = self.data.profiles.get_mut(idx) {
-                                                prof.phase_binding = Some(binding);
-                                                AppStateData::merge_phase_vars(
-                                                    &mut prof.vars,
-                                                    &app.name,
-                                                    &env.name,
-                                                    fetched_pairs,
-                                                );
+                                                prof.set_phase_vars(binding, fetched_pairs);
                                                 let pname = prof.name.clone();
                                                 self.sync_to_system(&format!(
-                                                    "Pulled {} var(s) from Phase ({}/{}) into '{}'",
+                                                    "Synced {} var(s) from Phase ({}/{}) into '{}'",
                                                     fetched_len, app.name, env.name, pname
                                                 ));
                                             }
-                                        } else if let Some(prof) = self.current_profile_mut() {
-                                            prof.phase_binding = Some(binding);
-                                            AppStateData::merge_phase_vars(
-                                                &mut prof.vars,
-                                                &app.name,
-                                                &env.name,
-                                                fetched_pairs,
-                                            );
-                                            let pname = prof.name.clone();
-                                            self.sync_to_system(&format!(
-                                                "Pulled {} var(s) from Phase ({}/{}) into '{}'",
-                                                fetched_len, app.name, env.name, pname
-                                            ));
                                         }
                                         self.clamp_selections();
                                         return;
@@ -969,24 +1230,31 @@ impl App {
                                 "Invalid variable name. Use letters, digits, '_' (cannot start with digit)."
                                     .to_string(),
                             );
-                        } else if let Some(vars) = self.current_vars_mut() {
-                            if is_edit {
-                                if let Some(idx) = original_index {
-                                    if let Some(v) = vars.get_mut(idx) {
-                                        v.key = k.clone();
-                                        v.set_value(var_value.clone());
-                                    }
-                                }
+                        } else if let Some(prof) = self.current_profile_mut() {
+                            if prof.is_phase() {
+                                error = Some(
+                                    "Cannot modify variables manually in a Phase.dev profile."
+                                        .to_string(),
+                                );
                             } else {
-                                AppStateData::upsert_custom_var(vars, k.clone(), var_value.clone());
+                                if is_edit {
+                                    if let Some(idx) = original_index {
+                                        if let Some(v) = prof.vars.get_mut(idx) {
+                                            v.key = k.clone();
+                                            v.set_value(var_value.clone());
+                                        }
+                                    }
+                                } else {
+                                    let _ = prof.upsert_custom_var(k.clone(), var_value.clone());
+                                }
+                                self.clamp_selections();
+                                let target_name = self.current_target_title();
+                                self.sync_to_system(&format!(
+                                    "Saved variable '{}' in {}",
+                                    k, target_name
+                                ));
+                                return;
                             }
-                            self.clamp_selections();
-                            let target_name = self.current_target_title();
-                            self.sync_to_system(&format!(
-                                "Saved variable '{}' in {}",
-                                k, target_name
-                            ));
-                            return;
                         }
                     }
                     _ => {}
@@ -1024,9 +1292,9 @@ impl App {
 
             Modal::ConfirmDeleteVar { var_idx, var_key } => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    if let Some(vars) = self.current_vars_mut() {
-                        if var_idx < vars.len() {
-                            vars.remove(var_idx);
+                    if let Some(prof) = self.current_profile_mut() {
+                        if prof.is_custom() && var_idx < prof.vars.len() {
+                            prof.vars.remove(var_idx);
                             self.clamp_selections();
                             self.sync_to_system(&format!("Deleted variable '{}'", var_key));
                         }
@@ -1053,6 +1321,14 @@ impl App {
                     }
                     KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         name.clear();
+                    }
+                    KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if let Some(prof) = self.data.profiles.get(profile_idx) {
+                            if prof.is_phase() {
+                                self.open_phase_picker(Some(profile_idx), None);
+                                return;
+                            }
+                        }
                     }
                     KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                         name.push(c);
@@ -1091,6 +1367,171 @@ impl App {
                     error,
                 };
             }
+
+            Modal::Settings {
+                mut draft,
+                mut interval_input,
+                mut active_field,
+                mut error,
+            } => {
+                const TOTAL_SETTINGS_FIELDS: usize = 7;
+
+                // Sync parsed interval input into draft before navigation/actions
+                let sync_interval_from_str = |input: &str, d: &mut AppSettings| {
+                    if let Ok(parsed) = input.trim().parse::<u64>() {
+                        d.set_interval_mins(parsed.max(MIN_AUTO_SYNC_INTERVAL_MINS));
+                    } else if input.trim().is_empty() {
+                        d.set_interval_mins(MIN_AUTO_SYNC_INTERVAL_MINS);
+                    }
+                };
+
+                match key.code {
+                    KeyCode::Esc => {
+                        return;
+                    }
+                    KeyCode::Tab | KeyCode::Down => {
+                        sync_interval_from_str(&interval_input, &mut draft);
+                        interval_input = draft.effective_interval_mins().to_string();
+                        active_field = (active_field + 1) % TOTAL_SETTINGS_FIELDS;
+                        error = None;
+                    }
+                    KeyCode::BackTab | KeyCode::Up => {
+                        sync_interval_from_str(&interval_input, &mut draft);
+                        interval_input = draft.effective_interval_mins().to_string();
+                        active_field =
+                            (active_field + TOTAL_SETTINGS_FIELDS - 1) % TOTAL_SETTINGS_FIELDS;
+                        error = None;
+                    }
+                    KeyCode::Char(' ')
+                    | KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Char('-')
+                    | KeyCode::Char('+')
+                    | KeyCode::Char('=')
+                    | KeyCode::Char('[')
+                    | KeyCode::Char(']') => {
+                        error = None;
+                        match active_field {
+                            0 => {
+                                draft.auto_sync_enabled = !draft.auto_sync_enabled;
+                            }
+                            1 => {
+                                sync_interval_from_str(&interval_input, &mut draft);
+                                let cur = draft.effective_interval_mins();
+                                let next = match key.code {
+                                    KeyCode::Left | KeyCode::Char('-') => {
+                                        cur.saturating_sub(1).max(MIN_AUTO_SYNC_INTERVAL_MINS)
+                                    }
+                                    KeyCode::Right
+                                    | KeyCode::Char('+')
+                                    | KeyCode::Char('=')
+                                    | KeyCode::Char(' ') => (cur + 1).min(1440),
+                                    KeyCode::Char('[') => {
+                                        cur.saturating_sub(5).max(MIN_AUTO_SYNC_INTERVAL_MINS)
+                                    }
+                                    KeyCode::Char(']') => (cur + 5).min(1440),
+                                    _ => cur,
+                                };
+                                draft.set_interval_mins(next);
+                                interval_input = draft.effective_interval_mins().to_string();
+                            }
+                            2 => {
+                                draft.sync_only_enabled_profiles =
+                                    !draft.sync_only_enabled_profiles;
+                            }
+                            3 => {
+                                draft.phase_export_all_paths = !draft.phase_export_all_paths;
+                            }
+                            4 => {
+                                draft.mask_secrets_by_default = !draft.mask_secrets_by_default;
+                            }
+                            5 => {
+                                draft.insert_new_profile_at_top =
+                                    !draft.insert_new_profile_at_top;
+                            }
+                            6 => {
+                                draft.shell_prompt_hook = !draft.shell_prompt_hook;
+                            }
+                            _ => {}
+                        }
+                    }
+                    KeyCode::Backspace if active_field == 1 => {
+                        interval_input.pop();
+                        error = None;
+                    }
+                    KeyCode::Char(c) if active_field == 1 && c.is_ascii_digit() => {
+                        if interval_input.len() < 4 {
+                            interval_input.push(c);
+                            if let Ok(v) = interval_input.parse::<u64>() {
+                                if v >= MIN_AUTO_SYNC_INTERVAL_MINS {
+                                    draft.set_interval_mins(v);
+                                }
+                            }
+                            error = None;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if active_field == 1 {
+                            match interval_input.trim().parse::<u64>() {
+                                Ok(v) if v >= MIN_AUTO_SYNC_INTERVAL_MINS => {
+                                    draft.set_interval_mins(v);
+                                }
+                                Ok(_) => {
+                                    draft.set_interval_mins(MIN_AUTO_SYNC_INTERVAL_MINS);
+                                    interval_input = MIN_AUTO_SYNC_INTERVAL_MINS.to_string();
+                                    error = Some(
+                                        "Minimum auto-sync interval is 1 minute (clamped to 1m)."
+                                            .to_string(),
+                                    );
+                                    self.modal = Modal::Settings {
+                                        draft,
+                                        interval_input,
+                                        active_field,
+                                        error,
+                                    };
+                                    return;
+                                }
+                                Err(_) => {
+                                    error = Some(
+                                        "Please enter a valid interval in minutes (minimum 1)."
+                                            .to_string(),
+                                    );
+                                    self.modal = Modal::Settings {
+                                        draft,
+                                        interval_input,
+                                        active_field,
+                                        error,
+                                    };
+                                    return;
+                                }
+                            }
+                        } else {
+                            sync_interval_from_str(&interval_input, &mut draft);
+                        }
+
+                        draft.normalize();
+                        self.data.settings = draft.clone();
+                        let sync_desc = if draft.auto_sync_enabled {
+                            format!("ON ({}m)", draft.effective_interval_mins())
+                        } else {
+                            "OFF".to_string()
+                        };
+                        self.sync_to_system(&format!(
+                            "Saved Settings (Phase Auto-Sync: {})",
+                            sync_desc
+                        ));
+                        return;
+                    }
+                    _ => {}
+                }
+
+                self.modal = Modal::Settings {
+                    draft,
+                    interval_input,
+                    active_field,
+                    error,
+                };
+            }
         }
     }
 
@@ -1120,19 +1561,29 @@ impl App {
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
         let phase_status = if self.data.phase.is_configured() {
-            let mode_str = match self.data.phase.host_mode {
-                HostMode::Cloud => format!("Cloud ({})", PHASE_CLOUD_HOST),
-                HostMode::SelfHosted => format!("Self-Hosted ({})", self.data.phase.effective_host()),
-            };
+            let auth_tag = self.data.phase.auth_method.label();
+            let host = self.data.phase.effective_host();
             Span::styled(
-                format!(" Connected: {} ", mode_str),
-                Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD),
+                format!(" Connected ({}: {}) ", auth_tag, host),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
             )
         } else {
             Span::styled(
                 " Optional / Offline ([c] Connect) ",
                 Style::default().fg(Color::Gray),
             )
+        };
+
+        let auto_sync_badge = if self.data.settings.auto_sync_enabled {
+            Span::styled(
+                format!("ON ({}m)", self.data.settings.effective_interval_mins()),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled("OFF", Style::default().fg(Color::DarkGray))
         };
 
         let state_path = AppStateData::state_file_path();
@@ -1145,7 +1596,9 @@ impl App {
             ),
             Span::raw("| Phase.dev: "),
             phase_status,
-            Span::raw(" | Encrypted Store: "),
+            Span::raw(" | Auto-Sync: "),
+            auto_sync_badge,
+            Span::raw(" | Store: "),
             Span::styled(
                 state_path.to_string_lossy().into_owned(),
                 Style::default().fg(Color::Gray),
@@ -1157,8 +1610,6 @@ impl App {
             .title(" Environment & Phase.dev Manager ");
         frame.render_widget(Paragraph::new(line).block(block), area);
     }
-
-
 
     fn draw_profiles_pane(&self, frame: &mut Frame, area: Rect) {
         let is_focused = self.focus == FocusPane::Profiles;
@@ -1245,12 +1696,11 @@ impl App {
             })
             .collect();
 
-        let header = Row::new(vec!["KEY", "VALUE ([v] show/hide)", "SOURCE"])
-            .style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            );
+        let header = Row::new(vec!["KEY", "VALUE ([v] show/hide)", "SOURCE"]).style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
 
         let table = Table::new(
             rows,
@@ -1304,12 +1754,11 @@ impl App {
             })
             .collect();
 
-        let header = Row::new(vec!["EXPORTED KEY", "EFFECTIVE VALUE", "PROFILE", "ORIGIN"])
-            .style(
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            );
+        let header = Row::new(vec!["EXPORTED KEY", "EFFECTIVE VALUE", "PROFILE", "ORIGIN"]).style(
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        );
 
         let table = Table::new(
             rows,
@@ -1354,52 +1803,57 @@ impl App {
                 "[Space]",
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" Toggle  "),
+            Span::raw(" Toggle "),
             Span::styled(
                 "[u/d]",
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" Move Priority  "),
+            Span::raw(" Move Priority "),
             Span::styled(
                 "[n]",
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" New Profile  "),
+            Span::raw(" New Profile "),
             Span::styled(
                 "[a]",
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" Add Var  "),
+            Span::raw(" Add Var "),
             Span::styled(
                 "[e]",
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" Edit  "),
+            Span::raw(" Edit "),
             Span::styled(
                 "[x]",
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" Delete  "),
+            Span::raw(" Delete "),
             Span::styled(
                 "[p]",
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" Phase Pull  "),
+            Span::raw(" Phase Sync "),
             Span::styled(
                 "[c]",
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" Phase Auth  "),
+            Span::raw(" Auth "),
+            Span::styled(
+                "[s]",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Settings "),
             Span::styled(
                 "[v]",
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" Show/Hide  "),
+            Span::raw(" Show/Hide "),
             Span::styled(
                 "[r]",
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" Reload Shell  "),
+            Span::raw(" Reload "),
             Span::styled(
                 "[q]",
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -1419,70 +1873,137 @@ impl App {
         match &self.modal {
             Modal::None => {}
             Modal::PhaseConnect {
+                auth_method,
                 host_mode,
                 custom_url,
                 pat_token,
+                cli_status,
                 active_field,
                 error,
+                ..
             } => {
-                let popup = centered_rect(70, 55, area);
+                let popup = centered_rect(74, 62, area);
                 frame.render_widget(Clear, popup);
 
-                let mode_str = match host_mode {
-                    HostMode::Cloud => {
-                        format!("◄ Cloud (Official: {}) ►", PHASE_CLOUD_HOST)
-                    }
-                    HostMode::SelfHosted => "◄ Self-Hosted (Custom URL) ►".to_string(),
+                let auth_str = match auth_method {
+                    PhaseAuthMethod::Cli => "◄ Installed Phase CLI (Auto-detected) ►",
+                    PhaseAuthMethod::Token => "◄ API Token (PAT / Service Token) ►",
                 };
 
-                let f0_style = field_style(*active_field == 0);
+                let cli_badge_color = if cli_status.installed && cli_status.logged_in {
+                    Color::Green
+                } else if cli_status.installed {
+                    Color::Yellow
+                } else {
+                    Color::Red
+                };
+
                 let mut lines = vec![
                     Line::from(Span::styled(
-                        "Connect to Phase.dev using Personal Access Token (PAT)",
+                        "Configure Phase.dev Authentication",
                         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                     )),
                     Line::from(""),
                     Line::from(vec![
-                        Span::styled("1. Server Mode (Space/Left/Right): ", Style::default().fg(Color::Yellow)),
-                        Span::styled(mode_str, f0_style),
+                        Span::styled(
+                            "1. Auth Method (Space/Left/Right): ",
+                            Style::default().fg(Color::Yellow),
+                        ),
+                        Span::styled(auth_str, field_style(*active_field == 0)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("   CLI Detection: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(cli_status.summary_badge(), Style::default().fg(cli_badge_color)),
                     ]),
                     Line::from(""),
                 ];
 
-                if *host_mode == HostMode::SelfHosted {
-                    let f1_style = field_style(*active_field == 1);
+                if *auth_method == PhaseAuthMethod::Cli {
+                    let bin_str = cli_status
+                        .binary_path
+                        .as_deref()
+                        .unwrap_or("not found in PATH");
+                    let host_str = cli_status
+                        .host
+                        .as_deref()
+                        .unwrap_or(PHASE_CLOUD_HOST);
+                    let org_str = cli_status.organization.as_deref().unwrap_or("N/A");
+
+                    lines.push(Line::from(vec![
+                        Span::styled("   Binary Path  : ", Style::default().fg(Color::Gray)),
+                        Span::styled(bin_str, Style::default().fg(Color::White)),
+                    ]));
+                    lines.push(Line::from(vec![
+                        Span::styled("   Phase Host   : ", Style::default().fg(Color::Gray)),
+                        Span::styled(host_str, Style::default().fg(Color::White)),
+                        Span::styled(
+                            format!(" (Org: {})", org_str),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                    lines.push(Line::from(""));
                     lines.push(Line::from(Span::styled(
-                        "2. Self-Hosted Console URL (e.g. https://phase.yourdomain.com):",
+                        "Uses `phase apps list` & `phase secrets export --format json` natively.",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        "[Enter] Verify CLI & Connect  |  [r] Re-detect CLI  |  [Ctrl+S] Save  |  [Esc] Close",
+                        Style::default().fg(Color::Gray),
+                    )));
+                } else {
+                    let mode_str = match host_mode {
+                        HostMode::Cloud => {
+                            format!("◄ Cloud (Official: {}) ►", PHASE_CLOUD_HOST)
+                        }
+                        HostMode::SelfHosted => "◄ Self-Hosted (Custom URL) ►".to_string(),
+                    };
+
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            "2. Server Mode (Space/Left/Right): ",
+                            Style::default().fg(Color::Yellow),
+                        ),
+                        Span::styled(mode_str, field_style(*active_field == 1)),
+                    ]));
+                    lines.push(Line::from(""));
+
+                    if *host_mode == HostMode::SelfHosted {
+                        lines.push(Line::from(Span::styled(
+                            "3. Self-Hosted Console URL (e.g. https://phase.yourdomain.com):",
+                            Style::default().fg(Color::Yellow),
+                        )));
+                        lines.push(Line::from(Span::styled(
+                            format!(" > {}█", custom_url),
+                            field_style(*active_field == 2),
+                        )));
+                        lines.push(Line::from(""));
+                    }
+
+                    let pat_idx = if *host_mode == HostMode::Cloud { 2 } else { 3 };
+                    let masked_pat = if pat_token.len() > 18 {
+                        format!("{}...{}", &pat_token[..14], &pat_token[pat_token.len() - 4..])
+                    } else {
+                        pat_token.clone()
+                    };
+
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "{}. Phase API Token (pss_user:v1:... or pss_service:v2:...):",
+                            pat_idx
+                        ),
                         Style::default().fg(Color::Yellow),
                     )));
                     lines.push(Line::from(Span::styled(
-                        format!(" > {}█", custom_url),
-                        f1_style,
+                        format!(" > {}█", masked_pat),
+                        field_style(*active_field == pat_idx),
                     )));
                     lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        "[Tab/Up/Down] Switch Field  |  [Enter] Verify & Connect  |  [Ctrl+S] Save Offline  |  [Esc] Close",
+                        Style::default().fg(Color::Gray),
+                    )));
                 }
-
-                let pat_idx = if *host_mode == HostMode::Cloud { 1 } else { 2 };
-                let f_pat_style = field_style(*active_field == pat_idx);
-                let masked_pat = if pat_token.len() > 18 {
-                    format!("{}...{}", &pat_token[..14], &pat_token[pat_token.len() - 4..])
-                } else {
-                    pat_token.clone()
-                };
-
-                lines.push(Line::from(Span::styled(
-                    format!("{}. Phase PAT / Service Token (pss_user:v1:... or pss_service:v2:...):", pat_idx + 1),
-                    Style::default().fg(Color::Yellow),
-                )));
-                lines.push(Line::from(Span::styled(
-                    format!(" > {}█", masked_pat),
-                    f_pat_style,
-                )));
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "[Tab/Up/Down] Switch Field  |  [Enter] Verify & Connect  |  [Ctrl+S] Save Offline  |  [Esc] Close",
-                    Style::default().fg(Color::Gray),
-                )));
 
                 if let Some(err) = error {
                     lines.push(Line::from(""));
@@ -1495,7 +2016,7 @@ impl App {
                 let block = Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan))
-                    .title(" Phase.dev Connection Setup ");
+                    .title(" Phase.dev Authentication Setup ");
                 frame.render_widget(
                     Paragraph::new(lines).wrap(Wrap { trim: false }).block(block),
                     popup,
@@ -1508,13 +2029,13 @@ impl App {
                 active_field,
                 error,
             } => {
-                let popup = centered_rect(60, 45, area);
+                let popup = centered_rect(64, 46, area);
                 frame.render_widget(Clear, popup);
 
                 let src_str = if *pull_from_phase {
-                    "◄ Pull from Phase.dev (Select App & Env) ►"
+                    "◄ Phase.dev Synchronization (Select App & Env) ►"
                 } else {
-                    "◄ Custom Profile (Manual Variables) ►"
+                    "◄ Custom Environment (Manual Variables) ►"
                 };
 
                 let mut lines = vec![
@@ -1533,7 +2054,7 @@ impl App {
                     )),
                     Line::from(""),
                     Line::from(Span::styled(
-                        "2. Initial Variable Source (Space/Left/Right):",
+                        "2. Profile Data Source (Space/Left/Right):",
                         Style::default().fg(Color::Yellow),
                     )),
                     Line::from(Span::styled(
@@ -1542,12 +2063,12 @@ impl App {
                     )),
                     Line::from(""),
                     Line::from(Span::styled(
-                        "(Note: You can always add custom manual variables [a] or pull from Phase [p] later)",
+                        "Each profile uses exclusively one source (Custom and Phase.dev sources are never mixed).",
                         Style::default().fg(Color::DarkGray),
                     )),
                     Line::from(""),
                     Line::from(Span::styled(
-                        "[Tab] Switch Field  |  [Enter] Continue  |  [Esc] Cancel",
+                        "[Tab/Up/Down] Switch Field  |  [Enter] Create Profile  |  [Esc] Cancel",
                         Style::default().fg(Color::Gray),
                     )),
                 ];
@@ -1583,10 +2104,7 @@ impl App {
 
                 let inner = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Min(8),
-                        Constraint::Length(3),
-                    ])
+                    .constraints([Constraint::Min(8), Constraint::Length(3)])
                     .split(popup);
 
                 let cols = Layout::default()
@@ -1664,7 +2182,7 @@ impl App {
                     ))
                 } else {
                     Line::from(Span::styled(
-                        "[Up/Down] Navigate  |  [Tab/Enter] Switch App -> Env  |  [Enter on Env] Pull Secrets  |  [Esc] Cancel",
+                        "[Up/Down] Navigate  |  [Tab/Enter] Switch App -> Env  |  [Enter on Env] Sync Secrets  |  [Esc] Cancel",
                         Style::default().fg(Color::Gray),
                     ))
                 };
@@ -1687,7 +2205,7 @@ impl App {
                 frame.render_widget(Clear, popup);
 
                 let title = if *is_edit {
-                    " Edit Environment Variable "
+                    " Edit Custom Environment Variable "
                 } else {
                     " Add Custom Environment Variable "
                 };
@@ -1746,7 +2264,7 @@ impl App {
                 let lines = vec![
                     Line::from(""),
                     Line::from(Span::styled(
-                        format!("Delete profile '{}'?", profile_name),
+                        format!("Delete profile '{}' and all its variables?", profile_name),
                         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                     )),
                     Line::from(""),
@@ -1778,22 +2296,179 @@ impl App {
                 frame.render_widget(Paragraph::new(lines).block(block), popup);
             }
 
-            Modal::EditProfile { name, error, .. } => {
-                let popup = centered_rect(50, 24, area);
+            Modal::EditProfile {
+                profile_idx,
+                name,
+                error,
+            } => {
+                let popup = centered_rect(56, 30, area);
                 frame.render_widget(Clear, popup);
+                let is_phase = self
+                    .data
+                    .profiles
+                    .get(*profile_idx)
+                    .map(|p| p.is_phase())
+                    .unwrap_or(false);
+                let src_label = self
+                    .data
+                    .profiles
+                    .get(*profile_idx)
+                    .map(|p| p.source_label())
+                    .unwrap_or_else(|| "Custom".to_string());
+
                 let mut lines = vec![
+                    Line::from(vec![
+                        Span::styled("Data Source: ", Style::default().fg(Color::Gray)),
+                        Span::styled(src_label, Style::default().fg(Color::Cyan)),
+                    ]),
+                    Line::from(""),
                     Line::from(Span::styled(
                         "Rename Profile:",
                         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                     )),
+                    Line::from(Span::styled(format!(" > {}█", name), field_style(true))),
                     Line::from(""),
+                ];
+
+                if is_phase {
+                    lines.push(Line::from(Span::styled(
+                        "[Enter] Save Name  |  [Ctrl+P] Change Phase App/Env  |  [Esc] Cancel",
+                        Style::default().fg(Color::Gray),
+                    )));
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        "[Enter] Save  |  [Esc] Cancel",
+                        Style::default().fg(Color::Gray),
+                    )));
+                }
+
+                if let Some(err) = error {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        format!("Error: {}", err),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    )));
+                }
+
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(" Edit Profile ");
+                frame.render_widget(
+                    Paragraph::new(lines).wrap(Wrap { trim: false }).block(block),
+                    popup,
+                );
+            }
+
+            Modal::Settings {
+                draft,
+                interval_input,
+                active_field,
+                error,
+            } => {
+                let popup = centered_rect(72, 66, area);
+                frame.render_widget(Clear, popup);
+
+                let toggle_str = |on: bool| -> &'static str {
+                    if on {
+                        "◄ ON  ►"
+                    } else {
+                        "◄ OFF ►"
+                    }
+                };
+
+                let scope_str = if draft.sync_only_enabled_profiles {
+                    "◄ Enabled Phase Profiles Only ►"
+                } else {
+                    "◄ All Phase Profiles ►"
+                };
+
+                let path_str = if draft.phase_export_all_paths {
+                    "◄ All Secret Paths (--path \"\") ►"
+                } else {
+                    "◄ Root Path (/) Only ►"
+                };
+
+                let prio_str = if draft.insert_new_profile_at_top {
+                    "◄ Top Priority (#1) ►"
+                } else {
+                    "◄ Bottom of List ►"
+                };
+
+                let mut lines = vec![
                     Line::from(Span::styled(
-                        format!(" > {}█", name),
-                        field_style(true),
+                        "Application & Phase.dev Synchronization Settings",
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                     )),
                     Line::from(""),
+                    Line::from(vec![
+                        Span::styled(
+                            "1. Phase.dev Automatic Sync           : ",
+                            Style::default().fg(Color::Yellow),
+                        ),
+                        Span::styled(
+                            toggle_str(draft.auto_sync_enabled),
+                            field_style(*active_field == 0),
+                        ),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(
+                            "2. Auto-Sync Interval (min 1m)        : ",
+                            Style::default().fg(Color::Yellow),
+                        ),
+                        Span::styled(
+                            format!("◄ {} min█ ►", interval_input),
+                            field_style(*active_field == 1),
+                        ),
+                        Span::styled(
+                            " (Left/Right or type digits, [/] ±5m)",
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(
+                            "3. Auto-Sync Profile Scope            : ",
+                            Style::default().fg(Color::Yellow),
+                        ),
+                        Span::styled(scope_str, field_style(*active_field == 2)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(
+                            "4. Phase Secret Path Scope            : ",
+                            Style::default().fg(Color::Yellow),
+                        ),
+                        Span::styled(path_str, field_style(*active_field == 3)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(
+                            "5. Mask Secret Values on Startup      : ",
+                            Style::default().fg(Color::Yellow),
+                        ),
+                        Span::styled(
+                            toggle_str(draft.mask_secrets_by_default),
+                            field_style(*active_field == 4),
+                        ),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(
+                            "6. New Profile Default Placement      : ",
+                            Style::default().fg(Color::Yellow),
+                        ),
+                        Span::styled(prio_str, field_style(*active_field == 5)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(
+                            "7. Live Shell Prompt Auto-Reload Hook : ",
+                            Style::default().fg(Color::Yellow),
+                        ),
+                        Span::styled(
+                            toggle_str(draft.shell_prompt_hook),
+                            field_style(*active_field == 6),
+                        ),
+                    ]),
+                    Line::from(""),
                     Line::from(Span::styled(
-                        "[Enter] Save  |  [Esc] Cancel",
+                        "[Up/Down/Tab] Select  |  [Space/Left/Right] Adjust  |  [Enter] Save  |  [Esc] Cancel",
                         Style::default().fg(Color::Gray),
                     )),
                 ];
@@ -1809,7 +2484,7 @@ impl App {
                 let block = Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan))
-                    .title(" Rename Profile ");
+                    .title(" Settings ");
                 frame.render_widget(
                     Paragraph::new(lines).wrap(Wrap { trim: false }).block(block),
                     popup,
@@ -1817,6 +2492,7 @@ impl App {
             }
         }
     }
+
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
         if !matches!(self.modal, Modal::None) {
             return;
@@ -1847,20 +2523,23 @@ impl App {
         let clean = pasted.trim_matches(|c| c == '\r' || c == '\n');
         match &mut self.modal {
             Modal::PhaseConnect {
+                auth_method,
                 host_mode,
                 custom_url,
                 pat_token,
                 active_field,
                 error,
+                ..
             } => {
-                if *host_mode == HostMode::SelfHosted && *active_field == 1 {
-                    custom_url.push_str(clean);
-                    *error = None;
-                } else if (*host_mode == HostMode::Cloud && *active_field == 1)
-                    || (*host_mode == HostMode::SelfHosted && *active_field == 2)
-                {
-                    pat_token.push_str(clean);
-                    *error = None;
+                if *auth_method == PhaseAuthMethod::Token {
+                    let pat_idx = if *host_mode == HostMode::Cloud { 2 } else { 3 };
+                    if *host_mode == HostMode::SelfHosted && *active_field == 2 {
+                        custom_url.push_str(clean);
+                        *error = None;
+                    } else if *active_field == pat_idx {
+                        pat_token.push_str(clean);
+                        *error = None;
+                    }
                 }
             }
             Modal::NewProfile {
@@ -1891,6 +2570,23 @@ impl App {
             Modal::EditProfile { name, error, .. } => {
                 name.push_str(clean);
                 *error = None;
+            }
+            Modal::Settings {
+                draft,
+                interval_input,
+                active_field,
+                error,
+            } => {
+                if *active_field == 1 {
+                    let digits: String = clean.chars().filter(|c| c.is_ascii_digit()).collect();
+                    if !digits.is_empty() {
+                        *interval_input = digits;
+                        if let Ok(v) = interval_input.parse::<u64>() {
+                            draft.set_interval_mins(v.max(MIN_AUTO_SYNC_INTERVAL_MINS));
+                        }
+                        *error = None;
+                    }
+                }
             }
             _ => {}
         }
@@ -1979,6 +2675,8 @@ pub fn run_tui() -> Result<(), String> {
 
     let res = (|| -> Result<(), String> {
         loop {
+            app.check_auto_sync();
+
             terminal
                 .draw(|f| app.draw(f))
                 .map_err(|e| format!("Draw error: {}", e))?;
@@ -2010,7 +2708,6 @@ pub fn run_tui() -> Result<(), String> {
     let _ = crossterm::terminal::disable_raw_mode();
     let _ = terminal.show_cursor();
 
-    // Ensure state is applied on exit
     let _ = apply_state_to_system(&app.data);
 
     res
@@ -2043,6 +2740,7 @@ mod tests {
             should_quit: false,
             cached_apps: Vec::new(),
             last_area: Rect::default(),
+            last_auto_sync_attempt: None,
         }
     }
 
@@ -2063,7 +2761,9 @@ mod tests {
         // 3. Edit (Rename) via 'e'
         app.handle_key(KeyEvent::from(KeyCode::Char('e')));
         match &app.modal {
-            Modal::EditProfile { profile_idx, name, .. } => {
+            Modal::EditProfile {
+                profile_idx, name, ..
+            } => {
                 assert_eq!(*profile_idx, 0);
                 assert_eq!(name, "default");
             }
@@ -2098,22 +2798,18 @@ mod tests {
         assert_eq!(app.data.profiles[0].name, "default");
         assert_eq!(app.data.profiles[1].name, "second_profile");
 
-        // Select second profile
         app.selected_profile = 1;
 
-        // Move UP using 'u'
         app.handle_key(KeyEvent::from(KeyCode::Char('u')));
         assert_eq!(app.data.profiles[0].name, "second_profile");
         assert_eq!(app.data.profiles[1].name, "default");
         assert_eq!(app.selected_profile, 0);
 
-        // Move DOWN using 'd'
         app.handle_key(KeyEvent::from(KeyCode::Char('d')));
         assert_eq!(app.data.profiles[0].name, "default");
         assert_eq!(app.data.profiles[1].name, "second_profile");
         assert_eq!(app.selected_profile, 1);
 
-        // Verify 'K' and 'J' do NOT move priority
         app.handle_key(KeyEvent::from(KeyCode::Char('K')));
         assert_eq!(app.data.profiles[1].name, "second_profile");
         app.handle_key(KeyEvent::from(KeyCode::Char('J')));
@@ -2124,17 +2820,20 @@ mod tests {
     fn test_edit_action_works_across_panes() {
         let mut app = make_test_app();
 
-        // 1. Focus on Profiles -> 'e' opens EditProfile
         app.focus = FocusPane::Profiles;
         app.handle_key(KeyEvent::from(KeyCode::Char('e')));
         assert!(matches!(app.modal, Modal::EditProfile { .. }));
         app.modal = Modal::None;
 
-        // 2. Focus on Vars -> 'e' opens VarEditor
         app.focus = FocusPane::Vars;
         app.handle_key(KeyEvent::from(KeyCode::Char('e')));
         match &app.modal {
-            Modal::VarEditor { is_edit, var_key, var_value, .. } => {
+            Modal::VarEditor {
+                is_edit,
+                var_key,
+                var_value,
+                ..
+            } => {
                 assert!(*is_edit);
                 assert_eq!(var_key, "API_KEY");
                 assert_eq!(var_value, "sk-123456789xyz");
@@ -2143,16 +2842,79 @@ mod tests {
         }
         app.modal = Modal::None;
 
-        // 3. Focus on Effective -> 'e' opens VarEditor targeting the winning profile var
         app.focus = FocusPane::Effective;
         app.handle_key(KeyEvent::from(KeyCode::Char('e')));
         match &app.modal {
-            Modal::VarEditor { is_edit, var_key, .. } => {
+            Modal::VarEditor {
+                is_edit, var_key, ..
+            } => {
                 assert!(*is_edit);
                 assert_eq!(var_key, "API_KEY");
             }
             _ => panic!("Expected Modal::VarEditor from Effective pane"),
         }
+    }
+
+    #[test]
+    fn test_phase_profile_disallows_manual_var_mixing() {
+        let mut app = make_test_app();
+        app.data.profiles.insert(
+            0,
+            Profile::new_phase(
+                "phase_prod".to_string(),
+                PhaseBinding {
+                    app_id: "app1".to_string(),
+                    app_name: "MyService".to_string(),
+                    env_id: "env1".to_string(),
+                    env_name: "Production".to_string(),
+                },
+                vec![("PHASE_SECRET".to_string(), "val123456".to_string())],
+            ),
+        );
+        app.selected_profile = 0;
+
+        // Pressing 'a' on a Phase profile must NOT open VarEditor
+        app.handle_key(KeyEvent::from(KeyCode::Char('a')));
+        assert!(matches!(app.modal, Modal::None));
+        assert!(app.is_error_status);
+
+        // Pressing 'e' on Vars pane of a Phase profile must NOT open VarEditor
+        app.focus = FocusPane::Vars;
+        app.handle_key(KeyEvent::from(KeyCode::Char('e')));
+        assert!(matches!(app.modal, Modal::None));
+        assert!(app.is_error_status);
+
+        // Pressing 'x' on Vars pane of a Phase profile must NOT open ConfirmDeleteVar
+        app.handle_key(KeyEvent::from(KeyCode::Char('x')));
+        assert!(matches!(app.modal, Modal::None));
+        assert!(app.is_error_status);
+    }
+
+    #[test]
+    fn test_settings_modal_toggle_and_interval_configuration() {
+        let mut app = make_test_app();
+        assert!(app.data.settings.auto_sync_enabled);
+        assert_eq!(app.data.settings.auto_sync_interval_mins, 30);
+
+        // Open settings with 's'
+        app.handle_key(KeyEvent::from(KeyCode::Char('s')));
+        assert!(matches!(app.modal, Modal::Settings { .. }));
+
+        // Field 0: toggle auto_sync_enabled OFF with Space
+        app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        // Move to Field 1 (interval) with Tab
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        // Clear interval digits and type "15"
+        app.handle_key(KeyEvent::from(KeyCode::Backspace));
+        app.handle_key(KeyEvent::from(KeyCode::Backspace));
+        app.handle_key(KeyEvent::from(KeyCode::Char('1')));
+        app.handle_key(KeyEvent::from(KeyCode::Char('5')));
+        // Save with Enter
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+
+        assert!(matches!(app.modal, Modal::None));
+        assert!(!app.data.settings.auto_sync_enabled);
+        assert_eq!(app.data.settings.auto_sync_interval_mins, 15);
     }
 
     #[test]
@@ -2172,7 +2934,6 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // Titles must NOT have numbers
         assert!(content.contains("Profiles (Top Wins Priority)"));
         assert!(!content.contains("1. Default & Profiles"));
         assert!(!content.contains("Profiles (Top #1 Wins Priority)"));
@@ -2181,19 +2942,11 @@ mod tests {
         assert!(!content.contains("2. Variables in"));
         assert!(content.contains("Active System Environment"));
         assert!(!content.contains("3. Active System Environment"));
-
-        // Pane 3 title must NOT have "(x encrypted..."
         assert!(!content.contains("encrypted in state.enc"));
-
-        // Footer must have "[u/d] Move Priority" and not "[K/J"
         assert!(content.contains("[u/d] Move Priority"));
         assert!(!content.contains("[K/J"));
-
-        // Table header shows PROFILE instead of WINNING PROFILE
         assert!(content.contains("PROFILE"));
         assert!(!content.contains("WINNING PROFILE"));
-
-        // Footer must NOT contain initial "Ready" text below shortcut help
         assert!(!content.contains("Ready"));
     }
 
@@ -2203,7 +2956,6 @@ mod tests {
         app.last_area = Rect::new(0, 0, 100, 30);
         let (profiles_rect, vars_rect, effective_rect) = compute_pane_areas(app.last_area);
 
-        // Click on Vars pane -> focus becomes Vars
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: vars_rect.x + 2,
@@ -2212,7 +2964,6 @@ mod tests {
         });
         assert_eq!(app.focus, FocusPane::Vars);
 
-        // Click on Effective pane -> focus becomes Effective
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: effective_rect.x + 2,
@@ -2221,7 +2972,6 @@ mod tests {
         });
         assert_eq!(app.focus, FocusPane::Effective);
 
-        // Click on Profiles pane -> focus becomes Profiles
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: profiles_rect.x + 2,
@@ -2230,7 +2980,6 @@ mod tests {
         });
         assert_eq!(app.focus, FocusPane::Profiles);
 
-        // Non-left click does not change focus
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Right),
             column: vars_rect.x + 2,
@@ -2239,7 +2988,6 @@ mod tests {
         });
         assert_eq!(app.focus, FocusPane::Profiles);
 
-        // Click outside panes (e.g. header row 1) does not change focus
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 10,
@@ -2248,7 +2996,6 @@ mod tests {
         });
         assert_eq!(app.focus, FocusPane::Profiles);
 
-        // Click while a modal is active does not change focus
         app.modal = Modal::ConfirmDeleteVar {
             var_idx: 0,
             var_key: "API_KEY".to_string(),
@@ -2267,7 +3014,6 @@ mod tests {
         let mut app = make_test_app();
         assert_eq!(app.focus, FocusPane::Profiles);
 
-        // Tab cycles Profiles -> Vars -> Effective -> Profiles
         app.handle_key(KeyEvent::from(KeyCode::Tab));
         assert_eq!(app.focus, FocusPane::Vars);
         app.handle_key(KeyEvent::from(KeyCode::Tab));
@@ -2275,7 +3021,6 @@ mod tests {
         app.handle_key(KeyEvent::from(KeyCode::Tab));
         assert_eq!(app.focus, FocusPane::Profiles);
 
-        // BackTab cycles backwards
         app.handle_key(KeyEvent::from(KeyCode::BackTab));
         assert_eq!(app.focus, FocusPane::Effective);
         app.handle_key(KeyEvent::from(KeyCode::BackTab));
@@ -2283,7 +3028,6 @@ mod tests {
         app.handle_key(KeyEvent::from(KeyCode::BackTab));
         assert_eq!(app.focus, FocusPane::Profiles);
 
-        // Left / 'h' and Right / 'l'
         app.handle_key(KeyEvent::from(KeyCode::Char('l')));
         assert_eq!(app.focus, FocusPane::Vars);
         app.handle_key(KeyEvent::from(KeyCode::Char('h')));

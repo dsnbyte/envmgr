@@ -1,3 +1,4 @@
+use crate::phase::detect_phase_cli;
 use blake2::{Blake2b512, Digest};
 use chacha20poly1305::{
     aead::{Aead, KeyInit},
@@ -7,8 +8,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const PHASE_CLOUD_HOST: &str = "https://console.phase.dev";
+pub const MIN_AUTO_SYNC_INTERVAL_MINS: u64 = 1;
+pub const DEFAULT_AUTO_SYNC_INTERVAL_MINS: u64 = 30;
 
 /// Hardcoded master key phrase compiled directly into the binary.
 /// Changing this key requires modifying the source code and rebuilding the program.
@@ -65,15 +69,68 @@ pub enum HostMode {
     SelfHosted,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PhaseAuthMethod {
+    #[default]
+    Token,
+    Cli,
+}
+
+impl PhaseAuthMethod {
+    pub fn label(&self) -> &'static str {
+        match self {
+            PhaseAuthMethod::Token => "API Token",
+            PhaseAuthMethod::Cli => "Phase CLI",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhaseConfig {
+    #[serde(default)]
+    pub auth_method: PhaseAuthMethod,
+    #[serde(default)]
     pub host_mode: HostMode,
+    #[serde(default)]
     pub custom_url: String,
+    #[serde(default)]
     pub pat_token: String,
+}
+
+impl Default for PhaseConfig {
+    fn default() -> Self {
+        let cli = detect_phase_cli();
+        let (host_mode, custom_url) = match cli.host.as_deref() {
+            Some(h) if !h.is_empty() && h != PHASE_CLOUD_HOST => {
+                (HostMode::SelfHosted, h.to_string())
+            }
+            _ => (HostMode::Cloud, String::new()),
+        };
+        let auth_method = if cli.installed {
+            PhaseAuthMethod::Cli
+        } else {
+            PhaseAuthMethod::Token
+        };
+        Self {
+            auth_method,
+            host_mode,
+            custom_url,
+            pat_token: String::new(),
+        }
+    }
 }
 
 impl PhaseConfig {
     pub fn effective_host(&self) -> String {
+        if self.auth_method == PhaseAuthMethod::Cli {
+            let cli = detect_phase_cli();
+            if let Some(host) = cli.host {
+                if !host.trim().is_empty() {
+                    return host.trim().trim_end_matches('/').to_string();
+                }
+            }
+        }
         match self.host_mode {
             HostMode::Cloud => PHASE_CLOUD_HOST.to_string(),
             HostMode::SelfHosted => {
@@ -90,8 +147,100 @@ impl PhaseConfig {
     }
 
     pub fn is_configured(&self) -> bool {
-        !self.pat_token.trim().is_empty()
-            && (self.host_mode == HostMode::Cloud || !self.custom_url.trim().is_empty())
+        match self.auth_method {
+            PhaseAuthMethod::Cli => {
+                let cli = detect_phase_cli();
+                cli.installed && cli.logged_in
+            }
+            PhaseAuthMethod::Token => {
+                !self.pat_token.trim().is_empty()
+                    && (self.host_mode == HostMode::Cloud || !self.custom_url.trim().is_empty())
+            }
+        }
+    }
+
+    /// Automatically switches to CLI auth if no token is configured and the Phase CLI is installed.
+    pub fn auto_detect_cli(&mut self) {
+        let cli = detect_phase_cli();
+        if self.pat_token.trim().is_empty() && cli.installed {
+            self.auth_method = PhaseAuthMethod::Cli;
+            if let Some(host) = cli.host {
+                let trimmed = host.trim().trim_end_matches('/');
+                if trimmed.is_empty() || trimmed == PHASE_CLOUD_HOST {
+                    self.host_mode = HostMode::Cloud;
+                } else {
+                    self.host_mode = HostMode::SelfHosted;
+                    if self.custom_url.trim().is_empty() {
+                        self.custom_url = trimmed.to_string();
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_sync_interval_mins() -> u64 {
+    DEFAULT_AUTO_SYNC_INTERVAL_MINS
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppSettings {
+    /// Automatically synchronize Phase.dev profiles at a configurable interval (default: true).
+    #[serde(default = "default_true")]
+    pub auto_sync_enabled: bool,
+    /// Interval in minutes for automatic Phase.dev sync (default: 30, minimum: 1).
+    #[serde(default = "default_sync_interval_mins")]
+    pub auto_sync_interval_mins: u64,
+    /// When auto-syncing, only sync enabled Phase.dev profiles (default: true).
+    #[serde(default = "default_true")]
+    pub sync_only_enabled_profiles: bool,
+    /// Export secrets across all Phase paths (`--path ""`) instead of root `/` only (default: true).
+    #[serde(default = "default_true")]
+    pub phase_export_all_paths: bool,
+    /// Mask secret values by default when launching the TUI (default: true).
+    #[serde(default = "default_true")]
+    pub mask_secrets_by_default: bool,
+    /// Insert newly created profiles at top priority (#1) instead of bottom (default: true).
+    #[serde(default = "default_true")]
+    pub insert_new_profile_at_top: bool,
+    /// Enable live shell prompt auto-reload hook in ~/.bashrc (default: true).
+    #[serde(default = "default_true")]
+    pub shell_prompt_hook: bool,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            auto_sync_enabled: true,
+            auto_sync_interval_mins: DEFAULT_AUTO_SYNC_INTERVAL_MINS,
+            sync_only_enabled_profiles: true,
+            phase_export_all_paths: true,
+            mask_secrets_by_default: true,
+            insert_new_profile_at_top: true,
+            shell_prompt_hook: true,
+        }
+    }
+}
+
+impl AppSettings {
+    pub fn clamp_interval(mins: u64) -> u64 {
+        mins.clamp(MIN_AUTO_SYNC_INTERVAL_MINS, 1440)
+    }
+
+    pub fn effective_interval_mins(&self) -> u64 {
+        Self::clamp_interval(self.auto_sync_interval_mins)
+    }
+
+    pub fn set_interval_mins(&mut self, mins: u64) {
+        self.auto_sync_interval_mins = Self::clamp_interval(mins);
+    }
+
+    pub fn normalize(&mut self) {
+        self.auto_sync_interval_mins = Self::clamp_interval(self.auto_sync_interval_mins);
     }
 }
 
@@ -184,6 +333,91 @@ pub struct Profile {
     pub vars: Vec<EnvVar>,
 }
 
+impl Profile {
+    pub fn new_custom(name: String) -> Self {
+        Self {
+            name,
+            enabled: true,
+            phase_binding: None,
+            vars: Vec::new(),
+        }
+    }
+
+    pub fn new_phase(name: String, binding: PhaseBinding, fetched: Vec<(String, String)>) -> Self {
+        let mut prof = Self {
+            name,
+            enabled: true,
+            phase_binding: Some(binding.clone()),
+            vars: Vec::new(),
+        };
+        prof.set_phase_vars(binding, fetched);
+        prof
+    }
+
+    pub fn is_phase(&self) -> bool {
+        self.phase_binding.is_some()
+    }
+
+    pub fn is_custom(&self) -> bool {
+        self.phase_binding.is_none()
+    }
+
+    pub fn source_label(&self) -> String {
+        match &self.phase_binding {
+            Some(b) => format!("Phase ({}/{})", b.app_name, b.env_name),
+            None => "Custom".to_string(),
+        }
+    }
+
+    /// Replaces the profile's variables exclusively with Phase.dev variables for the bound app/env.
+    pub fn set_phase_vars(&mut self, binding: PhaseBinding, fetched: Vec<(String, String)>) {
+        let app_name = binding.app_name.clone();
+        let env_name = binding.env_name.clone();
+        self.phase_binding = Some(binding);
+        self.vars.clear();
+        for (k, v) in fetched {
+            self.vars.push(EnvVar::new(
+                k,
+                v,
+                VarSource::Phase {
+                    app_name: app_name.clone(),
+                    env_name: env_name.clone(),
+                },
+            ));
+        }
+    }
+
+    /// Upserts a custom variable if and only if this profile is a Custom profile.
+    /// Returns an error if the profile is bound to Phase.dev.
+    pub fn upsert_custom_var(&mut self, key: String, value: String) -> Result<(), String> {
+        if self.is_phase() {
+            return Err(format!(
+                "Profile '{}' is synchronized with Phase.dev; custom variables cannot be mixed.",
+                self.name
+            ));
+        }
+        AppStateData::upsert_custom_var(&mut self.vars, key, value);
+        Ok(())
+    }
+
+    /// Ensures the profile contains variables from only one data source matching its profile type.
+    pub fn sanitize_single_source(&mut self) {
+        if let Some(binding) = &self.phase_binding {
+            let app_name = binding.app_name.clone();
+            let env_name = binding.env_name.clone();
+            self.vars.retain(|v| matches!(v.source, VarSource::Phase { .. }));
+            for v in &mut self.vars {
+                v.source = VarSource::Phase {
+                    app_name: app_name.clone(),
+                    env_name: env_name.clone(),
+                };
+            }
+        } else {
+            self.vars.retain(|v| matches!(v.source, VarSource::Custom));
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveVar {
     pub key: String,
@@ -223,25 +457,35 @@ impl EffectiveVar {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppStateData {
+    #[serde(default)]
     pub phase: PhaseConfig,
+    #[serde(default)]
     pub profiles: Vec<Profile>,
+    #[serde(default)]
+    pub settings: AppSettings,
+    #[serde(default)]
+    pub last_phase_sync_epoch: u64,
 }
 
 impl Default for AppStateData {
     fn default() -> Self {
         Self {
             phase: PhaseConfig::default(),
-            profiles: vec![Profile {
-                name: "default".to_string(),
-                enabled: true,
-                phase_binding: None,
-                vars: Vec::new(),
-            }],
+            profiles: vec![Profile::new_custom("default".to_string())],
+            settings: AppSettings::default(),
+            last_phase_sync_epoch: 0,
         }
     }
 }
 
 impl AppStateData {
+    pub fn current_epoch_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
     pub fn config_dir() -> PathBuf {
         if let Ok(custom) = std::env::var("ENVMGR_CONFIG_DIR") {
             if !custom.trim().is_empty() {
@@ -269,7 +513,10 @@ impl AppStateData {
             return Self::default();
         };
         let mut state: Self = serde_json::from_slice(&decrypted).unwrap_or_default();
+        state.settings.normalize();
+        state.phase.auto_detect_cli();
         for prof in &mut state.profiles {
+            prof.sanitize_single_source();
             for var in &mut prof.vars {
                 if var.prefix.is_empty() && var.suffix.is_empty() && !var.value.is_empty() {
                     let (p, s) = compute_prefix_suffix(&var.value);
@@ -316,6 +563,7 @@ impl AppStateData {
                 continue;
             }
             let owner = profile.name.clone();
+            let prof_source = profile.source_label();
             for var in &profile.vars {
                 if !map.contains_key(&var.key) {
                     order.push(var.key.clone());
@@ -328,7 +576,7 @@ impl AppStateData {
                         prefix: var.prefix.clone(),
                         suffix: var.suffix.clone(),
                         winning_owner: owner.clone(),
-                        source_label: var.source.label(),
+                        source_label: prof_source.clone(),
                     },
                 );
             }
@@ -340,38 +588,29 @@ impl AppStateData {
             .collect()
     }
 
-    /// Merges fetched Phase variables into a target Vec<EnvVar>.
-    /// Preserves custom variables unless overwritten by a Phase variable with the same key,
-    /// and replaces old Phase variables from previous syncs.
-    pub fn merge_phase_vars(
-        target: &mut Vec<EnvVar>,
-        app_name: &str,
-        env_name: &str,
-        fetched: Vec<(String, String)>,
-    ) {
-        let fetched_keys: std::collections::HashSet<&str> =
-            fetched.iter().map(|(k, _)| k.as_str()).collect();
-        target.retain(|v| matches!(v.source, VarSource::Custom) && !fetched_keys.contains(v.key.as_str()));
-
-        for (k, v) in fetched {
-            target.push(EnvVar::new(
-                k,
-                v,
-                VarSource::Phase {
-                    app_name: app_name.to_string(),
-                    env_name: env_name.to_string(),
-                },
-            ));
-        }
-    }
-
     pub fn upsert_custom_var(target: &mut Vec<EnvVar>, key: String, value: String) {
+        target.retain(|v| matches!(v.source, VarSource::Custom));
         if let Some(existing) = target.iter_mut().find(|v| v.key == key) {
             existing.set_value(value);
             existing.source = VarSource::Custom;
         } else {
             target.push(EnvVar::new(key, value, VarSource::Custom));
         }
+    }
+
+    /// Checks whether automatic Phase.dev sync is due at `now_epoch` (seconds).
+    pub fn is_auto_sync_due(&self, now_epoch: u64) -> bool {
+        if !self.settings.auto_sync_enabled || !self.phase.is_configured() {
+            return false;
+        }
+        let has_eligible_profile = self.profiles.iter().any(|p| {
+            p.is_phase() && (!self.settings.sync_only_enabled_profiles || p.enabled)
+        });
+        if !has_eligible_profile {
+            return false;
+        }
+        let interval_secs = self.settings.effective_interval_mins().saturating_mul(60);
+        now_epoch.saturating_sub(self.last_phase_sync_epoch) >= interval_secs
     }
 }
 
@@ -423,8 +662,6 @@ mod tests {
 
     #[test]
     fn test_encrypted_state_file_never_stores_plaintext_on_disk() {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
         let uniq = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -438,6 +675,7 @@ mod tests {
 
         let state = AppStateData {
             phase: PhaseConfig {
+                auth_method: PhaseAuthMethod::Token,
                 host_mode: HostMode::Cloud,
                 custom_url: String::new(),
                 pat_token: "pss_user:v1:secret_pat_token_12345".to_string(),
@@ -456,7 +694,12 @@ mod tests {
                 Profile {
                     name: "prod_profile_secret".to_string(),
                     enabled: true,
-                    phase_binding: None,
+                    phase_binding: Some(PhaseBinding {
+                        app_id: "app-1".to_string(),
+                        app_name: "my-app".to_string(),
+                        env_id: "env-1".to_string(),
+                        env_name: "production".to_string(),
+                    }),
                     vars: vec![EnvVar::new(
                         "API_TOKEN".to_string(),
                         plaintext_secret_2.to_string(),
@@ -467,6 +710,8 @@ mod tests {
                     )],
                 },
             ],
+            settings: AppSettings::default(),
+            last_phase_sync_epoch: 0,
         };
 
         state.save_to_dir(&temp_dir).expect("should save state.enc");
@@ -510,6 +755,68 @@ mod tests {
     }
 
     #[test]
+    fn test_single_source_per_profile_never_mixes() {
+        let binding = PhaseBinding {
+            app_id: "app1".to_string(),
+            app_name: "Backend".to_string(),
+            env_id: "env1".to_string(),
+            env_name: "Prod".to_string(),
+        };
+        let mut phase_prof = Profile::new_phase(
+            "phase_prod".to_string(),
+            binding.clone(),
+            vec![("DB_URL".to_string(), "postgres://prod".to_string())],
+        );
+        assert!(phase_prof.is_phase());
+        assert!(!phase_prof.is_custom());
+        assert!(phase_prof
+            .upsert_custom_var("CUSTOM_KEY".to_string(), "123".to_string())
+            .is_err());
+        assert_eq!(phase_prof.vars.len(), 1);
+
+        // Even if corrupted in memory and sanitized, custom vars are stripped from Phase profile
+        phase_prof.vars.push(EnvVar::new(
+            "MIXED".to_string(),
+            "bad".to_string(),
+            VarSource::Custom,
+        ));
+        phase_prof.sanitize_single_source();
+        assert_eq!(phase_prof.vars.len(), 1);
+        assert_eq!(phase_prof.vars[0].key, "DB_URL");
+
+        // Custom profile strips any Phase vars on sanitize
+        let mut custom_prof = Profile::new_custom("local_dev".to_string());
+        custom_prof
+            .upsert_custom_var("LOCAL_PORT".to_string(), "8080".to_string())
+            .unwrap();
+        custom_prof.vars.push(EnvVar::new(
+            "PHASE_LEAK".to_string(),
+            "secret".to_string(),
+            VarSource::Phase {
+                app_name: "Backend".to_string(),
+                env_name: "Prod".to_string(),
+            },
+        ));
+        custom_prof.sanitize_single_source();
+        assert_eq!(custom_prof.vars.len(), 1);
+        assert_eq!(custom_prof.vars[0].key, "LOCAL_PORT");
+    }
+
+    #[test]
+    fn test_settings_defaults_and_interval_clamping() {
+        let mut settings = AppSettings::default();
+        assert!(settings.auto_sync_enabled);
+        assert_eq!(settings.auto_sync_interval_mins, 30);
+
+        settings.set_interval_mins(0);
+        assert_eq!(settings.auto_sync_interval_mins, 1);
+        assert_eq!(settings.effective_interval_mins(), 1);
+
+        settings.set_interval_mins(15);
+        assert_eq!(settings.auto_sync_interval_mins, 15);
+    }
+
+    #[test]
     fn test_priority_top_profile_wins_over_lower() {
         let state = AppStateData {
             phase: PhaseConfig::default(),
@@ -533,6 +840,8 @@ mod tests {
                     ],
                 },
             ],
+            settings: AppSettings::default(),
+            last_phase_sync_epoch: 0,
         };
 
         let effective = state.compute_effective_vars();
@@ -565,6 +874,8 @@ mod tests {
                     vars: vec![EnvVar::new("A".to_string(), "from_profile_dua".to_string(), VarSource::Custom)],
                 },
             ],
+            settings: AppSettings::default(),
+            last_phase_sync_epoch: 0,
         };
 
         let effective = state.compute_effective_vars();

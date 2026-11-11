@@ -56,8 +56,42 @@ fn envmgr_bin_expr() -> String {
     "command envmgr".to_string()
 }
 
+#[cfg(test)]
 pub fn build_bashrc_snippet() -> String {
+    build_bashrc_snippet_with_options(true)
+}
+
+pub fn build_bashrc_snippet_with_options(prompt_hook: bool) -> String {
     let bin = envmgr_bin_expr();
+    let prompt_section = if prompt_hook {
+        format!(
+            "\n_envmgr_prompt_hook() {{\n\
+             \x20   local _sf=\"${{ENVMGR_CONFIG_DIR:-$HOME/.config/envmgr}}/state.enc\"\n\
+             \x20   if [ -f \"$_sf\" ]; then\n\
+             \x20       if [ ! -f \"${{_ENVMGR_SYNC_MARKER:-}}\" ] || [ \"$_sf\" -nt \"$_ENVMGR_SYNC_MARKER\" ]; then\n\
+             \x20           _ENVMGR_SYNC_MARKER=\"${{XDG_RUNTIME_DIR:-/tmp}}/.envmgr_sync_${{UID:-$(id -u)}}_$$\"\n\
+             \x20           touch \"$_ENVMGR_SYNC_MARKER\" 2>/dev/null\n\
+             \x20           eval \"$({bin} export 2>/dev/null)\"\n\
+             \x20       fi\n\
+             \x20   fi\n\
+             }}\n\
+             if [[ \"$(declare -p PROMPT_COMMAND 2>/dev/null)\" == \"declare -a\"* ]]; then\n\
+             \x20   case \" ${{PROMPT_COMMAND[*]}} \" in\n\
+             \x20       *\" _envmgr_prompt_hook \"*) ;;\n\
+             \x20       *) PROMPT_COMMAND+=(_envmgr_prompt_hook) ;;\n\
+             \x20   esac\n\
+             else\n\
+             \x20   case \";${{PROMPT_COMMAND:-}};\" in\n\
+             \x20       *\";_envmgr_prompt_hook;\"*) ;;\n\
+             \x20       *) PROMPT_COMMAND=\"_envmgr_prompt_hook${{PROMPT_COMMAND:+;$PROMPT_COMMAND}}\" ;;\n\
+             \x20   esac\n\
+             fi",
+            bin = bin
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         "{start}\n\
          if command -v envmgr >/dev/null 2>&1 || [ -n \"${{ENVMGR_BIN_PATH:-}}\" ]; then\n\
@@ -71,38 +105,22 @@ pub fn build_bashrc_snippet() -> String {
          \x20   touch \"$_ENVMGR_SYNC_MARKER\" 2>/dev/null\n\
          \x20   return $_envmgr_ec\n\
          }}\n\
-         export -f envmgr 2>/dev/null\n\
-         _envmgr_prompt_hook() {{\n\
-         \x20   local _sf=\"${{ENVMGR_CONFIG_DIR:-$HOME/.config/envmgr}}/state.enc\"\n\
-         \x20   if [ -f \"$_sf\" ]; then\n\
-         \x20       if [ ! -f \"${{_ENVMGR_SYNC_MARKER:-}}\" ] || [ \"$_sf\" -nt \"$_ENVMGR_SYNC_MARKER\" ]; then\n\
-         \x20           _ENVMGR_SYNC_MARKER=\"${{XDG_RUNTIME_DIR:-/tmp}}/.envmgr_sync_${{UID:-$(id -u)}}_$$\"\n\
-         \x20           touch \"$_ENVMGR_SYNC_MARKER\" 2>/dev/null\n\
-         \x20           eval \"$({bin} export 2>/dev/null)\"\n\
-         \x20       fi\n\
-         \x20   fi\n\
-         }}\n\
-         if [[ \"$(declare -p PROMPT_COMMAND 2>/dev/null)\" == \"declare -a\"* ]]; then\n\
-         \x20   case \" ${{PROMPT_COMMAND[*]}} \" in\n\
-         \x20       *\" _envmgr_prompt_hook \"*) ;;\n\
-         \x20       *) PROMPT_COMMAND+=(_envmgr_prompt_hook) ;;\n\
-         \x20   esac\n\
-         else\n\
-         \x20   case \";${{PROMPT_COMMAND:-}};\" in\n\
-         \x20       *\";_envmgr_prompt_hook;\"*) ;;\n\
-         \x20       *) PROMPT_COMMAND=\"_envmgr_prompt_hook${{PROMPT_COMMAND:+;$PROMPT_COMMAND}}\" ;;\n\
-         \x20   esac\n\
-         fi\n\
+         export -f envmgr 2>/dev/null{prompt_section}\n\
          {end}",
         start = BASHRC_START_MARKER,
         bin = bin,
+        prompt_section = prompt_section,
         end = BASHRC_END_MARKER
     )
 }
 
 pub fn ensure_bashrc_integration() -> Result<PathBuf, String> {
+    ensure_bashrc_integration_with_options(true)
+}
+
+pub fn ensure_bashrc_integration_with_options(prompt_hook: bool) -> Result<PathBuf, String> {
     let rc_path = bashrc_path();
-    let snippet = build_bashrc_snippet();
+    let snippet = build_bashrc_snippet_with_options(prompt_hook);
 
     let existing = fs::read_to_string(&rc_path).unwrap_or_default();
     let updated = if let (Some(start_idx), Some(end_idx)) = (
@@ -141,7 +159,6 @@ pub fn ensure_bashrc_integration() -> Result<PathBuf, String> {
 pub fn reload_shell_environment(vars: &[EffectiveVar]) -> Result<(), String> {
     let rc_path = ensure_bashrc_integration()?;
 
-    // Update current process environment variables
     if let Ok(prev_keys) = std::env::var("_ENVMGR_KEYS") {
         for k in prev_keys.split_whitespace() {
             if is_valid_env_key(k) {
@@ -158,7 +175,6 @@ pub fn reload_shell_environment(vars: &[EffectiveVar]) -> Result<(), String> {
     }
     std::env::set_var("_ENVMGR_KEYS", valid_keys.join(" "));
 
-    // Verify .bashrc + runtime export evaluation in bash
     let export_script = generate_env_sh_content(vars);
     let check_cmd = format!(
         "[ -f \"{}\" ] && source \"{}\"; {}",
@@ -182,7 +198,7 @@ pub fn reload_shell_environment(vars: &[EffectiveVar]) -> Result<(), String> {
 pub fn apply_state_to_system(state: &AppStateData) -> Result<usize, String> {
     state.save()?;
     let effective = state.compute_effective_vars();
-    let _ = ensure_bashrc_integration()?;
+    let _ = ensure_bashrc_integration_with_options(state.settings.shell_prompt_hook)?;
     Ok(effective.len())
 }
 
@@ -233,7 +249,7 @@ mod tests {
 
     #[test]
     fn test_end_to_end_bashrc_inclusion_and_encrypted_state_priority() {
-        use crate::model::{EnvVar, PhaseConfig, Profile, VarSource};
+        use crate::model::{AppSettings, EnvVar, PhaseConfig, Profile, VarSource};
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let uniq = SystemTime::now()
@@ -281,6 +297,8 @@ mod tests {
                     ],
                 },
             ],
+            settings: AppSettings::default(),
+            last_phase_sync_epoch: 0,
         };
 
         apply_state_to_system(&state).unwrap();
@@ -288,7 +306,6 @@ mod tests {
 
         assert!(temp_dir.join("state.enc").exists());
 
-        // Check .bashrc never contains variable values in plaintext
         let bashrc_content = fs::read_to_string(&bashrc_file).unwrap();
         assert!(bashrc_content.contains("export EXISTING_VAR='kept'"));
         assert!(!bashrc_content.contains("val_profile_dua"));
@@ -297,7 +314,6 @@ mod tests {
         assert!(!bashrc_content.contains("always_here"));
         assert!(bashrc_content.contains("export 2>/dev/null"));
 
-        // Verify loading from encrypted state.enc and evaluating in bash
         let loaded1 = AppStateData::load_from_dir(&temp_dir);
         let script1 = generate_env_sh_content(&loaded1.compute_effective_vars());
         let out = Command::new("bash")
@@ -314,7 +330,6 @@ mod tests {
             "val_profile_dua|always_here|kept"
         );
 
-        // Toggle profile_dua OFF -> profile_satu should win
         state.profiles[0].enabled = false;
         state.save_to_dir(&temp_dir).unwrap();
         let loaded2 = AppStateData::load_from_dir(&temp_dir);
@@ -327,7 +342,6 @@ mod tests {
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&out2.stdout), "val_profile_satu");
 
-        // Toggle profile_satu OFF -> Default should win
         state.profiles[1].enabled = false;
         state.save_to_dir(&temp_dir).unwrap();
         let loaded3 = AppStateData::load_from_dir(&temp_dir);
@@ -387,23 +401,18 @@ mod tests {
                 fi
             }}
 
-            # First prompt: should trigger initial sync
             _envmgr_prompt_hook
             [ "$eval_count" -eq 1 ] || exit 1
 
-            # Second prompt without file change: should NOT trigger sync
             _envmgr_prompt_hook
             [ "$eval_count" -eq 1 ] || exit 2
 
-            # Simulate modification in another terminal
             sleep 0.05
             touch "$_sf"
 
-            # Third prompt after file change: MUST trigger sync
             _envmgr_prompt_hook
             [ "$eval_count" -eq 2 ] || exit 3
 
-            # Fourth prompt without file change: should NOT trigger sync
             _envmgr_prompt_hook
             [ "$eval_count" -eq 2 ] || exit 4
             "#,
