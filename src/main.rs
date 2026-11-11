@@ -86,9 +86,9 @@ fn main() {
                     }
                 );
                 println!("Profiles ({})   :", state.profiles.len());
-                for (i, p) in state.profiles.iter().enumerate() {
+                for p in &state.profiles {
                     let st = if p.enabled { "ON " } else { "OFF" };
-                    println!("  #{} [{}] {} ({} vars)", i + 1, st, p.name, p.vars.len());
+                    println!("  [{}] {} ({} vars)", st, p.name, p.vars.len());
                 }
                 let eff = state.compute_effective_vars();
                 println!("\nEffective Variables ({}):", eff.len());

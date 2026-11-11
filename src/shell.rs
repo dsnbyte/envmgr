@@ -196,7 +196,7 @@ mod tests {
             EffectiveVar::new(
                 "APP_ENV".to_string(),
                 "production".to_string(),
-                "Profile #1: prod".to_string(),
+                "prod".to_string(),
                 "Custom".to_string(),
             ),
             EffectiveVar::new(

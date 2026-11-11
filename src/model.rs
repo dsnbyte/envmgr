@@ -311,11 +311,11 @@ impl AppStateData {
         let mut order: Vec<String> = Vec::new();
 
         // Apply enabled profiles from bottom to top so the topmost enabled profile overwrites lower ones
-        for (idx, profile) in self.profiles.iter().enumerate().rev() {
+        for profile in self.profiles.iter().rev() {
             if !profile.enabled {
                 continue;
             }
-            let owner = format!("Profile #{}: {}", idx + 1, profile.name);
+            let owner = profile.name.clone();
             for var in &profile.vars {
                 if !map.contains_key(&var.key) {
                     order.push(var.key.clone());
@@ -538,13 +538,13 @@ mod tests {
         let effective = state.compute_effective_vars();
         let map: HashMap<_, _> = effective.into_iter().map(|v| (v.key.clone(), v)).collect();
 
-        // Profile #1 (profile_satu) wins over Profile #2 for key A
+        // Profile profile_satu wins over Profile profile_dua for key A
         assert_eq!(map["A"].value, "from_profile_satu");
-        assert_eq!(map["A"].winning_owner, "Profile #1: profile_satu");
+        assert_eq!(map["A"].winning_owner, "profile_satu");
         assert_eq!(map["B"].value, "b_from_satu");
-        assert_eq!(map["B"].winning_owner, "Profile #1: profile_satu");
+        assert_eq!(map["B"].winning_owner, "profile_satu");
         assert_eq!(map["C"].value, "c_from_dua");
-        assert_eq!(map["C"].winning_owner, "Profile #2: profile_dua");
+        assert_eq!(map["C"].winning_owner, "profile_dua");
     }
 
     #[test]

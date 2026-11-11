@@ -4,7 +4,10 @@ use crate::model::{
 };
 use crate::phase::{fetch_apps_and_envs, fetch_secrets_for_env, try_detect_local_phase_cli_host, PhaseAppInfo};
 use crate::shell::{apply_state_to_system, reload_shell_environment};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -80,6 +83,7 @@ pub struct App {
     pub is_error_status: bool,
     pub should_quit: bool,
     pub cached_apps: Vec<PhaseAppInfo>,
+    pub last_area: Rect,
 }
 
 impl App {
@@ -102,10 +106,11 @@ impl App {
             selected_effective: 0,
             show_values: false,
             modal: Modal::None,
-            status_message: "Ready. Press [a] Add Var, [n] New Profile, [e] Edit, [Space] Toggle, [r] Reload Shell, [c] Phase.dev.".to_string(),
+            status_message: String::new(),
             is_error_status: false,
             should_quit: false,
             cached_apps: Vec::new(),
+            last_area: Rect::default(),
         };
 
         // Ensure env.sh and .bashrc are initialized right away
@@ -201,8 +206,7 @@ impl App {
                 None => String::new(),
             };
             format!(
-                "Profile #{}: {} [{}]{}",
-                self.selected_profile + 1,
+                "Profile: {} [{}]{}",
                 prof.name,
                 state_str,
                 phase_str
@@ -464,7 +468,7 @@ impl App {
     fn move_selected_profile_up(&mut self) {
         if self.selected_profile == 0 {
             if !self.data.profiles.is_empty() {
-                self.set_info("Profile is already at top priority (#1).");
+                self.set_info("Profile is already at top priority.");
             }
             return;
         }
@@ -472,8 +476,8 @@ impl App {
         self.selected_profile -= 1;
         let name = self.data.profiles[self.selected_profile].name.clone();
         self.sync_to_system(&format!(
-            "Moved profile '{}' up to priority #{}",
-            name, self.selected_profile + 1
+            "Moved profile '{}' up",
+            name
         ));
     }
 
@@ -485,8 +489,8 @@ impl App {
         self.selected_profile += 1;
         let name = self.data.profiles[self.selected_profile].name.clone();
         self.sync_to_system(&format!(
-            "Moved profile '{}' down to priority #{}",
-            name, self.selected_profile + 1
+            "Moved profile '{}' down",
+            name
         ));
     }
 
@@ -761,7 +765,7 @@ impl App {
                             self.selected_profile = 0;
                             self.selected_var = 0;
                             self.sync_to_system(&format!(
-                                "Created custom profile '{}' at priority #1",
+                                "Created custom profile '{}' at top priority",
                                 trimmed
                             ));
                             return;
@@ -1090,7 +1094,8 @@ impl App {
         }
     }
 
-    pub fn draw(&self, frame: &mut Frame) {
+    pub fn draw(&mut self, frame: &mut Frame) {
+        self.last_area = frame.area();
         let root_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1100,8 +1105,12 @@ impl App {
             ])
             .split(frame.area());
 
+        let (profiles_rect, vars_rect, effective_rect) = compute_pane_areas(frame.area());
+
         self.draw_header(frame, root_chunks[0]);
-        self.draw_body(frame, root_chunks[1]);
+        self.draw_profiles_pane(frame, profiles_rect);
+        self.draw_vars_pane(frame, vars_rect);
+        self.draw_effective_pane(frame, effective_rect);
         self.draw_footer(frame, root_chunks[2]);
 
         if !matches!(self.modal, Modal::None) {
@@ -1149,23 +1158,7 @@ impl App {
         frame.render_widget(Paragraph::new(line).block(block), area);
     }
 
-    fn draw_body(&self, frame: &mut Frame, area: Rect) {
-        let main_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .spacing(1)
-            .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
-            .split(area);
 
-        let right_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .spacing(1)
-            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-            .split(main_chunks[1]);
-
-        self.draw_profiles_pane(frame, main_chunks[0]);
-        self.draw_vars_pane(frame, right_chunks[0]);
-        self.draw_effective_pane(frame, right_chunks[1]);
-    }
 
     fn draw_profiles_pane(&self, frame: &mut Frame, area: Rect) {
         let is_focused = self.focus == FocusPane::Profiles;
@@ -1177,7 +1170,7 @@ impl App {
 
         let mut items: Vec<ListItem> = Vec::with_capacity(self.data.profiles.len());
 
-        for (idx, prof) in self.data.profiles.iter().enumerate() {
+        for prof in &self.data.profiles {
             let check = if prof.enabled { "[✓] " } else { "[ ] " };
             let check_style = if prof.enabled {
                 Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
@@ -1196,10 +1189,6 @@ impl App {
 
             let line = Line::from(vec![
                 Span::styled(check, check_style),
-                Span::styled(
-                    format!("#{} ", idx + 1),
-                    Style::default().fg(Color::Cyan),
-                ),
                 Span::styled(&prof.name, name_style),
                 Span::styled(
                     format!(" ({}v){}", prof.vars.len(), badge),
@@ -1216,13 +1205,13 @@ impl App {
             ))));
         }
 
-        let title = " Profiles (Top #1 Wins Priority) ";
+        let title = " Profiles (Top Wins Priority) ";
         let list = List::new(items)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(border_style)
-                    .padding(Padding::horizontal(1))
+                    .padding(Padding::new(1, 1, 1, 0))
                     .title(title),
             )
             .highlight_style(
@@ -1276,7 +1265,7 @@ impl App {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style)
-                .padding(Padding::horizontal(1))
+                .padding(Padding::new(1, 1, 1, 0))
                 .title(format!(" Variables in {} ", self.current_target_title())),
         )
         .row_highlight_style(
@@ -1315,7 +1304,7 @@ impl App {
             })
             .collect();
 
-        let header = Row::new(vec!["EXPORTED KEY", "EFFECTIVE VALUE", "WINNING PROFILE", "ORIGIN"])
+        let header = Row::new(vec!["EXPORTED KEY", "EFFECTIVE VALUE", "PROFILE", "ORIGIN"])
             .style(
                 Style::default()
                     .fg(Color::Green)
@@ -1336,7 +1325,7 @@ impl App {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style)
-                .padding(Padding::horizontal(1))
+                .padding(Padding::new(1, 1, 1, 0))
                 .title(" Active System Environment "),
         )
         .row_highlight_style(
@@ -1360,66 +1349,67 @@ impl App {
             Style::default().fg(Color::Green)
         };
 
-        let text = vec![
-            Line::from(vec![
-                Span::styled(
-                    "[Space]",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" Toggle  "),
-                Span::styled(
-                    "[u/d]",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" Move Priority  "),
-                Span::styled(
-                    "[n]",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" New Profile  "),
-                Span::styled(
-                    "[a]",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" Add Var  "),
-                Span::styled(
-                    "[e]",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" Edit  "),
-                Span::styled(
-                    "[x]",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" Delete  "),
-                Span::styled(
-                    "[p]",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" Phase Pull  "),
-                Span::styled(
-                    "[c]",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" Phase Auth  "),
-                Span::styled(
-                    "[v]",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" Show/Hide  "),
-                Span::styled(
-                    "[r]",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" Reload Shell  "),
-                Span::styled(
-                    "[q]",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" Quit"),
-            ]),
-            Line::from(Span::styled(&self.status_message, status_style)),
-        ];
+        let mut text = vec![Line::from(vec![
+            Span::styled(
+                "[Space]",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Toggle  "),
+            Span::styled(
+                "[u/d]",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Move Priority  "),
+            Span::styled(
+                "[n]",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" New Profile  "),
+            Span::styled(
+                "[a]",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Add Var  "),
+            Span::styled(
+                "[e]",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Edit  "),
+            Span::styled(
+                "[x]",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Delete  "),
+            Span::styled(
+                "[p]",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Phase Pull  "),
+            Span::styled(
+                "[c]",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Phase Auth  "),
+            Span::styled(
+                "[v]",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Show/Hide  "),
+            Span::styled(
+                "[r]",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Reload Shell  "),
+            Span::styled(
+                "[q]",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Quit"),
+        ])];
+
+        if !self.status_message.is_empty() {
+            text.push(Line::from(Span::styled(&self.status_message, status_style)));
+        }
 
         let p = Paragraph::new(text);
         frame.render_widget(p, area);
@@ -1819,7 +1809,6 @@ impl App {
                 let block = Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan))
-                    .padding(Padding::horizontal(1))
                     .title(" Rename Profile ");
                 frame.render_widget(
                     Paragraph::new(lines).wrap(Wrap { trim: false }).block(block),
@@ -1828,6 +1817,32 @@ impl App {
             }
         }
     }
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if !matches!(self.modal, Modal::None) {
+            return;
+        }
+
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            let area = if self.last_area.width > 0 && self.last_area.height > 0 {
+                self.last_area
+            } else if let Ok((w, h)) = crossterm::terminal::size() {
+                Rect::new(0, 0, w, h)
+            } else {
+                return;
+            };
+
+            let (profiles_rect, vars_rect, effective_rect) = compute_pane_areas(area);
+
+            if rect_contains(profiles_rect, mouse.column, mouse.row) {
+                self.focus = FocusPane::Profiles;
+            } else if rect_contains(vars_rect, mouse.column, mouse.row) {
+                self.focus = FocusPane::Vars;
+            } else if rect_contains(effective_rect, mouse.column, mouse.row) {
+                self.focus = FocusPane::Effective;
+            }
+        }
+    }
+
     pub fn handle_paste(&mut self, pasted: &str) {
         let clean = pasted.trim_matches(|c| c == '\r' || c == '\n');
         match &mut self.modal {
@@ -1893,6 +1908,36 @@ fn field_style(active: bool) -> Style {
     }
 }
 
+fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
+    x >= rect.x
+        && x < rect.x.saturating_add(rect.width)
+        && y >= rect.y
+        && y < rect.y.saturating_add(rect.height)
+}
+
+pub fn compute_pane_areas(area: Rect) -> (Rect, Rect, Rect) {
+    let root_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Top header
+            Constraint::Min(12),   // Main body
+            Constraint::Length(3), // Bottom keybindings & status
+        ])
+        .split(area);
+
+    let main_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
+        .split(root_chunks[1]);
+
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(main_chunks[1]);
+
+    (main_chunks[0], right_chunks[0], right_chunks[1])
+}
+
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -1923,7 +1968,8 @@ pub fn run_tui() -> Result<(), String> {
     crossterm::execute!(
         stdout,
         crossterm::terminal::EnterAlternateScreen,
-        crossterm::event::EnableBracketedPaste
+        crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableMouseCapture
     )
     .map_err(|e| format!("Failed to enter alternate screen: {}", e))?;
 
@@ -1947,6 +1993,7 @@ pub fn run_tui() -> Result<(), String> {
                 match event::read().map_err(|e| format!("Event read error: {}", e))? {
                     Event::Key(key) => app.handle_key(key),
                     Event::Paste(text) => app.handle_paste(&text),
+                    Event::Mouse(mouse) => app.handle_mouse(mouse),
                     _ => {}
                 }
             }
@@ -1956,6 +2003,7 @@ pub fn run_tui() -> Result<(), String> {
 
     let _ = crossterm::execute!(
         terminal.backend_mut(),
+        crossterm::event::DisableMouseCapture,
         crossterm::event::DisableBracketedPaste,
         crossterm::terminal::LeaveAlternateScreen
     );
@@ -1990,10 +2038,11 @@ mod tests {
             selected_effective: 0,
             show_values: false,
             modal: Modal::None,
-            status_message: "Ready".to_string(),
+            status_message: String::new(),
             is_error_status: false,
             should_quit: false,
             cached_apps: Vec::new(),
+            last_area: Rect::default(),
         }
     }
 
@@ -2108,7 +2157,7 @@ mod tests {
 
     #[test]
     fn test_ui_titles_padding_and_masked_keys() {
-        let app = make_test_app();
+        let mut app = make_test_app();
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -2124,9 +2173,11 @@ mod tests {
             .join("\n");
 
         // Titles must NOT have numbers
-        assert!(content.contains("Profiles (Top #1 Wins Priority)"));
+        assert!(content.contains("Profiles (Top Wins Priority)"));
         assert!(!content.contains("1. Default & Profiles"));
-        assert!(content.contains("Variables in Profile #1: default [ON]"));
+        assert!(!content.contains("Profiles (Top #1 Wins Priority)"));
+        assert!(content.contains("Variables in Profile: default [ON]"));
+        assert!(!content.contains("Profile #1"));
         assert!(!content.contains("2. Variables in"));
         assert!(content.contains("Active System Environment"));
         assert!(!content.contains("3. Active System Environment"));
@@ -2138,7 +2189,104 @@ mod tests {
         assert!(content.contains("[u/d] Move Priority"));
         assert!(!content.contains("[K/J"));
 
-        // Masked key display shows 3 prefix and 3 suffix: "sk-••••xyz"
-        assert!(content.contains("sk-••••xyz"));
+        // Table header shows PROFILE instead of WINNING PROFILE
+        assert!(content.contains("PROFILE"));
+        assert!(!content.contains("WINNING PROFILE"));
+
+        // Footer must NOT contain initial "Ready" text below shortcut help
+        assert!(!content.contains("Ready"));
+    }
+
+    #[test]
+    fn test_mouse_click_gains_focus_on_panes() {
+        let mut app = make_test_app();
+        app.last_area = Rect::new(0, 0, 100, 30);
+        let (profiles_rect, vars_rect, effective_rect) = compute_pane_areas(app.last_area);
+
+        // Click on Vars pane -> focus becomes Vars
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: vars_rect.x + 2,
+            row: vars_rect.y + 2,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.focus, FocusPane::Vars);
+
+        // Click on Effective pane -> focus becomes Effective
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: effective_rect.x + 2,
+            row: effective_rect.y + 2,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.focus, FocusPane::Effective);
+
+        // Click on Profiles pane -> focus becomes Profiles
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: profiles_rect.x + 2,
+            row: profiles_rect.y + 2,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.focus, FocusPane::Profiles);
+
+        // Non-left click does not change focus
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: vars_rect.x + 2,
+            row: vars_rect.y + 2,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.focus, FocusPane::Profiles);
+
+        // Click outside panes (e.g. header row 1) does not change focus
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.focus, FocusPane::Profiles);
+
+        // Click while a modal is active does not change focus
+        app.modal = Modal::ConfirmDeleteVar {
+            var_idx: 0,
+            var_key: "API_KEY".to_string(),
+        };
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: vars_rect.x + 2,
+            row: vars_rect.y + 2,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.focus, FocusPane::Profiles);
+    }
+
+    #[test]
+    fn test_keyboard_navigation_between_panes() {
+        let mut app = make_test_app();
+        assert_eq!(app.focus, FocusPane::Profiles);
+
+        // Tab cycles Profiles -> Vars -> Effective -> Profiles
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.focus, FocusPane::Vars);
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.focus, FocusPane::Effective);
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.focus, FocusPane::Profiles);
+
+        // BackTab cycles backwards
+        app.handle_key(KeyEvent::from(KeyCode::BackTab));
+        assert_eq!(app.focus, FocusPane::Effective);
+        app.handle_key(KeyEvent::from(KeyCode::BackTab));
+        assert_eq!(app.focus, FocusPane::Vars);
+        app.handle_key(KeyEvent::from(KeyCode::BackTab));
+        assert_eq!(app.focus, FocusPane::Profiles);
+
+        // Left / 'h' and Right / 'l'
+        app.handle_key(KeyEvent::from(KeyCode::Char('l')));
+        assert_eq!(app.focus, FocusPane::Vars);
+        app.handle_key(KeyEvent::from(KeyCode::Char('h')));
+        assert_eq!(app.focus, FocusPane::Profiles);
     }
 }
