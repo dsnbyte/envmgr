@@ -254,15 +254,6 @@ pub enum VarSource {
     },
 }
 
-impl VarSource {
-    pub fn label(&self) -> String {
-        match self {
-            VarSource::Custom => "Custom".to_string(),
-            VarSource::Phase { app_name, env_name } => format!("Phase ({}/{})", app_name, env_name),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvVar {
     pub key: String,

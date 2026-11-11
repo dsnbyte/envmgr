@@ -12,7 +12,7 @@ use crossterm::event::{
     MouseEventKind,
 };
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
@@ -1542,7 +1542,7 @@ impl App {
             .constraints([
                 Constraint::Length(3), // Top header
                 Constraint::Min(12),   // Main body
-                Constraint::Length(3), // Bottom keybindings & status
+                Constraint::Length(2), // Bottom keybindings & status
             ])
             .split(frame.area());
 
@@ -1560,55 +1560,20 @@ impl App {
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
-        let phase_status = if self.data.phase.is_configured() {
-            let auth_tag = self.data.phase.auth_method.label();
-            let host = self.data.phase.effective_host();
-            Span::styled(
-                format!(" Connected ({}: {}) ", auth_tag, host),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::styled(
-                " Optional / Offline ([c] Connect) ",
-                Style::default().fg(Color::Gray),
-            )
-        };
+        let line = Line::from(Span::styled(
+            "Environtment Variables Manager",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
 
-        let auto_sync_badge = if self.data.settings.auto_sync_enabled {
-            Span::styled(
-                format!("ON ({}m)", self.data.settings.effective_interval_mins()),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::styled("OFF", Style::default().fg(Color::DarkGray))
-        };
-
-        let state_path = AppStateData::state_file_path();
-        let line = Line::from(vec![
-            Span::styled(
-                " envmgr ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("| Phase.dev: "),
-            phase_status,
-            Span::raw(" | Auto-Sync: "),
-            auto_sync_badge,
-            Span::raw(" | Store: "),
-            Span::styled(
-                state_path.to_string_lossy().into_owned(),
-                Style::default().fg(Color::Gray),
-            ),
-        ]);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" Environment & Phase.dev Manager ");
-        frame.render_widget(Paragraph::new(line).block(block), area);
+        let block = Block::default().borders(Borders::ALL);
+        frame.render_widget(
+            Paragraph::new(line)
+                .alignment(Alignment::Center)
+                .block(block),
+            area,
+        );
     }
 
     fn draw_profiles_pane(&self, frame: &mut Frame, area: Rect) {
@@ -1692,11 +1657,11 @@ impl App {
             .iter()
             .map(|v| {
                 let val_display = v.masked_display(self.show_values);
-                Row::new(vec![v.key.clone(), val_display, v.source.label()])
+                Row::new(vec![v.key.clone(), val_display])
             })
             .collect();
 
-        let header = Row::new(vec!["KEY", "VALUE ([v] show/hide)", "SOURCE"]).style(
+        let header = Row::new(vec!["KEY", "VALUE"]).style(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -1705,9 +1670,8 @@ impl App {
         let table = Table::new(
             rows,
             [
-                Constraint::Percentage(35),
-                Constraint::Percentage(38),
-                Constraint::Percentage(27),
+                Constraint::Percentage(40),
+                Constraint::Percentage(60),
             ],
         )
         .header(header)
@@ -1754,7 +1718,7 @@ impl App {
             })
             .collect();
 
-        let header = Row::new(vec!["EXPORTED KEY", "EFFECTIVE VALUE", "PROFILE", "ORIGIN"]).style(
+        let header = Row::new(vec!["EXPORTED KEY", "EFFECTIVE VALUE", "PROFILE", "SOURCE"]).style(
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
@@ -1792,13 +1756,15 @@ impl App {
     }
 
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
-        let status_style = if self.is_error_status {
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Green)
-        };
+        let footer_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // Shortcuts
+                Constraint::Length(1), // Status bar
+            ])
+            .split(area);
 
-        let mut text = vec![Line::from(vec![
+        let shortcuts = Line::from(vec![
             Span::styled(
                 "[Space]",
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -1859,14 +1825,53 @@ impl App {
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
             Span::raw(" Quit"),
-        ])];
+        ]);
+        frame.render_widget(Paragraph::new(shortcuts), footer_chunks[0]);
 
-        if !self.status_message.is_empty() {
-            text.push(Line::from(Span::styled(&self.status_message, status_style)));
-        }
+        let phase_status = if self.data.phase.is_configured() {
+            let auth_tag = self.data.phase.auth_method.label();
+            let host = self.data.phase.effective_host();
+            Span::styled(
+                format!(" Connected ({}: {}) ", auth_tag, host),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(
+                " Optional / Offline ([c] Connect) ",
+                Style::default().fg(Color::Gray),
+            )
+        };
 
-        let p = Paragraph::new(text);
-        frame.render_widget(p, area);
+        let auto_sync_badge = if self.data.settings.auto_sync_enabled {
+            Span::styled(
+                format!("ON ({}m)", self.data.settings.effective_interval_mins()),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled("OFF", Style::default().fg(Color::DarkGray))
+        };
+
+        let status_line = Line::from(vec![
+            Span::styled(
+                " Phase.dev: ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            phase_status,
+            Span::raw(" | Auto-Sync: "),
+            auto_sync_badge,
+        ]);
+
+        let status_bar = Paragraph::new(status_line).style(
+            Style::default()
+                .bg(Color::Rgb(25, 35, 50))
+                .fg(Color::White),
+        );
+        frame.render_widget(status_bar, footer_chunks[1]);
     }
 
     fn draw_modal(&self, frame: &mut Frame, area: Rect) {
@@ -2617,7 +2622,7 @@ pub fn compute_pane_areas(area: Rect) -> (Rect, Rect, Rect) {
         .constraints([
             Constraint::Length(3), // Top header
             Constraint::Min(12),   // Main body
-            Constraint::Length(3), // Bottom keybindings & status
+            Constraint::Length(2), // Bottom keybindings & status
         ])
         .split(area);
 
@@ -2948,6 +2953,37 @@ mod tests {
         assert!(content.contains("PROFILE"));
         assert!(!content.contains("WINNING PROFILE"));
         assert!(!content.contains("Ready"));
+        assert!(content.contains("Environtment Variables Manager"));
+        assert!(!content.contains("Environment & Phase.dev Manager"));
+        assert!(!content.contains("Store:"));
+        assert!(!content.contains("VALUE ([v] show/hide)"));
+        assert!(content.contains("VALUE"));
+        assert!(content.contains("SOURCE"));
+        assert!(!content.contains("ORIGIN"));
+        assert!(content.contains("Phase.dev:"));
+    }
+
+    #[test]
+    fn test_status_message_not_rendered_beneath_shortcut() {
+        let mut app = make_test_app();
+        app.set_info("Secret values are now masked.");
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let content: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.get(x, y).symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!content.contains("Secret values are now masked."));
+        assert!(content.contains("Environtment Variables Manager"));
+        assert!(content.contains("Phase.dev:"));
     }
 
     #[test]
