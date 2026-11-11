@@ -16,8 +16,8 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Row, Table,
-        TableState, Wrap,
+        Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Row,
+        Table, TableState, Wrap,
     },
     Frame,
 };
@@ -85,6 +85,56 @@ pub enum Modal {
         active_field: usize, // 0..7
         error: Option<String>,
     },
+    Help,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextAction {
+    ToggleProfile,
+    Edit,
+    Delete,
+    MoveUp,
+    MoveDown,
+    NewProfile,
+    AddVar,
+    PhaseSync,
+    PhaseRebind,
+    ToggleMask,
+    ReloadShell,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContextMenuItem {
+    pub label: String,
+    pub shortcut: &'static str,
+    pub action: ContextAction,
+    pub is_danger: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContextMenu {
+    pub x: u16,
+    pub y: u16,
+    pub title: String,
+    pub items: Vec<ContextMenuItem>,
+    pub selected: usize,
+}
+
+impl ContextMenu {
+    pub fn rect(&self, area: Rect) -> Rect {
+        let content_width = self
+            .items
+            .iter()
+            .map(|item| item.label.len() + item.shortcut.len() + 7)
+            .max()
+            .unwrap_or(24)
+            .max(self.title.len() + 4) as u16;
+        let width = content_width.clamp(26, 40).min(area.width.saturating_sub(2));
+        let height = (self.items.len() as u16 + 2).min(area.height.saturating_sub(1));
+        let x = self.x.min(area.width.saturating_sub(width));
+        let y = self.y.min(area.height.saturating_sub(height));
+        Rect::new(x, y, width, height)
+    }
 }
 
 pub struct App {
@@ -95,6 +145,7 @@ pub struct App {
     pub selected_effective: usize,
     pub show_values: bool,
     pub modal: Modal,
+    pub context_menu: Option<ContextMenu>,
     pub status_message: String,
     pub is_error_status: bool,
     pub should_quit: bool,
@@ -127,6 +178,7 @@ impl App {
             selected_effective: 0,
             show_values,
             modal: Modal::None,
+            context_menu: None,
             status_message: String::new(),
             is_error_status: false,
             should_quit: false,
@@ -322,6 +374,11 @@ impl App {
             return;
         }
 
+        if self.context_menu.is_some() {
+            self.handle_context_menu_key(key);
+            return;
+        }
+
         if !matches!(self.modal, Modal::None) {
             self.handle_modal_key(key);
             return;
@@ -330,6 +387,9 @@ impl App {
         match key.code {
             KeyCode::Char('q') => {
                 self.should_quit = true;
+            }
+            KeyCode::Char('?') | KeyCode::F(1) => {
+                self.modal = Modal::Help;
             }
             KeyCode::Tab => {
                 self.focus = match self.focus {
@@ -602,7 +662,312 @@ impl App {
                 }
             }
             FocusPane::Effective => {
-                self.set_info("Cannot delete from Effective pane directly. Switch to Profiles or Variables pane.");
+                self.open_delete_effective_var();
+            }
+        }
+    }
+
+    fn open_delete_effective_var(&mut self) {
+        let eff = self.data.compute_effective_vars();
+        if let Some(ev) = eff.get(self.selected_effective) {
+            for (p_idx, prof) in self.data.profiles.iter().enumerate() {
+                if !prof.enabled {
+                    continue;
+                }
+                if let Some(v_idx) = prof.vars.iter().position(|v| v.key == ev.key) {
+                    if prof.is_phase() {
+                        let pname = prof.name.clone();
+                        let vkey = ev.key.clone();
+                        self.set_error(format!(
+                            "Variable '{}' belongs to Phase.dev profile '{}' and cannot be deleted manually.",
+                            vkey, pname
+                        ));
+                        return;
+                    }
+                    self.selected_profile = p_idx;
+                    self.selected_var = v_idx;
+                    self.focus = FocusPane::Vars;
+                    self.modal = Modal::ConfirmDeleteVar {
+                        var_idx: v_idx,
+                        var_key: ev.key.clone(),
+                    };
+                    return;
+                }
+            }
+        }
+        self.set_info("No effective variable selected to delete.");
+    }
+
+    fn open_new_profile_modal(&mut self) {
+        self.modal = Modal::NewProfile {
+            name: String::new(),
+            pull_from_phase: false,
+            active_field: 0,
+            error: None,
+        };
+    }
+
+    fn open_add_var_modal(&mut self) {
+        let Some(prof) = self.current_profile() else {
+            self.set_error("No profile available. Create a profile first with [n].");
+            return;
+        };
+        if prof.is_phase() {
+            let pname = prof.name.clone();
+            self.set_error(format!(
+                "Profile '{}' uses Phase.dev synchronization. Sources cannot be mixed (create a Custom profile with [n]).",
+                pname
+            ));
+        } else {
+            self.modal = Modal::VarEditor {
+                is_edit: false,
+                original_index: None,
+                var_key: String::new(),
+                var_value: String::new(),
+                active_field: 0,
+                error: None,
+            };
+        }
+    }
+
+    fn toggle_current_profile(&mut self) {
+        if let Some(prof) = self.current_profile_mut() {
+            prof.enabled = !prof.enabled;
+            let name = prof.name.clone();
+            let status = if prof.enabled { "ON" } else { "OFF" };
+            self.sync_to_system(&format!("Toggled profile '{}' {}", name, status));
+        }
+    }
+
+    fn toggle_mask_values(&mut self) {
+        self.show_values = !self.show_values;
+        let state = if self.show_values { "shown" } else { "masked" };
+        self.set_info(format!("Secret values are now {}.", state));
+    }
+
+    pub fn execute_context_action(&mut self, action: ContextAction) {
+        match action {
+            ContextAction::ToggleProfile => self.toggle_current_profile(),
+            ContextAction::Edit => self.handle_edit_action(),
+            ContextAction::Delete => self.handle_delete_action(),
+            ContextAction::MoveUp => self.move_selected_profile_up(),
+            ContextAction::MoveDown => self.move_selected_profile_down(),
+            ContextAction::NewProfile => self.open_new_profile_modal(),
+            ContextAction::AddVar => self.open_add_var_modal(),
+            ContextAction::PhaseSync => self.handle_phase_sync_action(false),
+            ContextAction::PhaseRebind => self.handle_phase_sync_action(true),
+            ContextAction::ToggleMask => self.toggle_mask_values(),
+            ContextAction::ReloadShell => self.reload_shell(),
+        }
+    }
+
+    pub fn open_context_menu_for_pane(&mut self, pane: FocusPane, x: u16, y: u16) {
+        let mut items = Vec::new();
+        let title = match pane {
+            FocusPane::Profiles => {
+                if let Some(prof) = self.current_profile() {
+                    let toggle_label = if prof.enabled {
+                        "Disable Profile"
+                    } else {
+                        "Enable Profile"
+                    };
+                    items.push(ContextMenuItem {
+                        label: "Edit Profile".to_string(),
+                        shortcut: "e",
+                        action: ContextAction::Edit,
+                        is_danger: false,
+                    });
+                    items.push(ContextMenuItem {
+                        label: toggle_label.to_string(),
+                        shortcut: "Space",
+                        action: ContextAction::ToggleProfile,
+                        is_danger: false,
+                    });
+                    items.push(ContextMenuItem {
+                        label: "Move Priority Up".to_string(),
+                        shortcut: "u",
+                        action: ContextAction::MoveUp,
+                        is_danger: false,
+                    });
+                    items.push(ContextMenuItem {
+                        label: "Move Priority Down".to_string(),
+                        shortcut: "d",
+                        action: ContextAction::MoveDown,
+                        is_danger: false,
+                    });
+                    if prof.is_phase() {
+                        items.push(ContextMenuItem {
+                            label: "Sync Phase.dev".to_string(),
+                            shortcut: "p",
+                            action: ContextAction::PhaseSync,
+                            is_danger: false,
+                        });
+                        items.push(ContextMenuItem {
+                            label: "Change Phase App/Env".to_string(),
+                            shortcut: "P",
+                            action: ContextAction::PhaseRebind,
+                            is_danger: false,
+                        });
+                    } else {
+                        items.push(ContextMenuItem {
+                            label: "Add Variable".to_string(),
+                            shortcut: "a",
+                            action: ContextAction::AddVar,
+                            is_danger: false,
+                        });
+                    }
+                    items.push(ContextMenuItem {
+                        label: "New Profile".to_string(),
+                        shortcut: "n",
+                        action: ContextAction::NewProfile,
+                        is_danger: false,
+                    });
+                    items.push(ContextMenuItem {
+                        label: "Delete Profile".to_string(),
+                        shortcut: "x",
+                        action: ContextAction::Delete,
+                        is_danger: true,
+                    });
+                } else {
+                    items.push(ContextMenuItem {
+                        label: "New Profile".to_string(),
+                        shortcut: "n",
+                        action: ContextAction::NewProfile,
+                        is_danger: false,
+                    });
+                }
+                " Profile Actions ".to_string()
+            }
+            FocusPane::Vars => {
+                let has_vars = !self.current_vars().is_empty();
+                let is_phase = self
+                    .current_profile()
+                    .map(|p| p.is_phase())
+                    .unwrap_or(false);
+                if has_vars {
+                    items.push(ContextMenuItem {
+                        label: "Edit Variable".to_string(),
+                        shortcut: "e",
+                        action: ContextAction::Edit,
+                        is_danger: false,
+                    });
+                    items.push(ContextMenuItem {
+                        label: "Delete Variable".to_string(),
+                        shortcut: "x",
+                        action: ContextAction::Delete,
+                        is_danger: true,
+                    });
+                }
+                if is_phase {
+                    items.push(ContextMenuItem {
+                        label: "Sync Phase.dev".to_string(),
+                        shortcut: "p",
+                        action: ContextAction::PhaseSync,
+                        is_danger: false,
+                    });
+                } else {
+                    items.push(ContextMenuItem {
+                        label: "Add Variable".to_string(),
+                        shortcut: "a",
+                        action: ContextAction::AddVar,
+                        is_danger: false,
+                    });
+                }
+                items.push(ContextMenuItem {
+                    label: if self.show_values {
+                        "Mask Secret Values".to_string()
+                    } else {
+                        "Show Secret Values".to_string()
+                    },
+                    shortcut: "v",
+                    action: ContextAction::ToggleMask,
+                    is_danger: false,
+                });
+                " Variable Actions ".to_string()
+            }
+            FocusPane::Effective => {
+                if !self.data.compute_effective_vars().is_empty() {
+                    items.push(ContextMenuItem {
+                        label: "Edit Variable".to_string(),
+                        shortcut: "e",
+                        action: ContextAction::Edit,
+                        is_danger: false,
+                    });
+                    items.push(ContextMenuItem {
+                        label: "Delete Variable".to_string(),
+                        shortcut: "x",
+                        action: ContextAction::Delete,
+                        is_danger: true,
+                    });
+                }
+                items.push(ContextMenuItem {
+                    label: if self.show_values {
+                        "Mask Secret Values".to_string()
+                    } else {
+                        "Show Secret Values".to_string()
+                    },
+                    shortcut: "v",
+                    action: ContextAction::ToggleMask,
+                    is_danger: false,
+                });
+                items.push(ContextMenuItem {
+                    label: "Reload Shell Env".to_string(),
+                    shortcut: "r",
+                    action: ContextAction::ReloadShell,
+                    is_danger: false,
+                });
+                " Effective Env Actions ".to_string()
+            }
+        };
+
+        if !items.is_empty() {
+            self.context_menu = Some(ContextMenu {
+                x,
+                y,
+                title,
+                items,
+                selected: 0,
+            });
+        }
+    }
+
+    fn handle_context_menu_key(&mut self, key: KeyEvent) {
+        let Some(mut menu) = self.context_menu.take() else {
+            return;
+        };
+        let len = menu.items.len();
+        if len == 0 {
+            return;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {}
+            KeyCode::Up | KeyCode::Char('k') => {
+                menu.selected = (menu.selected + len - 1) % len;
+                self.context_menu = Some(menu);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                menu.selected = (menu.selected + 1) % len;
+                self.context_menu = Some(menu);
+            }
+            KeyCode::Enter => {
+                let action = menu.items[menu.selected].action;
+                self.execute_context_action(action);
+            }
+            KeyCode::Char('e') => self.execute_context_action(ContextAction::Edit),
+            KeyCode::Char('x') | KeyCode::Delete => {
+                self.execute_context_action(ContextAction::Delete)
+            }
+            KeyCode::Char(' ') => self.execute_context_action(ContextAction::ToggleProfile),
+            KeyCode::Char('u') => self.execute_context_action(ContextAction::MoveUp),
+            KeyCode::Char('d') => self.execute_context_action(ContextAction::MoveDown),
+            KeyCode::Char('n') => self.execute_context_action(ContextAction::NewProfile),
+            KeyCode::Char('a') => self.execute_context_action(ContextAction::AddVar),
+            KeyCode::Char('p') => self.execute_context_action(ContextAction::PhaseSync),
+            KeyCode::Char('P') => self.execute_context_action(ContextAction::PhaseRebind),
+            KeyCode::Char('v') => self.execute_context_action(ContextAction::ToggleMask),
+            KeyCode::Char('r') => self.execute_context_action(ContextAction::ReloadShell),
+            _ => {
+                self.context_menu = Some(menu);
             }
         }
     }
@@ -1532,27 +1897,35 @@ impl App {
                     error,
                 };
             }
+
+            Modal::Help => match key.code {
+                KeyCode::Esc
+                | KeyCode::Char('?')
+                | KeyCode::Char('q')
+                | KeyCode::Enter
+                | KeyCode::Char(' ')
+                | KeyCode::F(1) => {}
+                _ => {
+                    self.modal = Modal::Help;
+                }
+            },
         }
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
         self.last_area = frame.area();
-        let root_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3), // Top header
-                Constraint::Min(12),   // Main body
-                Constraint::Length(2), // Bottom keybindings & status
-            ])
-            .split(frame.area());
+        let (header_rect, profiles_rect, vars_rect, effective_rect, status_bar_rect) =
+            compute_layout_chunks(frame.area());
 
-        let (profiles_rect, vars_rect, effective_rect) = compute_pane_areas(frame.area());
-
-        self.draw_header(frame, root_chunks[0]);
+        self.draw_header(frame, header_rect);
         self.draw_profiles_pane(frame, profiles_rect);
         self.draw_vars_pane(frame, vars_rect);
         self.draw_effective_pane(frame, effective_rect);
-        self.draw_footer(frame, root_chunks[2]);
+        self.draw_footer(frame, status_bar_rect);
+
+        if self.context_menu.is_some() {
+            self.draw_context_menu(frame, frame.area());
+        }
 
         if !matches!(self.modal, Modal::None) {
             self.draw_modal(frame, frame.area());
@@ -1560,20 +1933,64 @@ impl App {
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
-        let line = Line::from(Span::styled(
-            "Environtment Variables Manager",
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Rgb(65, 85, 115)));
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let title_span = Span::styled(
+            " Environtment Variables Manager ",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
-        ));
-
-        let block = Block::default().borders(Borders::ALL);
-        frame.render_widget(
-            Paragraph::new(line)
-                .alignment(Alignment::Center)
-                .block(block),
-            area,
         );
+
+        if inner.width >= 86 {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(34), Constraint::Length(50)])
+                .split(inner);
+
+            frame.render_widget(
+                Paragraph::new(Line::from(title_span)).alignment(Alignment::Left),
+                cols[0],
+            );
+
+            let btn_style = Style::default()
+                .fg(Color::Cyan)
+                .bg(Color::Rgb(25, 38, 58))
+                .add_modifier(Modifier::BOLD);
+            let sep = Span::raw(" ");
+            let mask_label = if self.show_values {
+                " [Hide] "
+            } else {
+                " [Show] "
+            };
+
+            let toolbar = Line::from(vec![
+                Span::styled(" [+Profile] ", btn_style),
+                sep.clone(),
+                Span::styled(" [+Var] ", btn_style),
+                sep.clone(),
+                Span::styled(" [Sync] ", btn_style),
+                sep.clone(),
+                Span::styled(mask_label, btn_style),
+                sep,
+                Span::styled(" [Settings] ", btn_style),
+            ]);
+            frame.render_widget(
+                Paragraph::new(toolbar).alignment(Alignment::Right),
+                cols[1],
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(Line::from(title_span)).alignment(Alignment::Center),
+                inner,
+            );
+        }
     }
 
     fn draw_profiles_pane(&self, frame: &mut Frame, area: Rect) {
@@ -1616,7 +2033,7 @@ impl App {
 
         if items.is_empty() {
             items.push(ListItem::new(Line::from(Span::styled(
-                "No profiles. Press [n] to create one.",
+                "No profiles. Click [+Profile] or press [n] to create one.",
                 Style::default().fg(Color::DarkGray),
             ))));
         }
@@ -1626,6 +2043,7 @@ impl App {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
                     .border_style(border_style)
                     .padding(Padding::new(1, 1, 1, 0))
                     .title(title),
@@ -1678,6 +2096,7 @@ impl App {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(border_style)
                 .padding(Padding::new(1, 1, 1, 0))
                 .title(format!(" Variables in {} ", self.current_target_title())),
@@ -1737,6 +2156,7 @@ impl App {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(border_style)
                 .padding(Padding::new(1, 1, 1, 0))
                 .title(" Active System Environment "),
@@ -1756,77 +2176,10 @@ impl App {
     }
 
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
-        let footer_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1), // Shortcuts
-                Constraint::Length(1), // Status bar
-            ])
+        let status_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(16), Constraint::Length(16)])
             .split(area);
-
-        let shortcuts = Line::from(vec![
-            Span::styled(
-                "[Space]",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" Toggle "),
-            Span::styled(
-                "[u/d]",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" Move Priority "),
-            Span::styled(
-                "[n]",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" New Profile "),
-            Span::styled(
-                "[a]",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" Add Var "),
-            Span::styled(
-                "[e]",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" Edit "),
-            Span::styled(
-                "[x]",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" Delete "),
-            Span::styled(
-                "[p]",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" Phase Sync "),
-            Span::styled(
-                "[c]",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" Auth "),
-            Span::styled(
-                "[s]",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" Settings "),
-            Span::styled(
-                "[v]",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" Show/Hide "),
-            Span::styled(
-                "[r]",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" Reload "),
-            Span::styled(
-                "[q]",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" Quit"),
-        ]);
-        frame.render_widget(Paragraph::new(shortcuts), footer_chunks[0]);
 
         let phase_status = if self.data.phase.is_configured() {
             let auth_tag = self.data.phase.auth_method.label();
@@ -1866,12 +2219,107 @@ impl App {
             auto_sync_badge,
         ]);
 
-        let status_bar = Paragraph::new(status_line).style(
-            Style::default()
-                .bg(Color::Rgb(25, 35, 50))
-                .fg(Color::White),
+        let bg_style = Style::default()
+            .bg(Color::Rgb(25, 35, 50))
+            .fg(Color::White);
+
+        frame.render_widget(
+            Paragraph::new(status_line).style(bg_style),
+            status_chunks[0],
         );
-        frame.render_widget(status_bar, footer_chunks[1]);
+
+        let help_indicator = Line::from(vec![
+            Span::styled(
+                " ? ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " Shortcuts ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .bg(Color::Rgb(35, 50, 72))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        frame.render_widget(
+            Paragraph::new(help_indicator)
+                .alignment(Alignment::Right)
+                .style(bg_style),
+            status_chunks[1],
+        );
+    }
+
+    fn draw_context_menu(&self, frame: &mut Frame, area: Rect) {
+        let Some(menu) = &self.context_menu else {
+            return;
+        };
+        let popup = menu.rect(area);
+        frame.render_widget(Clear, popup);
+
+        let inner_width = popup.width.saturating_sub(2) as usize;
+        let items: Vec<ListItem> = menu
+            .items
+            .iter()
+            .enumerate()
+            .map(|(idx, item)| {
+                let is_sel = idx == menu.selected;
+                let shortcut_str = format!("[{}]", item.shortcut);
+                let pad = inner_width
+                    .saturating_sub(item.label.len() + shortcut_str.len() + 3)
+                    .max(1);
+                let spaces = " ".repeat(pad);
+
+                let (fg_label, fg_key, row_bg) = if is_sel {
+                    if item.is_danger {
+                        (Color::White, Color::Yellow, Color::Rgb(120, 35, 45))
+                    } else {
+                        (Color::White, Color::Cyan, Color::Rgb(40, 68, 105))
+                    }
+                } else if item.is_danger {
+                    (Color::LightRed, Color::DarkGray, Color::Rgb(20, 26, 38))
+                } else {
+                    (Color::White, Color::DarkGray, Color::Rgb(20, 26, 38))
+                };
+
+                let prefix = if is_sel { "▸ " } else { "  " };
+                let line = Line::from(vec![
+                    Span::styled(
+                        format!("{}{}", prefix, item.label),
+                        Style::default()
+                            .fg(fg_label)
+                            .bg(row_bg)
+                            .add_modifier(if is_sel {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                    Span::styled(spaces, Style::default().bg(row_bg)),
+                    Span::styled(
+                        format!("{} ", shortcut_str),
+                        Style::default().fg(fg_key).bg(row_bg),
+                    ),
+                ]);
+                ListItem::new(line).style(Style::default().bg(row_bg))
+            })
+            .collect();
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Cyan))
+            .style(Style::default().bg(Color::Rgb(20, 26, 38)))
+            .title(Span::styled(
+                &menu.title,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+
+        frame.render_widget(List::new(items).block(block), popup);
     }
 
     fn draw_modal(&self, frame: &mut Frame, area: Rect) {
@@ -2020,6 +2468,7 @@ impl App {
 
                 let block = Block::default()
                     .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(Color::Cyan))
                     .title(" Phase.dev Authentication Setup ");
                 frame.render_widget(
@@ -2088,6 +2537,7 @@ impl App {
 
                 let block = Block::default()
                     .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(Color::Cyan))
                     .title(" New Profile ");
                 frame.render_widget(
@@ -2255,6 +2705,7 @@ impl App {
 
                 let block = Block::default()
                     .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(Color::Cyan))
                     .title(title);
                 frame.render_widget(
@@ -2277,6 +2728,7 @@ impl App {
                 ];
                 let block = Block::default()
                     .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(Color::Red))
                     .title(" Confirm Delete Profile ");
                 frame.render_widget(Paragraph::new(lines).block(block), popup);
@@ -2296,6 +2748,7 @@ impl App {
                 ];
                 let block = Block::default()
                     .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(Color::Red))
                     .title(" Confirm Delete Variable ");
                 frame.render_widget(Paragraph::new(lines).block(block), popup);
@@ -2357,6 +2810,7 @@ impl App {
 
                 let block = Block::default()
                     .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(Color::Cyan))
                     .title(" Edit Profile ");
                 frame.render_widget(
@@ -2488,8 +2942,115 @@ impl App {
 
                 let block = Block::default()
                     .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(Color::Cyan))
                     .title(" Settings ");
+                frame.render_widget(
+                    Paragraph::new(lines).wrap(Wrap { trim: false }).block(block),
+                    popup,
+                );
+            }
+
+            Modal::Help => {
+                let popup = centered_rect(72, 74, area);
+                frame.render_widget(Clear, popup);
+
+                let key_style = Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD);
+                let sec_style = Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD);
+                let desc_style = Style::default().fg(Color::White);
+
+                let lines = vec![
+                    Line::from(Span::styled(
+                        "Keyboard Shortcuts & Mouse Controls",
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled("Mouse Actions", sec_style)),
+                    Line::from(vec![
+                        Span::styled("  Left Click         ", key_style),
+                        Span::styled("Focus pane, select item, toggle [✓] profile, or click buttons", desc_style),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  Right Click        ", key_style),
+                        Span::styled("Select item & open Context Menu (Edit, Delete, Toggle, etc.)", desc_style),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  Scroll Wheel       ", key_style),
+                        Span::styled("Scroll items in the hovered pane or context menu", desc_style),
+                    ]),
+                    Line::from(""),
+                    Line::from(Span::styled("Profile & Variable Actions", sec_style)),
+                    Line::from(vec![
+                        Span::styled("  [Space]            ", key_style),
+                        Span::styled("Toggle selected profile ON / OFF", desc_style),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  [u / d]            ", key_style),
+                        Span::styled("Move Priority up / down (top profile wins)", desc_style),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  [n]                ", key_style),
+                        Span::styled("Create a New Profile (Custom or Phase.dev)", desc_style),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  [a]                ", key_style),
+                        Span::styled("Add a custom environment variable", desc_style),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  [e / Enter]        ", key_style),
+                        Span::styled("Edit selected profile or variable", desc_style),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  [x / Delete]       ", key_style),
+                        Span::styled("Delete selected profile or variable", desc_style),
+                    ]),
+                    Line::from(""),
+                    Line::from(Span::styled("Phase.dev, View & System", sec_style)),
+                    Line::from(vec![
+                        Span::styled("  [p / P]            ", key_style),
+                        Span::styled("Sync Phase.dev secrets / Rebind Phase App & Env", desc_style),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  [c]                ", key_style),
+                        Span::styled("Configure Phase.dev authentication (CLI / Token)", desc_style),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  [v]                ", key_style),
+                        Span::styled("Show / Hide (mask) secret values", desc_style),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  [s]                ", key_style),
+                        Span::styled("Open application & auto-sync Settings", desc_style),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  [r]                ", key_style),
+                        Span::styled("Save encrypted state & reload shell environment", desc_style),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  [Tab / Shift+Tab]  ", key_style),
+                        Span::styled("Cycle focus between Profiles, Variables, and Effective panes", desc_style),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  [?] / [q]          ", key_style),
+                        Span::styled("Toggle this help popup / Quit application", desc_style),
+                    ]),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "Press [Esc], [?], [Enter], or click anywhere to close",
+                        Style::default().fg(Color::Gray),
+                    )),
+                ];
+
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .padding(Padding::new(1, 1, 0, 0))
+                    .title(" ? Keyboard Shortcuts & Help ");
                 frame.render_widget(
                     Paragraph::new(lines).wrap(Wrap { trim: false }).block(block),
                     popup,
@@ -2498,29 +3059,315 @@ impl App {
         }
     }
 
+    fn profile_index_at_row(&self, profiles_rect: Rect, row: u16) -> Option<usize> {
+        let item_start_y = profiles_rect.y.saturating_add(2);
+        let item_end_y = profiles_rect
+            .y
+            .saturating_add(profiles_rect.height.saturating_sub(1));
+        if row < item_start_y || row >= item_end_y || self.data.profiles.is_empty() {
+            return None;
+        }
+        let visible_rows = (item_end_y - item_start_y) as usize;
+        let offset = if visible_rows > 0 && self.selected_profile >= visible_rows {
+            self.selected_profile + 1 - visible_rows
+        } else {
+            0
+        };
+        let idx = offset + (row - item_start_y) as usize;
+        (idx < self.data.profiles.len()).then_some(idx)
+    }
+
+    fn var_index_at_row(&self, vars_rect: Rect, row: u16) -> Option<usize> {
+        let item_start_y = vars_rect.y.saturating_add(3);
+        let item_end_y = vars_rect
+            .y
+            .saturating_add(vars_rect.height.saturating_sub(1));
+        let vars_len = self.current_vars().len();
+        if row < item_start_y || row >= item_end_y || vars_len == 0 {
+            return None;
+        }
+        let visible_rows = (item_end_y - item_start_y) as usize;
+        let offset = if visible_rows > 0 && self.selected_var >= visible_rows {
+            self.selected_var + 1 - visible_rows
+        } else {
+            0
+        };
+        let idx = offset + (row - item_start_y) as usize;
+        (idx < vars_len).then_some(idx)
+    }
+
+    fn effective_index_at_row(&self, effective_rect: Rect, row: u16) -> Option<usize> {
+        let item_start_y = effective_rect.y.saturating_add(3);
+        let item_end_y = effective_rect
+            .y
+            .saturating_add(effective_rect.height.saturating_sub(1));
+        let eff_len = self.data.compute_effective_vars().len();
+        if row < item_start_y || row >= item_end_y || eff_len == 0 {
+            return None;
+        }
+        let visible_rows = (item_end_y - item_start_y) as usize;
+        let offset = if visible_rows > 0 && self.selected_effective >= visible_rows {
+            self.selected_effective + 1 - visible_rows
+        } else {
+            0
+        };
+        let idx = offset + (row - item_start_y) as usize;
+        (idx < eff_len).then_some(idx)
+    }
+
+    fn scroll_pane_up(&mut self, pane: FocusPane) {
+        match pane {
+            FocusPane::Profiles => {
+                if self.selected_profile > 0 {
+                    self.selected_profile -= 1;
+                    self.selected_var = 0;
+                }
+            }
+            FocusPane::Vars => {
+                if self.selected_var > 0 {
+                    self.selected_var -= 1;
+                }
+            }
+            FocusPane::Effective => {
+                if self.selected_effective > 0 {
+                    self.selected_effective -= 1;
+                }
+            }
+        }
+    }
+
+    fn scroll_pane_down(&mut self, pane: FocusPane) {
+        match pane {
+            FocusPane::Profiles => {
+                if self.selected_profile + 1 < self.data.profiles.len() {
+                    self.selected_profile += 1;
+                    self.selected_var = 0;
+                }
+            }
+            FocusPane::Vars => {
+                if self.selected_var + 1 < self.current_vars().len() {
+                    self.selected_var += 1;
+                }
+            }
+            FocusPane::Effective => {
+                let len = self.data.compute_effective_vars().len();
+                if self.selected_effective + 1 < len {
+                    self.selected_effective += 1;
+                }
+            }
+        }
+    }
+
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        let area = if self.last_area.width > 0 && self.last_area.height > 0 {
+            self.last_area
+        } else if let Ok((w, h)) = crossterm::terminal::size() {
+            Rect::new(0, 0, w, h)
+        } else {
+            return;
+        };
+
+        // 1. Handle active Context Menu interactions first
+        if let Some(mut menu) = self.context_menu.take() {
+            let popup = menu.rect(area);
+            let inner_top = popup.y.saturating_add(1);
+            let inner_bottom = popup.y.saturating_add(popup.height.saturating_sub(1));
+            let in_menu_rows = rect_contains(popup, mouse.column, mouse.row)
+                && mouse.row >= inner_top
+                && mouse.row < inner_bottom;
+
+            match mouse.kind {
+                MouseEventKind::Moved => {
+                    if in_menu_rows {
+                        let idx = (mouse.row - inner_top) as usize;
+                        if idx < menu.items.len() {
+                            menu.selected = idx;
+                        }
+                    }
+                    self.context_menu = Some(menu);
+                    return;
+                }
+                MouseEventKind::ScrollUp => {
+                    if !menu.items.is_empty() {
+                        menu.selected = (menu.selected + menu.items.len() - 1) % menu.items.len();
+                    }
+                    self.context_menu = Some(menu);
+                    return;
+                }
+                MouseEventKind::ScrollDown => {
+                    if !menu.items.is_empty() {
+                        menu.selected = (menu.selected + 1) % menu.items.len();
+                    }
+                    self.context_menu = Some(menu);
+                    return;
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if in_menu_rows {
+                        let idx = (mouse.row - inner_top) as usize;
+                        if let Some(action) = menu.items.get(idx).map(|i| i.action) {
+                            self.execute_context_action(action);
+                        }
+                    }
+                    return;
+                }
+                MouseEventKind::Down(MouseButton::Right) => {
+                    // Close current context menu and fall through to open a new one at the cursor
+                }
+                _ => {
+                    self.context_menu = Some(menu);
+                    return;
+                }
+            }
+        }
+
+        // 2. If a modal is open, handle modal mouse clicks without altering background focus
         if !matches!(self.modal, Modal::None) {
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                match &self.modal {
+                    Modal::Help => {
+                        self.modal = Modal::None;
+                    }
+                    _ => {
+                        let popup = centered_rect(74, 66, area);
+                        if !rect_contains(popup, mouse.column, mouse.row) {
+                            self.modal = Modal::None;
+                        }
+                    }
+                }
+            }
             return;
         }
 
-        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-            let area = if self.last_area.width > 0 && self.last_area.height > 0 {
-                self.last_area
-            } else if let Ok((w, h)) = crossterm::terminal::size() {
-                Rect::new(0, 0, w, h)
-            } else {
-                return;
-            };
+        let (header_rect, profiles_rect, vars_rect, effective_rect, status_bar_rect) =
+            compute_layout_chunks(area);
 
-            let (profiles_rect, vars_rect, effective_rect) = compute_pane_areas(area);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Status bar click handling
+                if rect_contains(status_bar_rect, mouse.column, mouse.row) {
+                    let help_start_x = status_bar_rect
+                        .x
+                        .saturating_add(status_bar_rect.width.saturating_sub(16));
+                    if mouse.column >= help_start_x {
+                        self.modal = Modal::Help;
+                    } else if mouse.column < status_bar_rect.x.saturating_add(44) {
+                        self.open_phase_connect_modal(None, None);
+                    } else {
+                        self.open_settings_modal();
+                    }
+                    return;
+                }
 
-            if rect_contains(profiles_rect, mouse.column, mouse.row) {
-                self.focus = FocusPane::Profiles;
-            } else if rect_contains(vars_rect, mouse.column, mouse.row) {
-                self.focus = FocusPane::Vars;
-            } else if rect_contains(effective_rect, mouse.column, mouse.row) {
-                self.focus = FocusPane::Effective;
+                // Header toolbar buttons click handling
+                if rect_contains(header_rect, mouse.column, mouse.row) {
+                    let inner_w = header_rect.width.saturating_sub(2);
+                    if inner_w >= 86 && mouse.row == header_rect.y + 1 {
+                        let right_edge = header_rect.x + header_rect.width - 1;
+                        let offset_from_right = right_edge.saturating_sub(mouse.column);
+                        // Toolbar layout from right edge:
+                        // " [+Profile]  [+Var]  [Sync]  [Show]  [Settings] " (total 48 chars)
+                        if offset_from_right < 12 {
+                            self.open_settings_modal();
+                        } else if offset_from_right < 21 {
+                            self.toggle_mask_values();
+                        } else if offset_from_right < 30 {
+                            self.handle_phase_sync_action(false);
+                        } else if offset_from_right < 38 {
+                            self.open_add_var_modal();
+                        } else if offset_from_right < 50 {
+                            self.open_new_profile_modal();
+                        }
+                    }
+                    return;
+                }
+
+                // Panes & items left-click handling
+                if rect_contains(profiles_rect, mouse.column, mouse.row) {
+                    self.focus = FocusPane::Profiles;
+                    if let Some(idx) = self.profile_index_at_row(profiles_rect, mouse.row) {
+                        if self.selected_profile != idx {
+                            self.selected_profile = idx;
+                            self.selected_var = 0;
+                        }
+                        let check_start = profiles_rect.x.saturating_add(4);
+                        let check_end = profiles_rect.x.saturating_add(7);
+                        if mouse.column >= check_start && mouse.column < check_end {
+                            self.toggle_current_profile();
+                        }
+                    }
+                } else if rect_contains(vars_rect, mouse.column, mouse.row) {
+                    self.focus = FocusPane::Vars;
+                    if let Some(idx) = self.var_index_at_row(vars_rect, mouse.row) {
+                        self.selected_var = idx;
+                    }
+                } else if rect_contains(effective_rect, mouse.column, mouse.row) {
+                    self.focus = FocusPane::Effective;
+                    if let Some(idx) = self.effective_index_at_row(effective_rect, mouse.row) {
+                        self.selected_effective = idx;
+                    }
+                }
             }
+
+            MouseEventKind::Down(MouseButton::Right) => {
+                if rect_contains(profiles_rect, mouse.column, mouse.row) {
+                    self.focus = FocusPane::Profiles;
+                    if let Some(idx) = self.profile_index_at_row(profiles_rect, mouse.row) {
+                        if self.selected_profile != idx {
+                            self.selected_profile = idx;
+                            self.selected_var = 0;
+                        }
+                    }
+                    self.open_context_menu_for_pane(
+                        FocusPane::Profiles,
+                        mouse.column,
+                        mouse.row,
+                    );
+                } else if rect_contains(vars_rect, mouse.column, mouse.row) {
+                    self.focus = FocusPane::Vars;
+                    if let Some(idx) = self.var_index_at_row(vars_rect, mouse.row) {
+                        self.selected_var = idx;
+                    }
+                    self.open_context_menu_for_pane(FocusPane::Vars, mouse.column, mouse.row);
+                } else if rect_contains(effective_rect, mouse.column, mouse.row) {
+                    self.focus = FocusPane::Effective;
+                    if let Some(idx) = self.effective_index_at_row(effective_rect, mouse.row) {
+                        self.selected_effective = idx;
+                    }
+                    self.open_context_menu_for_pane(
+                        FocusPane::Effective,
+                        mouse.column,
+                        mouse.row,
+                    );
+                }
+            }
+
+            MouseEventKind::ScrollUp => {
+                let target_pane = if rect_contains(profiles_rect, mouse.column, mouse.row) {
+                    FocusPane::Profiles
+                } else if rect_contains(vars_rect, mouse.column, mouse.row) {
+                    FocusPane::Vars
+                } else if rect_contains(effective_rect, mouse.column, mouse.row) {
+                    FocusPane::Effective
+                } else {
+                    self.focus
+                };
+                self.scroll_pane_up(target_pane);
+            }
+
+            MouseEventKind::ScrollDown => {
+                let target_pane = if rect_contains(profiles_rect, mouse.column, mouse.row) {
+                    FocusPane::Profiles
+                } else if rect_contains(vars_rect, mouse.column, mouse.row) {
+                    FocusPane::Vars
+                } else if rect_contains(effective_rect, mouse.column, mouse.row) {
+                    FocusPane::Effective
+                } else {
+                    self.focus
+                };
+                self.scroll_pane_down(target_pane);
+            }
+
+            _ => {}
         }
     }
 
@@ -2616,13 +3463,13 @@ fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
         && y < rect.y.saturating_add(rect.height)
 }
 
-pub fn compute_pane_areas(area: Rect) -> (Rect, Rect, Rect) {
+pub fn compute_layout_chunks(area: Rect) -> (Rect, Rect, Rect, Rect, Rect) {
     let root_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // Top header
             Constraint::Min(12),   // Main body
-            Constraint::Length(2), // Bottom keybindings & status
+            Constraint::Length(1), // Bottom status bar
         ])
         .split(area);
 
@@ -2636,7 +3483,19 @@ pub fn compute_pane_areas(area: Rect) -> (Rect, Rect, Rect) {
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(main_chunks[1]);
 
-    (main_chunks[0], right_chunks[0], right_chunks[1])
+    (
+        root_chunks[0],
+        main_chunks[0],
+        right_chunks[0],
+        right_chunks[1],
+        root_chunks[2],
+    )
+}
+
+#[cfg(test)]
+pub fn compute_pane_areas(area: Rect) -> (Rect, Rect, Rect) {
+    let (_, profiles, vars, effective, _) = compute_layout_chunks(area);
+    (profiles, vars, effective)
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -2740,6 +3599,7 @@ mod tests {
             selected_effective: 0,
             show_values: false,
             modal: Modal::None,
+            context_menu: None,
             status_message: String::new(),
             is_error_status: false,
             should_quit: false,
@@ -2948,7 +3808,11 @@ mod tests {
         assert!(content.contains("Active System Environment"));
         assert!(!content.contains("3. Active System Environment"));
         assert!(!content.contains("encrypted in state.enc"));
-        assert!(content.contains("[u/d] Move Priority"));
+        // Full shortcut list is removed from the bottom; `? Shortcuts` indicator is shown instead
+        assert!(!content.contains("[u/d] Move Priority"));
+        assert!(!content.contains("[Space] Toggle"));
+        assert!(content.contains("?"));
+        assert!(content.contains("Shortcuts"));
         assert!(!content.contains("[K/J"));
         assert!(content.contains("PROFILE"));
         assert!(!content.contains("WINNING PROFILE"));
@@ -2961,6 +3825,167 @@ mod tests {
         assert!(content.contains("SOURCE"));
         assert!(!content.contains("ORIGIN"));
         assert!(content.contains("Phase.dev:"));
+    }
+
+    #[test]
+    fn test_help_popup_via_question_mark_and_status_bar_click() {
+        let mut app = make_test_app();
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // 1. Press '?' to open help popup
+        app.handle_key(KeyEvent::from(KeyCode::Char('?')));
+        assert!(matches!(app.modal, Modal::Help));
+
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let content: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.get(x, y).symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(content.contains("Keyboard Shortcuts & Mouse Controls"));
+        assert!(content.contains("Move Priority"));
+        assert!(content.contains("Right Click"));
+
+        // Close with '?' or Esc
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(matches!(app.modal, Modal::None));
+
+        // 2. Click the `? Shortcuts` indicator in the status bar at the bottom-right
+        let (_, _, _, _, status_bar_rect) = compute_layout_chunks(app.last_area);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: status_bar_rect.x + status_bar_rect.width - 3,
+            row: status_bar_rect.y,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert!(matches!(app.modal, Modal::Help));
+
+        // Click anywhere to close the help popup
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert!(matches!(app.modal, Modal::None));
+    }
+
+    #[test]
+    fn test_mouse_click_and_right_click_items_and_context_menu() {
+        let mut app = make_test_app();
+        app.data.profiles[0].vars.push(EnvVar::new(
+            "SECOND_KEY".to_string(),
+            "val-987654321".to_string(),
+            VarSource::Custom,
+        ));
+        app.data.profiles.push(Profile::new_custom("staging".to_string()));
+        app.last_area = Rect::new(0, 0, 120, 30);
+
+        let (profiles_rect, vars_rect, _) = compute_pane_areas(app.last_area);
+
+        // 1. Left-click the second profile ("staging" at row profiles_rect.y + 3)
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: profiles_rect.x + 8,
+            row: profiles_rect.y + 3,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.focus, FocusPane::Profiles);
+        assert_eq!(app.selected_profile, 1);
+
+        // 2. Left-click back on the first profile ("default" at row profiles_rect.y + 2)
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: profiles_rect.x + 8,
+            row: profiles_rect.y + 2,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.selected_profile, 0);
+
+        // 3. Left-click the second variable ("SECOND_KEY" at row vars_rect.y + 4)
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: vars_rect.x + 5,
+            row: vars_rect.y + 4,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.focus, FocusPane::Vars);
+        assert_eq!(app.selected_var, 1);
+
+        // 4. Right-click on the first variable ("API_KEY" at row vars_rect.y + 3)
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: vars_rect.x + 6,
+            row: vars_rect.y + 3,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.focus, FocusPane::Vars);
+        assert_eq!(app.selected_var, 0);
+        assert!(app.context_menu.is_some());
+
+        // Render and verify Context Menu shows Edit and Delete actions
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let content: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.get(x, y).symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(content.contains("Edit Variable"));
+        assert!(content.contains("Delete Variable"));
+
+        // 5. Click "Edit Variable" (first item in context menu at menu_rect.y + 1)
+        let menu_rect = app.context_menu.as_ref().unwrap().rect(app.last_area);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: menu_rect.x + 3,
+            row: menu_rect.y + 1,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert!(app.context_menu.is_none());
+        match &app.modal {
+            Modal::VarEditor {
+                is_edit, var_key, ..
+            } => {
+                assert!(*is_edit);
+                assert_eq!(var_key, "API_KEY");
+            }
+            _ => panic!("Expected Modal::VarEditor from context menu Edit click"),
+        }
+        app.modal = Modal::None;
+
+        // 6. Right-click variable again and click "Delete Variable" (second item at menu_rect.y + 2)
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: vars_rect.x + 6,
+            row: vars_rect.y + 3,
+            modifiers: KeyModifiers::empty(),
+        });
+        let menu_rect = app.context_menu.as_ref().unwrap().rect(app.last_area);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: menu_rect.x + 3,
+            row: menu_rect.y + 2,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert!(app.context_menu.is_none());
+        match &app.modal {
+            Modal::ConfirmDeleteVar { var_key, .. } => {
+                assert_eq!(var_key, "API_KEY");
+            }
+            _ => panic!("Expected Modal::ConfirmDeleteVar from context menu Delete click"),
+        }
     }
 
     #[test]
@@ -3022,7 +4047,10 @@ mod tests {
             row: vars_rect.y + 2,
             modifiers: KeyModifiers::empty(),
         });
-        assert_eq!(app.focus, FocusPane::Profiles);
+        assert_eq!(app.focus, FocusPane::Vars);
+        assert!(app.context_menu.is_some());
+        app.context_menu = None;
+        app.focus = FocusPane::Profiles;
 
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
