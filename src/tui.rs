@@ -3,9 +3,8 @@ use crate::model::{
     PhaseConfig, Collection, PHASE_CLOUD_HOST,
 };
 use crate::phase::{
-    detect_phase_cli_detailed, fetch_apps_and_envs, fetch_secrets_for_env,
-    populate_app_env_var_counts, sync_phase_collections, try_detect_local_phase_cli_host,
-    PhaseAppInfo, PhaseCliStatus,
+    detect_phase_cli_detailed, fetch_apps_and_envs, fetch_secrets_for_env, sync_phase_collections,
+    try_detect_local_phase_cli_host, PhaseAppInfo, PhaseCliStatus,
 };
 use crate::shell::{apply_state_to_system, reload_shell_environment};
 use crossterm::event::{
@@ -1262,13 +1261,10 @@ impl App {
         }
 
         match fetch_apps_and_envs(&self.data.phase) {
-            Ok(mut apps) => {
+            Ok(apps) => {
                 if apps.is_empty() {
                     self.set_error("Connected to Phase.dev, but no Apps were found.");
                     return;
-                }
-                if let Some(first_app) = apps.first_mut() {
-                    populate_app_env_var_counts(&self.data.phase, first_app);
                 }
                 self.cached_apps = apps.clone();
                 self.modal = Modal::PhasePicker {
@@ -1407,7 +1403,7 @@ impl App {
             Modal::PhasePicker {
                 target_collection_idx,
                 new_collection_name,
-                mut apps,
+                apps,
                 mut selected_app,
                 mut selected_env,
                 mut picker_step,
@@ -1480,11 +1476,6 @@ impl App {
                             if selected_app > 0 {
                                 selected_app -= 1;
                                 selected_env = 0;
-                                if let Some(app) = apps.get_mut(selected_app) {
-                                    if app.environments.iter().any(|e| e.var_count.is_none()) {
-                                        populate_app_env_var_counts(&self.data.phase, app);
-                                    }
-                                }
                             }
                         } else if picker_step == 1 {
                             if selected_env > 0 {
@@ -1499,11 +1490,6 @@ impl App {
                             if selected_app + 1 < apps.len() {
                                 selected_app += 1;
                                 selected_env = 0;
-                                if let Some(app) = apps.get_mut(selected_app) {
-                                    if app.environments.iter().any(|e| e.var_count.is_none()) {
-                                        populate_app_env_var_counts(&self.data.phase, app);
-                                    }
-                                }
                             }
                         } else if picker_step == 1 {
                             if selected_env + 1 < env_count {
@@ -2952,11 +2938,7 @@ impl App {
                     .map(|a| {
                         a.environments
                             .iter()
-                            .map(|e| {
-                                let count = e.var_count.unwrap_or(0);
-                                let var_word = if count == 1 { "var" } else { "vars" };
-                                ListItem::new(format!("{} ({} {})", e.name, count, var_word))
-                            })
+                            .map(|e| ListItem::new(e.name.clone()))
                             .collect()
                     })
                     .unwrap_or_default();
@@ -4149,33 +4131,59 @@ impl App {
                 picker_step,
                 export_all_paths,
                 apps,
+                error,
                 ..
             } => {
-                let list_start_y = block_inner.y + 1;
-                let path_scope_start_y = btn_chunk.y.saturating_sub(3);
-                if row >= list_start_y && row < path_scope_start_y {
-                    let offset = (row - list_start_y) as usize;
-                    let mid_x = block_inner.x + block_inner.width / 2;
-                    if col < mid_x {
+                let picker_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(6),
+                        Constraint::Length(3),
+                        Constraint::Length(1),
+                    ])
+                    .split(block_inner);
+
+                let cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(picker_chunks[0]);
+
+                if rect_contains(cols[0], col, row) {
+                    *picker_step = 0;
+                    *error = None;
+                    if row >= cols[0].y + 1 && row < cols[0].y + cols[0].height.saturating_sub(1) {
+                        let offset = (row - (cols[0].y + 1)) as usize;
                         if offset < apps.len() {
                             *selected_app = offset;
                             *selected_env = 0;
-                            *picker_step = 0;
-                            if let Some(app) = apps.get_mut(offset) {
-                                if app.environments.iter().any(|e| e.var_count.is_none()) {
-                                    populate_app_env_var_counts(&self.data.phase, app);
-                                }
-                            }
-                        }
-                    } else if let Some(app) = apps.get(*selected_app) {
-                        if offset < app.environments.len() {
-                            *selected_env = offset;
-                            *picker_step = 1;
                         }
                     }
-                } else if row >= path_scope_start_y && row < btn_chunk.y {
+                } else if rect_contains(cols[1], col, row) {
+                    *picker_step = 1;
+                    *error = None;
+                    if row >= cols[1].y + 1 && row < cols[1].y + cols[1].height.saturating_sub(1) {
+                        let offset = (row - (cols[1].y + 1)) as usize;
+                        if let Some(app) = apps.get(*selected_app) {
+                            if offset < app.environments.len() {
+                                *selected_env = offset;
+                            }
+                        }
+                    }
+                } else if rect_contains(picker_chunks[1], col, row) {
                     *picker_step = 2;
-                    if col >= block_inner.x + 3 && col <= block_inner.x + 35 {
+                    let pill_all_start = picker_chunks[1].x + 4;
+                    let pill_all_end = pill_all_start + 15;
+                    let pill_root_start = pill_all_end + 3;
+                    let pill_root_end = pill_root_start + 19;
+                    if row == picker_chunks[1].y + 1 {
+                        if col >= pill_all_start && col < pill_all_end {
+                            *export_all_paths = true;
+                        } else if col >= pill_root_start && col < pill_root_end {
+                            *export_all_paths = false;
+                        } else {
+                            *export_all_paths = !*export_all_paths;
+                        }
+                    } else if col >= picker_chunks[1].x + 3 && col <= picker_chunks[1].x + 42 {
                         *export_all_paths = !*export_all_paths;
                     }
                 }
@@ -6202,7 +6210,6 @@ mod tests {
                     identity_key: String::new(),
                     wrapped_seed: String::new(),
                     wrapped_salt: String::new(),
-                    var_count: Some(5),
                 },
             ],
         }];
@@ -6220,7 +6227,7 @@ mod tests {
 
         // Draw and verify:
         // 1. App name is shown without environment count
-        // 2. Environment selector displays variable count ("production (5 vars)")
+        // 2. Environment selector displays name without variable count
         // 3. Path scope does NOT show the removed description line
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -6236,7 +6243,8 @@ mod tests {
             .join("\n");
         assert!(screen.contains("BackendApp"));
         assert!(!screen.contains("BackendApp ("));
-        assert!(screen.contains("production (5 vars)"));
+        assert!(screen.contains("production"));
+        assert!(!screen.contains("production ("));
         assert!(!screen.contains("imports across all folder paths"));
         assert!(!screen.contains("Press Space or Left/Right"));
 
@@ -6618,5 +6626,244 @@ mod tests {
         assert!(popup_text.contains("[Ctrl+S]"));
         assert!(popup_text.contains("[Ctrl+P]"));
         assert!(popup_text.contains("Cycle focus between panes"));
+    }
+
+    #[test]
+    fn test_phase_picker_panels_focus_and_app_switching() {
+        let mut app = make_test_app();
+        app.last_area = Rect::new(0, 0, 120, 30);
+
+        let test_apps = vec![
+            PhaseAppInfo {
+                id: "app-0".to_string(),
+                name: "AppZero".to_string(),
+                environments: vec![
+                    crate::phase::PhaseEnvInfo {
+                        id: "env-0".to_string(),
+                        name: "development".to_string(),
+                        identity_key: String::new(),
+                        wrapped_seed: String::new(),
+                        wrapped_salt: String::new(),
+                    },
+                    crate::phase::PhaseEnvInfo {
+                        id: "env-1".to_string(),
+                        name: "staging".to_string(),
+                        identity_key: String::new(),
+                        wrapped_seed: String::new(),
+                        wrapped_salt: String::new(),
+                    },
+                    crate::phase::PhaseEnvInfo {
+                        id: "env-2".to_string(),
+                        name: "production".to_string(),
+                        identity_key: String::new(),
+                        wrapped_seed: String::new(),
+                        wrapped_salt: String::new(),
+                    },
+                ],
+            },
+            PhaseAppInfo {
+                id: "app-1".to_string(),
+                name: "AppOne".to_string(),
+                environments: vec![
+                    crate::phase::PhaseEnvInfo {
+                        id: "env-10".to_string(),
+                        name: "testing".to_string(),
+                        identity_key: String::new(),
+                        wrapped_seed: String::new(),
+                        wrapped_salt: String::new(),
+                    },
+                ],
+            },
+        ];
+
+        app.modal = Modal::PhasePicker {
+            target_collection_idx: None,
+            new_collection_name: Some("test_phase".to_string()),
+            apps: test_apps,
+            selected_app: 0,
+            selected_env: 0,
+            picker_step: 0,
+            export_all_paths: true,
+            error: None,
+        };
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Verify variable counts are not displayed in the environment list
+        assert!(screen.contains("development"));
+        assert!(screen.contains("staging"));
+        assert!(screen.contains("production"));
+        assert!(!screen.contains("development ("));
+        assert!(!screen.contains("staging ("));
+        assert!(!screen.contains("production ("));
+        assert!(!screen.contains("vars)"));
+
+        let popup = get_modal_rect(&app.modal, app.last_area);
+        let block_inner = Block::default()
+            .borders(Borders::ALL)
+            .padding(Padding::new(1, 1, 1, 0))
+            .inner(popup);
+        let picker_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(6),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ])
+            .split(block_inner);
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(picker_chunks[0]);
+
+        // 1. Initially picker_step is 0 (Panel 1)
+        match &app.modal {
+            Modal::PhasePicker { picker_step, .. } => assert_eq!(*picker_step, 0),
+            _ => panic!("Expected PhasePicker"),
+        }
+
+        // 2. Click in Panel 2 empty space (below list items) -> Panel 2 must receive focus (step 1)
+        // without altering selected_env
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: cols[1].x + 10,
+            row: cols[1].y + 8,
+            modifiers: KeyModifiers::NONE,
+        });
+        match &app.modal {
+            Modal::PhasePicker { picker_step, selected_app, selected_env, .. } => {
+                assert_eq!(*picker_step, 1, "Panel 2 must receive focus when clicked anywhere in its area");
+                assert_eq!(*selected_app, 0);
+                assert_eq!(*selected_env, 0);
+            }
+            _ => panic!("Expected PhasePicker"),
+        }
+
+        // 3. Click on Panel 2 title/border -> Panel 2 remains focused
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: cols[1].x + 2,
+            row: cols[1].y,
+            modifiers: KeyModifiers::NONE,
+        });
+        match &app.modal {
+            Modal::PhasePicker { picker_step, .. } => assert_eq!(*picker_step, 1),
+            _ => panic!("Expected PhasePicker"),
+        }
+
+        // 4. Click in Panel 1 empty space (below list items) -> Panel 1 must receive focus (step 0)
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: cols[0].x + 10,
+            row: cols[0].y + 8,
+            modifiers: KeyModifiers::NONE,
+        });
+        match &app.modal {
+            Modal::PhasePicker { picker_step, selected_app, selected_env, .. } => {
+                assert_eq!(*picker_step, 0, "Panel 1 must receive focus when clicked anywhere in its area");
+                assert_eq!(*selected_app, 0);
+                assert_eq!(*selected_env, 0);
+            }
+            _ => panic!("Expected PhasePicker"),
+        }
+
+        // 5. Click on Panel 1 title/border when focus is on step 1 -> Panel 1 must receive focus
+        if let Modal::PhasePicker { picker_step, .. } = &mut app.modal {
+            *picker_step = 1;
+        }
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: cols[0].x + 2,
+            row: cols[0].y,
+            modifiers: KeyModifiers::NONE,
+        });
+        match &app.modal {
+            Modal::PhasePicker { picker_step, selected_app, .. } => {
+                assert_eq!(*picker_step, 0, "Panel 1 border click must focus Panel 1");
+                assert_eq!(*selected_app, 0);
+            }
+            _ => panic!("Expected PhasePicker"),
+        }
+
+        // 6. Click on App 1 item in Panel 1 -> selects App 1 and resets env to 0
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: cols[0].x + 5,
+            row: cols[0].y + 2, // Second app item (index 1)
+            modifiers: KeyModifiers::NONE,
+        });
+        match &app.modal {
+            Modal::PhasePicker { picker_step, selected_app, selected_env, .. } => {
+                assert_eq!(*picker_step, 0);
+                assert_eq!(*selected_app, 1);
+                assert_eq!(*selected_env, 0);
+            }
+            _ => panic!("Expected PhasePicker"),
+        }
+
+        // 7. Click back to App 0 item in Panel 1
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: cols[0].x + 5,
+            row: cols[0].y + 1, // First app item (index 0)
+            modifiers: KeyModifiers::NONE,
+        });
+        match &app.modal {
+            Modal::PhasePicker { picker_step, selected_app, selected_env, .. } => {
+                assert_eq!(*picker_step, 0);
+                assert_eq!(*selected_app, 0);
+                assert_eq!(*selected_env, 0);
+            }
+            _ => panic!("Expected PhasePicker"),
+        }
+
+        // 8. Click on Env 2 item ("production") in Panel 2 -> focuses Panel 2 and selects env 2
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: cols[1].x + 5,
+            row: cols[1].y + 3, // Third env item (index 2)
+            modifiers: KeyModifiers::NONE,
+        });
+        match &app.modal {
+            Modal::PhasePicker { picker_step, selected_app, selected_env, .. } => {
+                assert_eq!(*picker_step, 1);
+                assert_eq!(*selected_app, 0);
+                assert_eq!(*selected_env, 2);
+            }
+            _ => panic!("Expected PhasePicker"),
+        }
+
+        // 9. Keyboard navigation app switching: switch focus to Panel 1 and use Down/Up
+        if let Modal::PhasePicker { picker_step, .. } = &mut app.modal {
+            *picker_step = 0;
+        }
+        app.handle_key(KeyEvent::from(KeyCode::Down));
+        match &app.modal {
+            Modal::PhasePicker { selected_app, selected_env, .. } => {
+                assert_eq!(*selected_app, 1);
+                assert_eq!(*selected_env, 0);
+            }
+            _ => panic!("Expected PhasePicker"),
+        }
+        app.handle_key(KeyEvent::from(KeyCode::Up));
+        match &app.modal {
+            Modal::PhasePicker { selected_app, selected_env, .. } => {
+                assert_eq!(*selected_app, 0);
+                assert_eq!(*selected_env, 0);
+            }
+            _ => panic!("Expected PhasePicker"),
+        }
     }
 }

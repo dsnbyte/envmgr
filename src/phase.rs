@@ -23,8 +23,6 @@ pub struct PhaseEnvInfo {
     pub wrapped_seed: String,
     #[serde(default)]
     pub wrapped_salt: String,
-    #[serde(default)]
-    pub var_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -564,7 +562,6 @@ pub fn parse_cli_apps_json(raw_json: &str) -> Result<Vec<PhaseAppInfo>, String> 
                     identity_key: String::new(),
                     wrapped_seed: String::new(),
                     wrapped_salt: String::new(),
-                    var_count: None,
                 })
                 .collect(),
         })
@@ -711,54 +708,12 @@ pub fn fetch_apps_and_envs(config: &PhaseConfig) -> Result<Vec<PhaseAppInfo>, St
                     identity_key: ek.identity_key,
                     wrapped_seed: ek.wrapped_seed,
                     wrapped_salt: ek.wrapped_salt,
-                    var_count: None,
                 })
                 .collect(),
         })
         .collect();
 
     Ok(apps)
-}
-
-/// Populates variable counts for all environments within a single Phase application.
-pub fn populate_app_env_var_counts(config: &PhaseConfig, app: &mut PhaseAppInfo) {
-    if config.auth_method == PhaseAuthMethod::Cli {
-        let Some(bin) = find_phase_binary() else {
-            for env in &mut app.environments {
-                env.var_count = Some(0);
-            }
-            return;
-        };
-        let bin_str = bin.to_string_lossy().into_owned();
-        for env in &mut app.environments {
-            let out = clean_phase_command(&bin_str)
-                .args([
-                    "secrets", "export",
-                    "--app-id", &app.id,
-                    "--env", &env.name,
-                    "--format", "json",
-                    "--path", "",
-                ])
-                .output();
-            if let Ok(out) = out {
-                if out.status.success() {
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(stdout.trim()) {
-                        env.var_count = Some(map.len());
-                        continue;
-                    }
-                }
-            }
-            env.var_count = Some(0);
-        }
-    } else if config.is_configured() {
-        for env in &mut app.environments {
-            match fetch_secrets_for_env(config, &app.id, &env.id, Some(&env.name), true) {
-                Ok(vars) => env.var_count = Some(vars.len()),
-                Err(_) => env.var_count = Some(0),
-            }
-        }
-    }
 }
 
 /// Fetches and decrypts all secrets for a given App and Environment from Phase.dev.
