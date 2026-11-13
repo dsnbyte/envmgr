@@ -183,15 +183,9 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppSettings {
-    /// When syncing Phase.dev collections, only sync enabled collections (default: true).
+    /// When syncing collections, only sync enabled collections (default: true).
     #[serde(default = "default_true", alias = "sync_only_enabled_profiles")]
     pub sync_only_enabled_collections: bool,
-    /// Export secrets across all Phase paths (`--path ""`) instead of root `/` only (default: true).
-    #[serde(default = "default_true")]
-    pub phase_export_all_paths: bool,
-    /// Mask secret values by default when launching the TUI (default: true).
-    #[serde(default = "default_true")]
-    pub mask_secrets_by_default: bool,
     /// Insert newly created collections at top priority (#1) instead of bottom (default: true).
     #[serde(default = "default_true", alias = "insert_new_profile_at_top")]
     pub insert_new_collection_at_top: bool,
@@ -204,8 +198,6 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             sync_only_enabled_collections: true,
-            phase_export_all_paths: true,
-            mask_secrets_by_default: true,
             insert_new_collection_at_top: true,
             shell_prompt_hook: true,
         }
@@ -282,6 +274,27 @@ pub struct PhaseBinding {
     pub app_name: String,
     pub env_id: String,
     pub env_name: String,
+    #[serde(default = "default_true")]
+    pub export_all_paths: bool,
+}
+
+impl PhaseBinding {
+    #[allow(dead_code)]
+    pub fn new(
+        app_id: impl Into<String>,
+        app_name: impl Into<String>,
+        env_id: impl Into<String>,
+        env_name: impl Into<String>,
+        export_all_paths: bool,
+    ) -> Self {
+        Self {
+            app_id: app_id.into(),
+            app_name: app_name.into(),
+            env_id: env_id.into(),
+            env_name: env_name.into(),
+            export_all_paths,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -692,6 +705,7 @@ mod tests {
                         app_name: "my-app".to_string(),
                         env_id: "env-1".to_string(),
                         env_name: "production".to_string(),
+                        export_all_paths: true,
                     }),
                     last_sync_epoch: None,
                     vars: vec![EnvVar::new(
@@ -755,6 +769,7 @@ mod tests {
             app_name: "Backend".to_string(),
             env_id: "env1".to_string(),
             env_name: "Prod".to_string(),
+            export_all_paths: true,
         };
         let mut phase_coll = Collection::new_phase(
             "phase_prod".to_string(),
@@ -800,8 +815,8 @@ mod tests {
     fn test_settings_defaults_and_relative_sync_time() {
         let settings = AppSettings::default();
         assert!(settings.sync_only_enabled_collections);
-        assert!(settings.phase_export_all_paths);
-        assert!(settings.mask_secrets_by_default);
+        assert!(settings.insert_new_collection_at_top);
+        assert!(settings.shell_prompt_hook);
 
         let now = 1_000_000;
         assert_eq!(format_relative_sync_time(None, now, false), "never");

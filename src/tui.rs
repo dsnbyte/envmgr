@@ -3,8 +3,9 @@ use crate::model::{
     PhaseConfig, Collection, PHASE_CLOUD_HOST,
 };
 use crate::phase::{
-    detect_phase_cli_detailed, fetch_apps_and_envs, fetch_secrets_for_env, sync_phase_collections,
-    try_detect_local_phase_cli_host, PhaseAppInfo, PhaseCliStatus,
+    detect_phase_cli_detailed, fetch_apps_and_envs, fetch_secrets_for_env,
+    populate_app_env_var_counts, sync_phase_collections, try_detect_local_phase_cli_host,
+    PhaseAppInfo, PhaseCliStatus,
 };
 use crate::shell::{apply_state_to_system, reload_shell_environment};
 use crossterm::event::{
@@ -33,19 +34,15 @@ pub enum FocusPane {
     Effective,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsTab {
+    Preferences,
+    PhaseAuth,
+}
+
 #[derive(Debug, Clone)]
 pub enum Modal {
     None,
-    PhaseConnect {
-        auth_method: PhaseAuthMethod,
-        host_mode: HostMode,
-        custom_url: String,
-        pat_token: String,
-        cli_status: PhaseCliStatus,
-        active_field: usize,
-        pending_new_collection: Option<String>,
-        error: Option<String>,
-    },
     NewCollection {
         name: String,
         pull_from_phase: bool,
@@ -58,7 +55,8 @@ pub enum Modal {
         apps: Vec<PhaseAppInfo>,
         selected_app: usize,
         selected_env: usize,
-        selecting_env: bool,
+        picker_step: usize, // 0 = app, 1 = env, 2 = path scope
+        export_all_paths: bool,
         error: Option<String>,
     },
     VarEditor {
@@ -83,8 +81,15 @@ pub enum Modal {
         error: Option<String>,
     },
     Settings {
+        tab: SettingsTab,
         draft: AppSettings,
-        active_field: usize, // 0..5
+        active_field: usize,
+        auth_method: PhaseAuthMethod,
+        host_mode: HostMode,
+        custom_url: String,
+        pat_token: String,
+        cli_status: PhaseCliStatus,
+        pending_new_collection: Option<String>,
         error: Option<String>,
     },
     Help,
@@ -181,7 +186,7 @@ impl App {
             }
         }
 
-        let show_values = !data.settings.mask_secrets_by_default;
+        let show_values = false;
 
         let mut app = Self {
             data,
@@ -248,6 +253,21 @@ impl App {
             }
             Err(e) => {
                 self.set_error(format!("{} | Failed to sync state.enc: {}", action_desc, e));
+            }
+        }
+    }
+
+    pub fn sync_to_system_silent(&mut self) {
+        if cfg!(test) {
+            return;
+        }
+        match apply_state_to_system(&self.data) {
+            Ok(_) => {
+                let effective = self.data.compute_effective_vars();
+                let _ = reload_shell_environment(&effective);
+            }
+            Err(e) => {
+                self.set_error(format!("Failed to sync state.enc: {}", e));
             }
         }
     }
@@ -323,7 +343,28 @@ impl App {
         }
     }
 
-    pub fn open_phase_connect_modal(&mut self, pending_new_collection: Option<String>, error: Option<String>) {
+    pub fn open_settings_modal(&mut self) {
+        self.open_settings_modal_with_tab(SettingsTab::Preferences, None, None);
+    }
+
+    pub fn open_phase_connect_modal(
+        &mut self,
+        pending_new_collection: Option<String>,
+        error: Option<String>,
+    ) {
+        self.open_settings_modal_with_tab(
+            SettingsTab::PhaseAuth,
+            pending_new_collection,
+            error,
+        );
+    }
+
+    pub fn open_settings_modal_with_tab(
+        &mut self,
+        tab: SettingsTab,
+        pending_new_collection: Option<String>,
+        error: Option<String>,
+    ) {
         let cli_status = detect_phase_cli_detailed();
         let auth_method = if self.data.phase.pat_token.trim().is_empty() && cli_status.installed {
             PhaseAuthMethod::Cli
@@ -331,24 +372,17 @@ impl App {
             self.data.phase.auth_method
         };
         self.input_cursor = 0;
-        self.modal = Modal::PhaseConnect {
+        self.modal = Modal::Settings {
+            tab,
+            draft: self.data.settings.clone(),
+            active_field: 0,
             auth_method,
             host_mode: self.data.phase.host_mode,
             custom_url: self.data.phase.custom_url.clone(),
             pat_token: self.data.phase.pat_token.clone(),
             cli_status,
-            active_field: 0,
             pending_new_collection,
             error,
-        };
-    }
-
-    pub fn open_settings_modal(&mut self) {
-        let draft = self.data.settings.clone();
-        self.modal = Modal::Settings {
-            draft,
-            active_field: 0,
-            error: None,
         };
     }
 
@@ -357,9 +391,70 @@ impl App {
             return;
         }
 
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.should_quit = true;
-            return;
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('c') => {
+                    self.should_quit = true;
+                    return;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.modal = Modal::NewCollection {
+                        name: String::new(),
+                        pull_from_phase: false,
+                        active_field: 0,
+                        error: None,
+                    };
+                    return;
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    let Some(coll) = self.current_collection() else {
+                        self.set_error("No collection available. Create a collection first with [Ctrl+N].");
+                        return;
+                    };
+                    if coll.is_phase() {
+                        let cname = coll.name.clone();
+                        self.set_error(format!(
+                            "Collection '{}' uses Phase.dev synchronization. Sources cannot be mixed (create a Custom collection with [Ctrl+N]).",
+                            cname
+                        ));
+                    } else {
+                        self.modal = Modal::VarEditor {
+                            is_edit: false,
+                            original_index: None,
+                            var_key: String::new(),
+                            var_value: String::new(),
+                            active_field: 0,
+                            error: None,
+                        };
+                    }
+                    return;
+                }
+                KeyCode::Char('e') | KeyCode::Char('E') => {
+                    self.handle_edit_action();
+                    return;
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    self.reload_shell();
+                    return;
+                }
+                KeyCode::Char('p') | KeyCode::Char('P') => {
+                    self.open_settings_modal();
+                    return;
+                }
+                KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::Char('m') | KeyCode::Char('M') => {
+                    self.toggle_mask_values();
+                    return;
+                }
+                KeyCode::Char('b') | KeyCode::Char('B') => {
+                    if key.modifiers.contains(KeyModifiers::SHIFT) || key.code == KeyCode::Char('B') {
+                        self.sync_all_phase_collections();
+                    } else {
+                        self.handle_phase_sync_action(false);
+                    }
+                    return;
+                }
+                _ => {}
+            }
         }
 
         if !self.status_message.is_empty() {
@@ -412,59 +507,8 @@ impl App {
                     self.focus = FocusPane::Vars;
                 }
             }
-            KeyCode::Char('v') => {
-                self.toggle_mask_values();
-            }
-            KeyCode::Char('c') => {
-                self.open_phase_connect_modal(None, None);
-            }
-            KeyCode::Char('s') => {
-                self.open_settings_modal();
-            }
-            KeyCode::Char('n') => {
-                self.modal = Modal::NewCollection {
-                    name: String::new(),
-                    pull_from_phase: false,
-                    active_field: 0,
-                    error: None,
-                };
-            }
-            KeyCode::Char('a') => {
-                let Some(coll) = self.current_collection() else {
-                    self.set_error("No collection available. Create a collection first with [n].");
-                    return;
-                };
-                if coll.is_phase() {
-                    let cname = coll.name.clone();
-                    self.set_error(format!(
-                        "Collection '{}' uses Phase.dev synchronization. Sources cannot be mixed (create a Custom collection with [n]).",
-                        cname
-                    ));
-                } else {
-                    self.modal = Modal::VarEditor {
-                        is_edit: false,
-                        original_index: None,
-                        var_key: String::new(),
-                        var_value: String::new(),
-                        active_field: 0,
-                        error: None,
-                    };
-                }
-            }
-            KeyCode::Char('e') => {
-                self.handle_edit_action();
-            }
-            KeyCode::Char('x') | KeyCode::Delete => {
+            KeyCode::Delete => {
                 self.handle_delete_action();
-            }
-            KeyCode::Char('p') => {
-                self.handle_phase_sync_action(false);
-            }
-            KeyCode::Char('P') => {
-                self.handle_phase_sync_action(true);
-            }
-            KeyCode::Char('r') => {
-                self.reload_shell();
             }
             _ => match self.focus {
                 FocusPane::Collections => self.handle_collections_pane_key(key),
@@ -476,49 +520,28 @@ impl App {
 
     fn handle_phase_sync_action(&mut self, force_rebind_picker: bool) {
         let Some(coll) = self.current_collection() else {
-            self.set_error("No collection available. Press [n] to create a Phase.dev collection.");
             return;
         };
 
-        if coll.is_phase() {
-            let idx = self.selected_collection;
-            if force_rebind_picker {
-                self.open_phase_picker(Some(idx), None);
-                return;
-            }
-            if !self.data.phase.is_configured() {
-                self.open_phase_connect_modal(
-                    None,
-                    Some("Configure Phase.dev authentication to sync this collection.".to_string()),
-                );
-                return;
-            }
-            self.set_info("Phase.dev sync in progress...");
-            self.sync_start_time = Some(Instant::now());
-            self.pending_phase_sync = Some(PendingSyncTarget::Collection(idx));
-        } else {
-            // Selected collection is a Custom collection: never mix Phase vars into it.
-            // If other Phase collections exist, sync all Phase collections; otherwise inform the user.
-            let has_any_phase = self.data.collections.iter().any(|c| c.is_phase());
-            if has_any_phase {
-                if !self.data.phase.is_configured() {
-                    self.open_phase_connect_modal(
-                        None,
-                        Some("Configure Phase.dev authentication to sync Phase collections.".to_string()),
-                    );
-                    return;
-                }
-                self.set_info("Phase.dev sync in progress...");
-                self.sync_start_time = Some(Instant::now());
-                self.pending_phase_sync = Some(PendingSyncTarget::All);
-            } else {
-                let cname = coll.name.clone();
-                self.set_error(format!(
-                    "Collection '{}' uses a Custom environment (sources cannot be mixed). Create a Phase.dev collection with [n].",
-                    cname
-                ));
-            }
+        if !coll.is_phase() {
+            return;
         }
+
+        let idx = self.selected_collection;
+        if force_rebind_picker {
+            self.open_phase_picker(Some(idx), None);
+            return;
+        }
+        if !self.data.phase.is_configured() {
+            self.open_phase_connect_modal(
+                None,
+                Some("Configure Phase.dev authentication to sync this collection.".to_string()),
+            );
+            return;
+        }
+        self.set_info("Phase.dev sync in progress...");
+        self.sync_start_time = Some(Instant::now());
+        self.pending_phase_sync = Some(PendingSyncTarget::Collection(idx));
     }
 
     pub fn perform_pending_sync(&mut self) -> bool {
@@ -625,7 +648,7 @@ impl App {
         if coll.is_phase() {
             let cname = coll.name.clone();
             self.set_error(format!(
-                "Collection '{}' is synced with Phase.dev. Variables cannot be edited manually (press [p] to sync).",
+                "Collection '{}' is synced with Phase.dev. Variables cannot be edited manually (press [Ctrl+B] to sync).",
                 cname
             ));
             return;
@@ -700,7 +723,7 @@ impl App {
                 if coll.is_phase() {
                     let cname = coll.name.clone();
                     self.set_error(format!(
-                        "Collection '{}' is synced with Phase.dev. Manage variables in Phase.dev and press [p] to sync.",
+                        "Collection '{}' is synced with Phase.dev. Manage variables in Phase.dev and press [Ctrl+B] to sync.",
                         cname
                     ));
                     return;
@@ -761,13 +784,13 @@ impl App {
 
     fn open_add_var_modal(&mut self) {
         let Some(coll) = self.current_collection() else {
-            self.set_error("No collection available. Create a collection first with [n].");
+            self.set_error("No collection available. Create a collection first with [Ctrl+N].");
             return;
         };
         if coll.is_phase() {
             let cname = coll.name.clone();
             self.set_error(format!(
-                "Collection '{}' uses Phase.dev synchronization. Sources cannot be mixed (create a Custom collection with [n]).",
+                "Collection '{}' uses Phase.dev synchronization. Sources cannot be mixed (create a Custom collection with [Ctrl+N]).",
                 cname
             ));
         } else {
@@ -786,16 +809,14 @@ impl App {
     fn toggle_current_collection(&mut self) {
         if let Some(coll) = self.current_collection_mut() {
             coll.enabled = !coll.enabled;
-            let name = coll.name.clone();
-            let status = if coll.enabled { "ON" } else { "OFF" };
-            self.sync_to_system(&format!("Toggled collection '{}' {}", name, status));
+            self.sync_to_system_silent();
         }
     }
 
     pub fn sync_all_phase_collections(&mut self) {
         let has_any_phase = self.data.collections.iter().any(|c| c.is_phase());
         if !has_any_phase {
-            self.set_error("No Phase.dev collections found to sync. Press [n] to create one.");
+            self.set_error("No Phase.dev collections found to sync. Press [Ctrl+N] to create one.");
             return;
         }
         if !self.data.phase.is_configured() {
@@ -878,7 +899,7 @@ impl App {
                     };
                     items.push(ContextMenuItem {
                         label: "Edit Collection".to_string(),
-                        shortcut: "e",
+                        shortcut: "Ctrl+E",
                         action: ContextAction::Edit,
                         is_danger: false,
                     });
@@ -902,8 +923,8 @@ impl App {
                     });
                     if coll.is_phase() {
                         items.push(ContextMenuItem {
-                            label: "Sync Phase.dev".to_string(),
-                            shortcut: "p",
+                            label: "Sync Environment".to_string(),
+                            shortcut: "Ctrl+B",
                             action: ContextAction::PhaseSync,
                             is_danger: false,
                         });
@@ -916,27 +937,27 @@ impl App {
                     } else {
                         items.push(ContextMenuItem {
                             label: "Add Variable".to_string(),
-                            shortcut: "a",
+                            shortcut: "Ctrl+A",
                             action: ContextAction::AddVar,
                             is_danger: false,
                         });
                     }
                     items.push(ContextMenuItem {
                         label: "New Collection".to_string(),
-                        shortcut: "n",
+                        shortcut: "Ctrl+N",
                         action: ContextAction::NewCollection,
                         is_danger: false,
                     });
                     items.push(ContextMenuItem {
                         label: "Delete Collection".to_string(),
-                        shortcut: "x",
+                        shortcut: "Delete",
                         action: ContextAction::Delete,
                         is_danger: true,
                     });
                 } else {
                     items.push(ContextMenuItem {
                         label: "New Collection".to_string(),
-                        shortcut: "n",
+                        shortcut: "Ctrl+N",
                         action: ContextAction::NewCollection,
                         is_danger: false,
                     });
@@ -951,28 +972,28 @@ impl App {
                 if has_vars && !is_phase {
                     items.push(ContextMenuItem {
                         label: "Edit Variable".to_string(),
-                        shortcut: "e",
+                        shortcut: "Ctrl+E",
                         action: ContextAction::Edit,
                         is_danger: false,
                     });
                     items.push(ContextMenuItem {
                         label: "Delete Variable".to_string(),
-                        shortcut: "x",
+                        shortcut: "Delete",
                         action: ContextAction::Delete,
                         is_danger: true,
                     });
                 }
                 if is_phase {
                     items.push(ContextMenuItem {
-                        label: "Sync Phase.dev".to_string(),
-                        shortcut: "p",
+                        label: "Sync Environment".to_string(),
+                        shortcut: "Ctrl+B",
                         action: ContextAction::PhaseSync,
                         is_danger: false,
                     });
                 } else {
                     items.push(ContextMenuItem {
                         label: "Add Variable".to_string(),
-                        shortcut: "a",
+                        shortcut: "Ctrl+A",
                         action: ContextAction::AddVar,
                         is_danger: false,
                     });
@@ -980,13 +1001,13 @@ impl App {
                 if has_vars {
                     items.push(ContextMenuItem {
                         label: "Copy Key".to_string(),
-                        shortcut: "y",
+                        shortcut: "Y",
                         action: ContextAction::CopyKey,
                         is_danger: false,
                     });
                     items.push(ContextMenuItem {
                         label: "Copy Value".to_string(),
-                        shortcut: "Y",
+                        shortcut: "Shift+Y",
                         action: ContextAction::CopyValue,
                         is_danger: false,
                     });
@@ -997,32 +1018,32 @@ impl App {
                 if has_vars {
                     items.push(ContextMenuItem {
                         label: "Edit Variable".to_string(),
-                        shortcut: "e",
+                        shortcut: "Ctrl+E",
                         action: ContextAction::Edit,
                         is_danger: false,
                     });
                     items.push(ContextMenuItem {
                         label: "Delete Variable".to_string(),
-                        shortcut: "x",
+                        shortcut: "Delete",
                         action: ContextAction::Delete,
                         is_danger: true,
                     });
                     items.push(ContextMenuItem {
                         label: "Copy Key".to_string(),
-                        shortcut: "y",
+                        shortcut: "Y",
                         action: ContextAction::CopyKey,
                         is_danger: false,
                     });
                     items.push(ContextMenuItem {
                         label: "Copy Value".to_string(),
-                        shortcut: "Y",
+                        shortcut: "Shift+Y",
                         action: ContextAction::CopyValue,
                         is_danger: false,
                     });
                 }
                 items.push(ContextMenuItem {
                     label: "Reload Shell Env".to_string(),
-                    shortcut: "r",
+                    shortcut: "Ctrl+S",
                     action: ContextAction::ReloadShell,
                     is_danger: false,
                 });
@@ -1061,19 +1082,13 @@ impl App {
                 let action = menu.items[menu.selected].action;
                 self.execute_context_action(action);
             }
-            KeyCode::Char('e') => self.execute_context_action(ContextAction::Edit),
-            KeyCode::Char('x') | KeyCode::Delete => {
-                self.execute_context_action(ContextAction::Delete)
+            KeyCode::Delete => {
+                self.execute_context_action(ContextAction::Delete);
             }
             KeyCode::Char(' ') => self.execute_context_action(ContextAction::ToggleCollection),
             KeyCode::Char('u') => self.execute_context_action(ContextAction::MoveUp),
             KeyCode::Char('d') => self.execute_context_action(ContextAction::MoveDown),
-            KeyCode::Char('n') => self.execute_context_action(ContextAction::NewCollection),
-            KeyCode::Char('a') => self.execute_context_action(ContextAction::AddVar),
-            KeyCode::Char('p') => self.execute_context_action(ContextAction::PhaseSync),
             KeyCode::Char('P') => self.execute_context_action(ContextAction::PhaseRebind),
-            KeyCode::Char('v') => self.execute_context_action(ContextAction::ToggleMask),
-            KeyCode::Char('r') => self.execute_context_action(ContextAction::ReloadShell),
             KeyCode::Char('y') | KeyCode::Char('c') => {
                 self.execute_context_action(ContextAction::CopyKey);
             }
@@ -1081,6 +1096,35 @@ impl App {
                 self.execute_context_action(ContextAction::CopyValue);
             }
             _ => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    match key.code {
+                        KeyCode::Char('n') | KeyCode::Char('N') => {
+                            self.execute_context_action(ContextAction::NewCollection);
+                            return;
+                        }
+                        KeyCode::Char('a') | KeyCode::Char('A') => {
+                            self.execute_context_action(ContextAction::AddVar);
+                            return;
+                        }
+                        KeyCode::Char('e') | KeyCode::Char('E') => {
+                            self.execute_context_action(ContextAction::Edit);
+                            return;
+                        }
+                        KeyCode::Char('b') | KeyCode::Char('B') => {
+                            self.execute_context_action(ContextAction::PhaseSync);
+                            return;
+                        }
+                        KeyCode::Char('s') | KeyCode::Char('S') => {
+                            self.execute_context_action(ContextAction::ReloadShell);
+                            return;
+                        }
+                        KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::Char('m') | KeyCode::Char('M') => {
+                            self.execute_context_action(ContextAction::ToggleMask);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
                 self.context_menu = Some(menu);
             }
         }
@@ -1108,14 +1152,9 @@ impl App {
                 self.move_selected_collection_down();
             }
             KeyCode::Char(' ') => {
-                if let Some(coll) = self.current_collection_mut() {
-                    coll.enabled = !coll.enabled;
-                    let name = coll.name.clone();
-                    let status = if coll.enabled { "ON" } else { "OFF" };
-                    self.sync_to_system(&format!("Toggled collection '{}' {}", name, status));
-                }
+                self.toggle_current_collection();
             }
-            KeyCode::Enter => {
+            KeyCode::Enter if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.open_edit_collection();
             }
             _ => {}
@@ -1124,17 +1163,13 @@ impl App {
 
     fn move_selected_collection_up(&mut self) {
         if self.selected_collection == 0 {
-            if !self.data.collections.is_empty() {
-                self.set_info("Collection is already at top priority.");
-            }
             return;
         }
         self.data
             .collections
             .swap(self.selected_collection, self.selected_collection - 1);
         self.selected_collection -= 1;
-        let name = self.data.collections[self.selected_collection].name.clone();
-        self.sync_to_system(&format!("Moved collection '{}' up", name));
+        self.sync_to_system_silent();
     }
 
     fn move_selected_collection_down(&mut self) {
@@ -1145,8 +1180,7 @@ impl App {
             .collections
             .swap(self.selected_collection, self.selected_collection + 1);
         self.selected_collection += 1;
-        let name = self.data.collections[self.selected_collection].name.clone();
-        self.sync_to_system(&format!("Moved collection '{}' down", name));
+        self.sync_to_system_silent();
     }
 
     fn handle_vars_pane_key(&mut self, key: KeyEvent) {
@@ -1162,7 +1196,7 @@ impl App {
                     self.selected_var += 1;
                 }
             }
-            KeyCode::Enter => {
+            KeyCode::Enter if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.open_edit_var();
             }
             KeyCode::Char('y') => {
@@ -1188,7 +1222,7 @@ impl App {
                     self.selected_effective += 1;
                 }
             }
-            KeyCode::Enter => {
+            KeyCode::Enter if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.open_edit_effective_var();
             }
             KeyCode::Char('y') => {
@@ -1228,10 +1262,13 @@ impl App {
         }
 
         match fetch_apps_and_envs(&self.data.phase) {
-            Ok(apps) => {
+            Ok(mut apps) => {
                 if apps.is_empty() {
                     self.set_error("Connected to Phase.dev, but no Apps were found.");
                     return;
+                }
+                if let Some(first_app) = apps.first_mut() {
+                    populate_app_env_var_counts(&self.data.phase, first_app);
                 }
                 self.cached_apps = apps.clone();
                 self.modal = Modal::PhasePicker {
@@ -1240,7 +1277,8 @@ impl App {
                     apps,
                     selected_app: 0,
                     selected_env: 0,
-                    selecting_env: false,
+                    picker_step: 0,
+                    export_all_paths: true,
                     error: None,
                 };
             }
@@ -1266,278 +1304,6 @@ impl App {
         let modal = std::mem::replace(&mut self.modal, Modal::None);
         match modal {
             Modal::None => {}
-            Modal::PhaseConnect {
-                mut auth_method,
-                mut host_mode,
-                mut custom_url,
-                mut pat_token,
-                mut cli_status,
-                mut active_field,
-                pending_new_collection,
-                mut error,
-            } => {
-                // Fields:
-                // When auth_method == Cli: 1 field (0 = Auth Method)
-                // When auth_method == Token & Cloud: 2 fields (0 = Auth Method, 1 = Server Mode, 2 = PAT) -> 3 fields
-                // When auth_method == Token & SelfHosted: 4 fields (0 = Auth Method, 1 = Server Mode, 2 = URL, 3 = PAT)
-                let max_fields = match auth_method {
-                    PhaseAuthMethod::Cli => 1,
-                    PhaseAuthMethod::Token => match host_mode {
-                        HostMode::Cloud => 3,
-                        HostMode::SelfHosted => 4,
-                    },
-                };
-
-                let pat_field_idx = if host_mode == HostMode::Cloud { 2 } else { 3 };
-
-                match key.code {
-                    KeyCode::Esc => {
-                        self.set_info("Closed Phase.dev setup.");
-                        return;
-                    }
-                    KeyCode::Tab | KeyCode::Down => {
-                        active_field = (active_field + 1) % max_fields;
-                        self.input_cursor = if host_mode == HostMode::SelfHosted && active_field == 2 {
-                            custom_url.chars().count()
-                        } else if active_field == pat_field_idx {
-                            pat_token.chars().count()
-                        } else {
-                            0
-                        };
-                    }
-                    KeyCode::BackTab | KeyCode::Up => {
-                        active_field = (active_field + max_fields - 1) % max_fields;
-                        self.input_cursor = if host_mode == HostMode::SelfHosted && active_field == 2 {
-                            custom_url.chars().count()
-                        } else if active_field == pat_field_idx {
-                            pat_token.chars().count()
-                        } else {
-                            0
-                        };
-                    }
-                    KeyCode::Char('r') if auth_method == PhaseAuthMethod::Cli => {
-                        cli_status = detect_phase_cli_detailed();
-                        error = None;
-                    }
-                    KeyCode::Left if auth_method == PhaseAuthMethod::Token && (active_field == 2 || active_field == pat_field_idx) => {
-                        self.input_cursor = self.input_cursor.saturating_sub(1);
-                        error = None;
-                    }
-                    KeyCode::Right if auth_method == PhaseAuthMethod::Token && (active_field == 2 || active_field == pat_field_idx) => {
-                        let len = if active_field == 2 { custom_url.chars().count() } else { pat_token.chars().count() };
-                        self.input_cursor = (self.input_cursor + 1).min(len);
-                        error = None;
-                    }
-                    KeyCode::Home | KeyCode::Char('a')
-                        if auth_method == PhaseAuthMethod::Token
-                            && (active_field == 2 || active_field == pat_field_idx)
-                            && (key.code == KeyCode::Home || key.modifiers.contains(KeyModifiers::CONTROL)) =>
-                    {
-                        self.input_cursor = 0;
-                    }
-                    KeyCode::End | KeyCode::Char('e')
-                        if auth_method == PhaseAuthMethod::Token
-                            && (active_field == 2 || active_field == pat_field_idx)
-                            && (key.code == KeyCode::End || key.modifiers.contains(KeyModifiers::CONTROL)) =>
-                    {
-                        let len = if active_field == 2 { custom_url.chars().count() } else { pat_token.chars().count() };
-                        self.input_cursor = len;
-                    }
-                    KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
-                        if active_field == 0 =>
-                    {
-                        auth_method = match auth_method {
-                            PhaseAuthMethod::Cli => PhaseAuthMethod::Token,
-                            PhaseAuthMethod::Token => PhaseAuthMethod::Cli,
-                        };
-                        if auth_method == PhaseAuthMethod::Cli {
-                            cli_status = detect_phase_cli_detailed();
-                        }
-                        active_field = 0;
-                        self.input_cursor = 0;
-                        error = None;
-                    }
-                    KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
-                        if auth_method == PhaseAuthMethod::Token && active_field == 1 =>
-                    {
-                        host_mode = match host_mode {
-                            HostMode::Cloud => HostMode::SelfHosted,
-                            HostMode::SelfHosted => HostMode::Cloud,
-                        };
-                        self.input_cursor = 0;
-                        error = None;
-                    }
-                    KeyCode::Backspace if auth_method == PhaseAuthMethod::Token => {
-                        if self.input_cursor > 0 {
-                            if host_mode == HostMode::SelfHosted && active_field == 2 {
-                                remove_char_at(&mut custom_url, self.input_cursor - 1);
-                            } else if active_field == pat_field_idx {
-                                remove_char_at(&mut pat_token, self.input_cursor - 1);
-                            }
-                            self.input_cursor -= 1;
-                            error = None;
-                        }
-                    }
-                    KeyCode::Delete if auth_method == PhaseAuthMethod::Token => {
-                        if host_mode == HostMode::SelfHosted && active_field == 2 {
-                            remove_char_at(&mut custom_url, self.input_cursor);
-                        } else if active_field == pat_field_idx {
-                            remove_char_at(&mut pat_token, self.input_cursor);
-                        }
-                        error = None;
-                    }
-                    KeyCode::Char('u')
-                        if auth_method == PhaseAuthMethod::Token
-                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        if host_mode == HostMode::SelfHosted && active_field == 2 {
-                            custom_url.clear();
-                        } else if active_field == pat_field_idx {
-                            pat_token.clear();
-                        }
-                        self.input_cursor = 0;
-                        error = None;
-                    }
-                    KeyCode::Char(c)
-                        if auth_method == PhaseAuthMethod::Token
-                            && !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        if host_mode == HostMode::SelfHosted && active_field == 2 {
-                            insert_char_at(&mut custom_url, self.input_cursor, c);
-                            self.input_cursor += 1;
-                            error = None;
-                        } else if active_field == pat_field_idx {
-                            insert_char_at(&mut pat_token, self.input_cursor, c);
-                            self.input_cursor += 1;
-                            error = None;
-                        }
-                    }
-                    KeyCode::Enter => {
-                        if auth_method == PhaseAuthMethod::Cli {
-                            cli_status = detect_phase_cli_detailed();
-                            if !cli_status.installed {
-                                error = Some(
-                                    "Phase CLI (`phase`) is not installed or not in PATH.".to_string(),
-                                );
-                            } else {
-                                let new_cfg = PhaseConfig {
-                                    auth_method: PhaseAuthMethod::Cli,
-                                    host_mode,
-                                    custom_url: custom_url.trim().to_string(),
-                                    pat_token: pat_token.trim().to_string(),
-                                };
-                                match fetch_apps_and_envs(&new_cfg) {
-                                    Ok(apps) => {
-                                        let app_count = apps.len();
-                                        self.cached_apps = apps.clone();
-                                        self.data.phase = new_cfg;
-                                        let _ = self.data.save();
-                                        if let Some(coll_name) = pending_new_collection {
-                                            self.modal = Modal::PhasePicker {
-                                                target_collection_idx: None,
-                                                new_collection_name: Some(coll_name),
-                                                apps,
-                                                selected_app: 0,
-                                                selected_env: 0,
-                                                selecting_env: false,
-                                                error: None,
-                                            };
-                                            return;
-                                        }
-                                        self.set_info(format!(
-                                            "Connected to Phase.dev via CLI ({})! Found {} app(s).",
-                                            self.data.phase.effective_host(),
-                                            app_count
-                                        ));
-                                        return;
-                                    }
-                                    Err(e) => {
-                                        error = Some(format!(
-                                            "{} (Ensure `phase auth` is logged in, or press Ctrl+S to save)",
-                                            e
-                                        ));
-                                    }
-                                }
-                            }
-                        } else if host_mode == HostMode::SelfHosted && custom_url.trim().is_empty()
-                        {
-                            error = Some("Self-hosted URL cannot be empty.".to_string());
-                        } else if pat_token.trim().is_empty() {
-                            error =
-                                Some("Personal Access Token (PAT) cannot be empty.".to_string());
-                        } else {
-                            let new_cfg = PhaseConfig {
-                                auth_method: PhaseAuthMethod::Token,
-                                host_mode,
-                                custom_url: custom_url.trim().to_string(),
-                                pat_token: pat_token.trim().to_string(),
-                            };
-                            match fetch_apps_and_envs(&new_cfg) {
-                                Ok(apps) => {
-                                    let app_count = apps.len();
-                                    self.cached_apps = apps.clone();
-                                    self.data.phase = new_cfg;
-                                    let _ = self.data.save();
-                                    if let Some(coll_name) = pending_new_collection {
-                                        self.modal = Modal::PhasePicker {
-                                            target_collection_idx: None,
-                                            new_collection_name: Some(coll_name),
-                                            apps,
-                                            selected_app: 0,
-                                            selected_env: 0,
-                                            selecting_env: false,
-                                            error: None,
-                                        };
-                                        return;
-                                    }
-                                    self.set_info(format!(
-                                        "Connected to Phase.dev via API Token ({})! Found {} app(s).",
-                                        self.data.phase.effective_host(),
-                                        app_count
-                                    ));
-                                    return;
-                                }
-                                Err(e) => {
-                                    error = Some(format!(
-                                        "{} (Press Ctrl+S to save without testing)",
-                                        e
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && key.code == KeyCode::Char('s')
-                {
-                    self.data.phase = PhaseConfig {
-                        auth_method,
-                        host_mode,
-                        custom_url: custom_url.trim().to_string(),
-                        pat_token: pat_token.trim().to_string(),
-                    };
-                    let _ = self.data.save();
-                    self.set_info(format!(
-                        "Saved Phase.dev config ({}: {})",
-                        self.data.phase.auth_method.label(),
-                        self.data.phase.effective_host()
-                    ));
-                    return;
-                }
-
-                self.modal = Modal::PhaseConnect {
-                    auth_method,
-                    host_mode,
-                    custom_url,
-                    pat_token,
-                    cli_status,
-                    active_field,
-                    pending_new_collection,
-                    error,
-                };
-            }
 
             Modal::NewCollection {
                 mut name,
@@ -1641,10 +1407,11 @@ impl App {
             Modal::PhasePicker {
                 target_collection_idx,
                 new_collection_name,
-                apps,
+                mut apps,
                 mut selected_app,
                 mut selected_env,
-                mut selecting_env,
+                mut picker_step,
+                mut export_all_paths,
                 mut error,
             } => {
                 let env_count = apps
@@ -1654,53 +1421,123 @@ impl App {
 
                 match key.code {
                     KeyCode::Esc => {
-                        if selecting_env {
-                            selecting_env = false;
+                        if picker_step > 0 {
+                            picker_step -= 1;
+                            error = None;
                         } else {
                             return;
                         }
                     }
-                    KeyCode::Tab | KeyCode::Left | KeyCode::Right => {
-                        if env_count > 0 {
-                            selecting_env = !selecting_env;
+                    KeyCode::BackTab => {
+                        if picker_step > 0 {
+                            picker_step -= 1;
+                            error = None;
+                        }
+                    }
+                    KeyCode::Left => {
+                        if picker_step == 2 {
+                            export_all_paths = !export_all_paths;
+                        } else if picker_step == 1 {
+                            picker_step = 0;
+                            error = None;
+                        }
+                    }
+                    KeyCode::Right => {
+                        if picker_step == 2 {
+                            export_all_paths = !export_all_paths;
+                        } else if picker_step == 0 {
+                            if env_count > 0 {
+                                picker_step = 1;
+                                selected_env = 0;
+                                error = None;
+                            } else {
+                                error = Some("Selected App has no environments.".to_string());
+                            }
+                        } else if picker_step == 1 {
+                            picker_step = 2;
+                            error = None;
+                        }
+                    }
+                    KeyCode::Tab => {
+                        if picker_step == 0 {
+                            if env_count > 0 {
+                                picker_step = 1;
+                                selected_env = 0;
+                                error = None;
+                            } else {
+                                error = Some("Selected App has no environments.".to_string());
+                            }
+                        } else if picker_step == 1 {
+                            picker_step = 2;
+                            error = None;
+                        } else {
+                            picker_step = 0;
+                            error = None;
                         }
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
-                        if !selecting_env {
+                        if picker_step == 0 {
                             if selected_app > 0 {
                                 selected_app -= 1;
                                 selected_env = 0;
+                                if let Some(app) = apps.get_mut(selected_app) {
+                                    if app.environments.iter().any(|e| e.var_count.is_none()) {
+                                        populate_app_env_var_counts(&self.data.phase, app);
+                                    }
+                                }
                             }
-                        } else if selected_env > 0 {
-                            selected_env -= 1;
+                        } else if picker_step == 1 {
+                            if selected_env > 0 {
+                                selected_env -= 1;
+                            }
+                        } else if picker_step == 2 {
+                            export_all_paths = !export_all_paths;
                         }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        if !selecting_env {
+                        if picker_step == 0 {
                             if selected_app + 1 < apps.len() {
                                 selected_app += 1;
                                 selected_env = 0;
+                                if let Some(app) = apps.get_mut(selected_app) {
+                                    if app.environments.iter().any(|e| e.var_count.is_none()) {
+                                        populate_app_env_var_counts(&self.data.phase, app);
+                                    }
+                                }
                             }
-                        } else if selected_env + 1 < env_count {
-                            selected_env += 1;
+                        } else if picker_step == 1 {
+                            if selected_env + 1 < env_count {
+                                selected_env += 1;
+                            }
+                        } else if picker_step == 2 {
+                            export_all_paths = !export_all_paths;
+                        }
+                    }
+                    KeyCode::Char(' ') => {
+                        if picker_step == 2 {
+                            export_all_paths = !export_all_paths;
                         }
                     }
                     KeyCode::Enter => {
-                        if !selecting_env {
+                        if picker_step == 0 {
                             if env_count == 0 {
                                 error = Some("Selected App has no environments.".to_string());
                             } else {
-                                selecting_env = true;
+                                picker_step = 1;
+                                selected_env = 0;
+                                error = None;
                             }
+                        } else if picker_step == 1 {
+                            picker_step = 2;
+                            error = None;
                         } else if let Some(app) = apps.get(selected_app) {
                             if let Some(env) = app.environments.get(selected_env) {
-                                let export_all = self.data.settings.phase_export_all_paths;
                                 match fetch_secrets_for_env(
                                     &self.data.phase,
                                     &app.id,
                                     &env.id,
                                     Some(&env.name),
-                                    export_all,
+                                    export_all_paths,
                                 ) {
                                     Ok(fetched_pairs) => {
                                         let fetched_len = fetched_pairs.len();
@@ -1709,6 +1546,7 @@ impl App {
                                             app_name: app.name.clone(),
                                             env_id: env.id.clone(),
                                             env_name: env.name.clone(),
+                                            export_all_paths,
                                         };
                                         self.data.last_phase_sync_epoch =
                                             AppStateData::current_epoch_secs();
@@ -1720,17 +1558,19 @@ impl App {
                                                 fetched_pairs,
                                             );
                                             self.insert_new_collection(new_coll);
+                                            let path_desc = if export_all_paths { "all paths" } else { "root only" };
                                             self.sync_to_system(&format!(
-                                                "Created Phase.dev collection '{}' with {} var(s) ({}/{})",
-                                                coll_name, fetched_len, app.name, env.name
+                                                "Created Phase.dev collection '{}' with {} var(s) ({}/{}, {})",
+                                                coll_name, fetched_len, app.name, env.name, path_desc
                                             ));
                                         } else if let Some(idx) = target_collection_idx {
                                             if let Some(coll) = self.data.collections.get_mut(idx) {
                                                 coll.set_phase_vars(binding, fetched_pairs);
                                                 let cname = coll.name.clone();
+                                                let path_desc = if export_all_paths { "all paths" } else { "root only" };
                                                 self.sync_to_system(&format!(
-                                                    "Synced {} var(s) from Phase ({}/{}) into '{}'",
-                                                    fetched_len, app.name, env.name, cname
+                                                    "Synced {} var(s) from Phase ({}/{}, {}) into '{}'",
+                                                    fetched_len, app.name, env.name, path_desc, cname
                                                 ));
                                             }
                                         }
@@ -1753,7 +1593,8 @@ impl App {
                     apps,
                     selected_app,
                     selected_env,
-                    selecting_env,
+                    picker_step,
+                    export_all_paths,
                     error,
                 };
             }
@@ -2005,62 +1846,394 @@ impl App {
             }
 
             Modal::Settings {
+                mut tab,
                 mut draft,
                 mut active_field,
+                mut auth_method,
+                mut host_mode,
+                mut custom_url,
+                mut pat_token,
+                mut cli_status,
+                pending_new_collection,
                 mut error,
             } => {
-                const TOTAL_SETTINGS_FIELDS: usize = 5;
-
-                match key.code {
-                    KeyCode::Esc => {
-                        return;
-                    }
-                    KeyCode::Tab | KeyCode::Down => {
-                        active_field = (active_field + 1) % TOTAL_SETTINGS_FIELDS;
-                        error = None;
-                    }
-                    KeyCode::BackTab | KeyCode::Up => {
-                        active_field =
-                            (active_field + TOTAL_SETTINGS_FIELDS - 1) % TOTAL_SETTINGS_FIELDS;
-                        error = None;
-                    }
-                    KeyCode::Char(' ')
-                    | KeyCode::Left
-                    | KeyCode::Right => {
-                        error = None;
-                        match active_field {
-                            0 => {
-                                draft.sync_only_enabled_collections =
-                                    !draft.sync_only_enabled_collections;
+                match tab {
+                    SettingsTab::Preferences => {
+                        const PREF_FIELDS: usize = 3;
+                        match key.code {
+                            KeyCode::Esc => {
+                                return;
                             }
-                            1 => {
-                                draft.phase_export_all_paths = !draft.phase_export_all_paths;
+                            KeyCode::Char('2') => {
+                                tab = SettingsTab::PhaseAuth;
+                                active_field = 0;
+                                error = None;
                             }
-                            2 => {
-                                draft.mask_secrets_by_default = !draft.mask_secrets_by_default;
+                            KeyCode::Tab => {
+                                tab = SettingsTab::PhaseAuth;
+                                active_field = 0;
+                                error = None;
                             }
-                            3 => {
-                                draft.insert_new_collection_at_top =
-                                    !draft.insert_new_collection_at_top;
+                            KeyCode::BackTab => {
+                                tab = SettingsTab::PhaseAuth;
+                                active_field = 0;
+                                error = None;
                             }
-                            4 => {
-                                draft.shell_prompt_hook = !draft.shell_prompt_hook;
+                            KeyCode::Down => {
+                                active_field = (active_field + 1) % PREF_FIELDS;
+                                error = None;
+                            }
+                            KeyCode::Up => {
+                                active_field = (active_field + PREF_FIELDS - 1) % PREF_FIELDS;
+                                error = None;
+                            }
+                            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right => {
+                                error = None;
+                                match active_field {
+                                    0 => {
+                                        draft.sync_only_enabled_collections =
+                                            !draft.sync_only_enabled_collections;
+                                    }
+                                    1 => {
+                                        draft.insert_new_collection_at_top =
+                                            !draft.insert_new_collection_at_top;
+                                    }
+                                    2 => {
+                                        draft.shell_prompt_hook = !draft.shell_prompt_hook;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            KeyCode::Enter => {
+                                self.data.settings = draft;
+                                self.sync_to_system("Saved application Settings");
+                                return;
                             }
                             _ => {}
                         }
                     }
-                    KeyCode::Enter => {
-                        self.data.settings = draft;
-                        self.sync_to_system("Saved application Settings");
-                        self.modal = Modal::None;
-                        return;
+                    SettingsTab::PhaseAuth => {
+                        let max_fields = match auth_method {
+                            PhaseAuthMethod::Cli => 1,
+                            PhaseAuthMethod::Token => match host_mode {
+                                HostMode::Cloud => 3,
+                                HostMode::SelfHosted => 4,
+                            },
+                        };
+                        let pat_field_idx = if host_mode == HostMode::Cloud { 2 } else { 3 };
+
+                        match key.code {
+                            KeyCode::Esc => {
+                                return;
+                            }
+                            KeyCode::Char('1') if active_field < 2 => {
+                                tab = SettingsTab::Preferences;
+                                active_field = 0;
+                                error = None;
+                            }
+                            KeyCode::Tab => {
+                                if active_field + 1 >= max_fields {
+                                    tab = SettingsTab::Preferences;
+                                    active_field = 0;
+                                    error = None;
+                                } else {
+                                    active_field += 1;
+                                    self.input_cursor = if host_mode == HostMode::SelfHosted && active_field == 2 {
+                                        custom_url.chars().count()
+                                    } else if active_field == pat_field_idx {
+                                        pat_token.chars().count()
+                                    } else {
+                                        0
+                                    };
+                                }
+                            }
+                            KeyCode::BackTab => {
+                                if active_field == 0 {
+                                    tab = SettingsTab::Preferences;
+                                    active_field = 2;
+                                    error = None;
+                                } else {
+                                    active_field -= 1;
+                                    self.input_cursor = if host_mode == HostMode::SelfHosted && active_field == 2 {
+                                        custom_url.chars().count()
+                                    } else if active_field == pat_field_idx {
+                                        pat_token.chars().count()
+                                    } else {
+                                        0
+                                    };
+                                }
+                            }
+                            KeyCode::Down => {
+                                error = None;
+                                match active_field {
+                                    0 => {
+                                        if auth_method == PhaseAuthMethod::Cli {
+                                            auth_method = PhaseAuthMethod::Token;
+                                        } else {
+                                            active_field = 1;
+                                        }
+                                    }
+                                    1 => {
+                                        if host_mode == HostMode::Cloud {
+                                            host_mode = HostMode::SelfHosted;
+                                        } else {
+                                            active_field = 2;
+                                            self.input_cursor = custom_url.chars().count();
+                                        }
+                                    }
+                                    2 => {
+                                        if host_mode == HostMode::SelfHosted {
+                                            active_field = 3;
+                                            self.input_cursor = pat_token.chars().count();
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            KeyCode::Up => {
+                                error = None;
+                                match active_field {
+                                    0 => {
+                                        if auth_method == PhaseAuthMethod::Token {
+                                            auth_method = PhaseAuthMethod::Cli;
+                                            cli_status = detect_phase_cli_detailed();
+                                        }
+                                    }
+                                    1 => {
+                                        if host_mode == HostMode::SelfHosted {
+                                            host_mode = HostMode::Cloud;
+                                        } else {
+                                            active_field = 0;
+                                        }
+                                    }
+                                    2 => {
+                                        active_field = 1;
+                                    }
+                                    3 => {
+                                        active_field = 2;
+                                        self.input_cursor = custom_url.chars().count();
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            KeyCode::Char('r') if auth_method == PhaseAuthMethod::Cli => {
+                                cli_status = detect_phase_cli_detailed();
+                                error = None;
+                            }
+                            KeyCode::Left if auth_method == PhaseAuthMethod::Token && (active_field == 2 || active_field == pat_field_idx) => {
+                                self.input_cursor = self.input_cursor.saturating_sub(1);
+                                error = None;
+                            }
+                            KeyCode::Right if auth_method == PhaseAuthMethod::Token && (active_field == 2 || active_field == pat_field_idx) => {
+                                let len = if active_field == 2 { custom_url.chars().count() } else { pat_token.chars().count() };
+                                self.input_cursor = (self.input_cursor + 1).min(len);
+                                error = None;
+                            }
+                            KeyCode::Home | KeyCode::Char('a')
+                                if auth_method == PhaseAuthMethod::Token
+                                    && (active_field == 2 || active_field == pat_field_idx)
+                                    && (key.code == KeyCode::Home || key.modifiers.contains(KeyModifiers::CONTROL)) =>
+                            {
+                                self.input_cursor = 0;
+                            }
+                            KeyCode::End | KeyCode::Char('e')
+                                if auth_method == PhaseAuthMethod::Token
+                                    && (active_field == 2 || active_field == pat_field_idx)
+                                    && (key.code == KeyCode::End || key.modifiers.contains(KeyModifiers::CONTROL)) =>
+                            {
+                                let len = if active_field == 2 { custom_url.chars().count() } else { pat_token.chars().count() };
+                                self.input_cursor = len;
+                            }
+                            KeyCode::Char(' ') if active_field == 0 => {
+                                auth_method = match auth_method {
+                                    PhaseAuthMethod::Cli => PhaseAuthMethod::Token,
+                                    PhaseAuthMethod::Token => {
+                                        cli_status = detect_phase_cli_detailed();
+                                        PhaseAuthMethod::Cli
+                                    }
+                                };
+                                active_field = 0;
+                                self.input_cursor = 0;
+                                error = None;
+                            }
+                            KeyCode::Char(' ') if auth_method == PhaseAuthMethod::Token && active_field == 1 => {
+                                host_mode = match host_mode {
+                                    HostMode::Cloud => HostMode::SelfHosted,
+                                    HostMode::SelfHosted => HostMode::Cloud,
+                                };
+                                self.input_cursor = 0;
+                                error = None;
+                            }
+                            KeyCode::Backspace if auth_method == PhaseAuthMethod::Token => {
+                                if self.input_cursor > 0 {
+                                    if host_mode == HostMode::SelfHosted && active_field == 2 {
+                                        remove_char_at(&mut custom_url, self.input_cursor - 1);
+                                    } else if active_field == pat_field_idx {
+                                        remove_char_at(&mut pat_token, self.input_cursor - 1);
+                                    }
+                                    self.input_cursor -= 1;
+                                    error = None;
+                                }
+                            }
+                            KeyCode::Delete if auth_method == PhaseAuthMethod::Token => {
+                                if host_mode == HostMode::SelfHosted && active_field == 2 {
+                                    remove_char_at(&mut custom_url, self.input_cursor);
+                                } else if active_field == pat_field_idx {
+                                    remove_char_at(&mut pat_token, self.input_cursor);
+                                }
+                                error = None;
+                            }
+                            KeyCode::Char('u')
+                                if auth_method == PhaseAuthMethod::Token
+                                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                if host_mode == HostMode::SelfHosted && active_field == 2 {
+                                    custom_url.clear();
+                                } else if active_field == pat_field_idx {
+                                    pat_token.clear();
+                                }
+                                self.input_cursor = 0;
+                                error = None;
+                            }
+                            KeyCode::Char(c)
+                                if auth_method == PhaseAuthMethod::Token
+                                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                if host_mode == HostMode::SelfHosted && active_field == 2 {
+                                    insert_char_at(&mut custom_url, self.input_cursor, c);
+                                    self.input_cursor += 1;
+                                    error = None;
+                                } else if active_field == pat_field_idx {
+                                    insert_char_at(&mut pat_token, self.input_cursor, c);
+                                    self.input_cursor += 1;
+                                    error = None;
+                                }
+                            }
+                            KeyCode::Enter => {
+                                if auth_method == PhaseAuthMethod::Cli {
+                                    cli_status = detect_phase_cli_detailed();
+                                    if !cli_status.installed {
+                                        error = Some(
+                                            "Phase CLI (`phase`) is not installed or not in PATH.".to_string(),
+                                        );
+                                    } else {
+                                        let new_cfg = PhaseConfig {
+                                            auth_method: PhaseAuthMethod::Cli,
+                                            host_mode,
+                                            custom_url: custom_url.trim().to_string(),
+                                            pat_token: pat_token.trim().to_string(),
+                                        };
+                                        match fetch_apps_and_envs(&new_cfg) {
+                                            Ok(apps) => {
+                                                let app_count = apps.len();
+                                                self.cached_apps = apps.clone();
+                                                self.data.phase = new_cfg;
+                                                let _ = self.data.save();
+                                                if let Some(coll_name) = pending_new_collection {
+                                                    self.modal = Modal::PhasePicker {
+                                                        target_collection_idx: None,
+                                                        new_collection_name: Some(coll_name),
+                                                        apps,
+                                                        selected_app: 0,
+                                                        selected_env: 0,
+                                                        picker_step: 0,
+                                                        export_all_paths: true,
+                                                        error: None,
+                                                    };
+                                                    return;
+                                                }
+                                                self.set_info(format!(
+                                                    "Connected to Phase.dev via CLI ({})! Found {} app(s).",
+                                                    self.data.phase.effective_host(),
+                                                    app_count
+                                                ));
+                                                return;
+                                            }
+                                            Err(e) => {
+                                                error = Some(format!(
+                                                    "{} (Ensure `phase auth` is logged in, or press Ctrl+S to save)",
+                                                    e
+                                                ));
+                                            }
+                                        }
+                                    }
+                                } else if host_mode == HostMode::SelfHosted && custom_url.trim().is_empty() {
+                                    error = Some("Self-hosted URL cannot be empty.".to_string());
+                                } else if pat_token.trim().is_empty() {
+                                    error = Some("Personal Access Token (PAT) cannot be empty.".to_string());
+                                } else {
+                                    let new_cfg = PhaseConfig {
+                                        auth_method: PhaseAuthMethod::Token,
+                                        host_mode,
+                                        custom_url: custom_url.trim().to_string(),
+                                        pat_token: pat_token.trim().to_string(),
+                                    };
+                                    match fetch_apps_and_envs(&new_cfg) {
+                                        Ok(apps) => {
+                                            let app_count = apps.len();
+                                            self.cached_apps = apps.clone();
+                                            self.data.phase = new_cfg;
+                                            let _ = self.data.save();
+                                            if let Some(coll_name) = pending_new_collection {
+                                                self.modal = Modal::PhasePicker {
+                                                    target_collection_idx: None,
+                                                    new_collection_name: Some(coll_name),
+                                                    apps,
+                                                    selected_app: 0,
+                                                    selected_env: 0,
+                                                    picker_step: 0,
+                                                    export_all_paths: true,
+                                                    error: None,
+                                                };
+                                                return;
+                                            }
+                                            self.set_info(format!(
+                                                "Connected to Phase.dev via API Token ({})! Found {} app(s).",
+                                                self.data.phase.effective_host(),
+                                                app_count
+                                            ));
+                                            return;
+                                        }
+                                        Err(e) => {
+                                            error = Some(format!(
+                                                "{} (Press Ctrl+S to save without testing)",
+                                                e
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+
+                        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+                            self.data.phase = PhaseConfig {
+                                auth_method,
+                                host_mode,
+                                custom_url: custom_url.trim().to_string(),
+                                pat_token: pat_token.trim().to_string(),
+                            };
+                            let _ = self.data.save();
+                            self.set_info(format!(
+                                "Saved Phase.dev config ({}: {})",
+                                self.data.phase.auth_method.label(),
+                                self.data.phase.effective_host()
+                            ));
+                            return;
+                        }
                     }
-                    _ => {}
                 }
 
                 self.modal = Modal::Settings {
+                    tab,
                     draft,
                     active_field,
+                    auth_method,
+                    host_mode,
+                    custom_url,
+                    pat_token,
+                    cli_status,
+                    pending_new_collection,
                     error,
                 };
             }
@@ -2205,7 +2378,7 @@ impl App {
 
         if items.is_empty() {
             items.push(ListItem::new(Line::from(Span::styled(
-                "No collections. Click [+Collection] or press [n] to create one.",
+                "No collections. Click [+Collection] or press [Ctrl+N] to create one.",
                 Style::default().fg(Color::DarkGray),
             ))));
         }
@@ -2292,8 +2465,8 @@ impl App {
         let table = Table::new(
             rows,
             [
-                Constraint::Percentage(40),
-                Constraint::Percentage(60),
+                Constraint::Percentage(26),
+                Constraint::Percentage(74),
             ],
         )
         .header(header)
@@ -2334,9 +2507,9 @@ impl App {
                     Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
                 ),
                 vec![
-                    Constraint::Percentage(26),
-                    Constraint::Percentage(28),
-                    Constraint::Percentage(14),
+                    Constraint::Percentage(22),
+                    Constraint::Percentage(34),
+                    Constraint::Percentage(12),
                     Constraint::Percentage(32),
                 ],
                 effective
@@ -2417,9 +2590,9 @@ impl App {
                 Span::raw(format!("Connected ({})", auth_tag))
             }
         } else if area.width >= 110 {
-            Span::raw("Optional / Offline ([c] Connect)")
+            Span::raw("Optional / Offline ([Ctrl+P] Settings)")
         } else {
-            Span::raw("Offline ([c] Connect)")
+            Span::raw("Offline ([Ctrl+P] Settings)")
         };
 
         let spans = vec![
@@ -2646,137 +2819,6 @@ impl App {
     fn draw_modal(&self, frame: &mut Frame, area: Rect) {
         match &self.modal {
             Modal::None => {}
-            Modal::PhaseConnect {
-                auth_method,
-                host_mode,
-                custom_url,
-                pat_token,
-                cli_status,
-                active_field,
-                error,
-                ..
-            } => {
-                let popup = get_modal_rect(&self.modal, area);
-                frame.render_widget(Clear, popup);
-
-                let block = Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Cyan))
-                    .padding(Padding::new(1, 1, 1, 0))
-                    .title(" Phase.dev Authentication Setup ");
-                let inner = block.inner(popup);
-                frame.render_widget(block, popup);
-
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(1), Constraint::Length(1)])
-                    .split(inner);
-
-                let mut lines = vec![
-                    Line::from(Span::styled(
-                        "Configure Phase.dev Authentication",
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                    )),
-                    Line::from(""),
-                ];
-
-                lines.extend(modern_vertical_radio_options(
-                    "1. Authentication Method:",
-                    &[
-                        ("cli", "Phase CLI (Auto-detected from local machine)"),
-                        ("token", "API Token (Personal Access Token / Service Token)"),
-                    ],
-                    if *auth_method == PhaseAuthMethod::Cli { 0 } else { 1 },
-                    *active_field == 0,
-                ));
-                lines.push(Line::from(""));
-
-                if *auth_method == PhaseAuthMethod::Cli {
-                    let cli_badge_color = if cli_status.installed && cli_status.logged_in {
-                        Color::Green
-                    } else if cli_status.installed {
-                        Color::Yellow
-                    } else {
-                        Color::Red
-                    };
-                    let bin_str = cli_status.binary_path.as_deref().unwrap_or("not found in PATH");
-                    let host_str = cli_status.host.as_deref().unwrap_or(PHASE_CLOUD_HOST);
-                    let org_str = cli_status.organization.as_deref().unwrap_or("N/A");
-
-                    lines.push(Line::from(vec![
-                        Span::styled("   CLI Detection : ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(cli_status.summary_badge(), Style::default().fg(cli_badge_color)),
-                    ]));
-                    lines.push(Line::from(vec![
-                        Span::styled("   Binary Path   : ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(bin_str, Style::default().fg(Color::White)),
-                    ]));
-                    lines.push(Line::from(vec![
-                        Span::styled("   Phase Host    : ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(host_str, Style::default().fg(Color::White)),
-                        Span::styled(format!(" (Org: {})", org_str), Style::default().fg(Color::DarkGray)),
-                    ]));
-                    lines.push(Line::from(""));
-                    lines.push(Line::from(Span::styled(
-                        "Native CLI uses `phase apps` & secrets export.",
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                } else {
-                    lines.extend(modern_vertical_radio_options(
-                        "2. Server Mode:",
-                        &[
-                            ("cloud", "Official Cloud (https://console.phase.dev)"),
-                            ("self_hosted", "Self-Hosted Console (Custom URL)"),
-                        ],
-                        if *host_mode == HostMode::Cloud { 0 } else { 1 },
-                        *active_field == 1,
-                    ));
-                    lines.push(Line::from(""));
-
-                    if *host_mode == HostMode::SelfHosted {
-                        lines.extend(modern_input_lines(
-                            "3. Self-Hosted URL:",
-                            custom_url,
-                            "https://phase.yourdomain.com",
-                            *active_field == 2,
-                            36,
-                            self.input_cursor,
-                        ));
-                        lines.push(Line::from(""));
-                    }
-
-                    let pat_idx = if *host_mode == HostMode::Cloud { 2 } else { 3 };
-                    let masked_pat = if pat_token.len() > 18 {
-                        format!("{}...{}", &pat_token[..14], &pat_token[pat_token.len() - 4..])
-                    } else {
-                        pat_token.clone()
-                    };
-
-                    lines.extend(modern_input_lines(
-                        "Phase API Token (pss_user:... / pss_service:...):",
-                        &masked_pat,
-                        "Enter or paste PAT token",
-                        *active_field == pat_idx,
-                        36,
-                        self.input_cursor,
-                    ));
-                }
-
-                if let Some(err) = error {
-                    lines.push(Line::from(""));
-                    lines.push(Line::from(Span::styled(
-                        format!("⚠ Error: {}", err),
-                        Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD),
-                    )));
-                }
-
-                frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), chunks[0]);
-                if let Some(btns) = get_modal_buttons(&self.modal) {
-                    render_modal_buttons(frame, chunks[1], btns);
-                }
-            }
-
             Modal::NewCollection {
                 name,
                 pull_from_phase,
@@ -2845,7 +2887,8 @@ impl App {
                 apps,
                 selected_app,
                 selected_env,
-                selecting_env,
+                picker_step,
+                export_all_paths,
                 error,
                 ..
             } => {
@@ -2863,7 +2906,11 @@ impl App {
 
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(6), Constraint::Length(1)])
+                    .constraints([
+                        Constraint::Min(6),
+                        Constraint::Length(3),
+                        Constraint::Length(1),
+                    ])
                     .split(inner);
 
                 let cols = Layout::default()
@@ -2873,12 +2920,10 @@ impl App {
 
                 let app_items: Vec<ListItem> = apps
                     .iter()
-                    .map(|a| {
-                        ListItem::new(format!("{} ({} envs)", a.name, a.environments.len()))
-                    })
+                    .map(|a| ListItem::new(a.name.clone()))
                     .collect();
 
-                let app_border = if !*selecting_env {
+                let app_border = if *picker_step == 0 {
                     Style::default().fg(Color::Cyan)
                 } else {
                     Style::default().fg(Color::DarkGray)
@@ -2907,12 +2952,16 @@ impl App {
                     .map(|a| {
                         a.environments
                             .iter()
-                            .map(|e| ListItem::new(e.name.clone()))
+                            .map(|e| {
+                                let count = e.var_count.unwrap_or(0);
+                                let var_word = if count == 1 { "var" } else { "vars" };
+                                ListItem::new(format!("{} ({} {})", e.name, count, var_word))
+                            })
                             .collect()
                     })
                     .unwrap_or_default();
 
-                let env_border = if *selecting_env {
+                let env_border = if *picker_step == 1 {
                     Style::default().fg(Color::Cyan)
                 } else {
                     Style::default().fg(Color::DarkGray)
@@ -2942,8 +2991,44 @@ impl App {
                 env_state.select(Some(*selected_env));
                 frame.render_stateful_widget(env_list, cols[1], &mut env_state);
 
+                let scope_border = if *picker_step == 2 {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+
+                let active_pill = Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD);
+                let inactive_pill = Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Rgb(35, 45, 60));
+
+                let scope_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(scope_border)
+                    .title(" 3. Choose Path Scope ");
+
+                let scope_lines = vec![
+                    Line::from(vec![
+                        Span::raw("   "),
+                        Span::styled(
+                            if *export_all_paths { " [● All Paths] " } else { " [○ All Paths] " },
+                            if *export_all_paths { active_pill } else { inactive_pill },
+                        ),
+                        Span::raw("   "),
+                        Span::styled(
+                            if !*export_all_paths { " [● Root (/) Only] " } else { " [○ Root (/) Only] " },
+                            if !*export_all_paths { active_pill } else { inactive_pill },
+                        ),
+                    ]),
+                ];
+                frame.render_widget(Paragraph::new(scope_lines).block(scope_block), chunks[1]);
+
                 if let Some(btns) = get_modal_buttons(&self.modal) {
-                    render_modal_buttons(frame, chunks[1], btns);
+                    render_modal_buttons(frame, chunks[2], btns);
                 }
             }
 
@@ -3165,9 +3250,16 @@ impl App {
             }
 
             Modal::Settings {
+                tab,
                 draft,
                 active_field,
+                auth_method,
+                host_mode,
+                custom_url,
+                pat_token,
+                cli_status,
                 error,
+                ..
             } => {
                 let popup = get_modal_rect(&self.modal, area);
                 frame.render_widget(Clear, popup);
@@ -3187,69 +3279,180 @@ impl App {
                     .split(inner);
 
                 let active_pill = Style::default()
-                    .fg(Color::Cyan)
-                    .bg(Color::Rgb(25, 38, 58))
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD);
                 let inactive_pill = Style::default()
-                    .fg(Color::DarkGray)
-                    .bg(Color::Rgb(20, 24, 32));
+                    .fg(Color::White)
+                    .bg(Color::Rgb(35, 45, 60));
 
-                let make_pfx = |f_idx: usize| {
-                    if *active_field == f_idx {
-                        ("▸ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-                    } else {
-                        ("  ", Style::default().fg(Color::Yellow))
-                    }
+                let active_tab_style = Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD);
+                let inactive_tab_style = Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Rgb(35, 45, 60));
+
+                let pref_tab_style = if *tab == SettingsTab::Preferences {
+                    active_tab_style
+                } else {
+                    inactive_tab_style
+                };
+                let phase_tab_style = if *tab == SettingsTab::PhaseAuth {
+                    active_tab_style
+                } else {
+                    inactive_tab_style
                 };
 
-                let (pfx0, s0) = make_pfx(0);
-                let (pfx1, s1) = make_pfx(1);
-                let (pfx2, s2) = make_pfx(2);
-                let (pfx3, s3) = make_pfx(3);
-                let (pfx4, s4) = make_pfx(4);
+                let tab_line = Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(" [ General ] ", pref_tab_style),
+                    Span::raw("  "),
+                    Span::styled(" [ Phase.dev ] ", phase_tab_style),
+                    Span::raw("   "),
+                    Span::styled("(Press Tab or 1 / 2 to switch tabs)", Style::default().fg(Color::DarkGray)),
+                ]);
 
-                let mut lines = vec![
-                    Line::from(Span::styled(
-                        "Application & Synchronization Settings",
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                    )),
-                    Line::from(""),
-                    Line::from(vec![
-                        Span::styled(pfx0, s0),
-                        Span::styled("1. Phase Sync Collection Scope    : ", s0),
-                        Span::styled(if draft.sync_only_enabled_collections { " [● Enabled Only] " } else { " [○ Enabled Only] " }, if draft.sync_only_enabled_collections { active_pill } else { inactive_pill }),
-                        Span::raw(" "),
-                        Span::styled(if !draft.sync_only_enabled_collections { " [● All Phase] " } else { " [○ All Phase] " }, if !draft.sync_only_enabled_collections { active_pill } else { inactive_pill }),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(pfx1, s1),
-                        Span::styled("2. Phase Secret Path Scope       : ", s1),
-                        Span::styled(if draft.phase_export_all_paths { " [● All Paths] " } else { " [○ All Paths] " }, if draft.phase_export_all_paths { active_pill } else { inactive_pill }),
-                        Span::raw(" "),
-                        Span::styled(if !draft.phase_export_all_paths { " [● Root (/) Only] " } else { " [○ Root (/) Only] " }, if !draft.phase_export_all_paths { active_pill } else { inactive_pill }),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(pfx2, s2),
-                        Span::styled("3. Mask Secret Values on Startup : ", s2),
-                        Span::styled(if draft.mask_secrets_by_default { " [● ON ] " } else { " [○ ON ] " }, if draft.mask_secrets_by_default { active_pill } else { inactive_pill }),
-                        Span::raw(" "),
-                        Span::styled(if !draft.mask_secrets_by_default { " [● OFF] " } else { " [○ OFF] " }, if !draft.mask_secrets_by_default { active_pill } else { inactive_pill }),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(pfx3, s3),
-                        Span::styled("4. New Collection Default Place  : ", s3),
-                        Span::styled(if draft.insert_new_collection_at_top { " [● Top Priority #1] " } else { " [○ Top Priority #1] " }, if draft.insert_new_collection_at_top { active_pill } else { inactive_pill }),
-                        Span::raw(" "),
-                        Span::styled(if !draft.insert_new_collection_at_top { " [● Bottom of List] " } else { " [○ Bottom of List] " }, if !draft.insert_new_collection_at_top { active_pill } else { inactive_pill }),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(pfx4, s4),
-                        Span::styled("5. Shell Prompt Auto-Reload Hook : ", s4),
-                        Span::styled(if draft.shell_prompt_hook { " [● ON ] " } else { " [○ ON ] " }, if draft.shell_prompt_hook { active_pill } else { inactive_pill }),
-                        Span::raw(" "),
-                        Span::styled(if !draft.shell_prompt_hook { " [● OFF] " } else { " [○ OFF] " }, if !draft.shell_prompt_hook { active_pill } else { inactive_pill }),
-                    ]),
-                ];
+                let mut lines = vec![tab_line, Line::from("")];
+
+                match tab {
+                    SettingsTab::Preferences => {
+                        let make_pfx = |f_idx: usize| {
+                            if *active_field == f_idx {
+                                ("▸ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                            } else {
+                                ("  ", Style::default().fg(Color::Yellow))
+                            }
+                        };
+
+                        let (pfx0, s0) = make_pfx(0);
+                        let (pfx1, s1) = make_pfx(1);
+                        let (pfx2, s2) = make_pfx(2);
+
+                        lines.extend(vec![
+                            Line::from(Span::styled(
+                                "Application & Synchronization Settings",
+                                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                            )),
+                            Line::from(""),
+                            Line::from(vec![
+                                Span::styled(pfx0, s0),
+                                Span::styled("1. Sync Collection Scope          : ", s0),
+                                Span::styled(if draft.sync_only_enabled_collections { " [● Enabled Only] " } else { " [○ Enabled Only] " }, if draft.sync_only_enabled_collections { active_pill } else { inactive_pill }),
+                                Span::raw(" "),
+                                Span::styled(if !draft.sync_only_enabled_collections { " [● All Collections] " } else { " [○ All Collections] " }, if !draft.sync_only_enabled_collections { active_pill } else { inactive_pill }),
+                            ]),
+                            Line::from(""),
+                            Line::from(vec![
+                                Span::styled(pfx1, s1),
+                                Span::styled("2. New Collection Default Place   : ", s1),
+                                Span::styled(if draft.insert_new_collection_at_top { " [● Top] " } else { " [○ Top] " }, if draft.insert_new_collection_at_top { active_pill } else { inactive_pill }),
+                                Span::raw(" "),
+                                Span::styled(if !draft.insert_new_collection_at_top { " [● Bottom] " } else { " [○ Bottom] " }, if !draft.insert_new_collection_at_top { active_pill } else { inactive_pill }),
+                            ]),
+                            Line::from(""),
+                            Line::from(vec![
+                                Span::styled(pfx2, s2),
+                                Span::styled("3. Shell Prompt Auto-Reload Hook  : ", s2),
+                                Span::styled(if draft.shell_prompt_hook { " [● ON ] " } else { " [○ ON ] " }, if draft.shell_prompt_hook { active_pill } else { inactive_pill }),
+                                Span::raw(" "),
+                                Span::styled(if !draft.shell_prompt_hook { " [● OFF] " } else { " [○ OFF] " }, if !draft.shell_prompt_hook { active_pill } else { inactive_pill }),
+                            ]),
+                        ]);
+                    }
+                    SettingsTab::PhaseAuth => {
+                        lines.extend(vec![
+                            Line::from(Span::styled(
+                                "Configure Phase.dev Authentication",
+                                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                            )),
+                            Line::from(""),
+                        ]);
+
+                        lines.extend(modern_vertical_radio_options(
+                            "1. Authentication Method:",
+                            &[
+                                ("cli", "Phase CLI (Auto-detected from local machine)"),
+                                ("token", "API Token (Personal Access Token / Service Token)"),
+                            ],
+                            if *auth_method == PhaseAuthMethod::Cli { 0 } else { 1 },
+                            *active_field == 0,
+                        ));
+                        lines.push(Line::from(""));
+
+                        if *auth_method == PhaseAuthMethod::Cli {
+                            let cli_badge_color = if cli_status.installed && cli_status.logged_in {
+                                Color::Green
+                            } else if cli_status.installed {
+                                Color::Yellow
+                            } else {
+                                Color::Red
+                            };
+                            let bin_str = cli_status.binary_path.as_deref().unwrap_or("not found in PATH");
+                            let host_str = cli_status.host.as_deref().unwrap_or(PHASE_CLOUD_HOST);
+                            let org_str = cli_status.organization.as_deref().unwrap_or("N/A");
+
+                            lines.push(Line::from(vec![
+                                Span::styled("   CLI Detection : ", Style::default().fg(Color::DarkGray)),
+                                Span::styled(cli_status.summary_badge(), Style::default().fg(cli_badge_color)),
+                            ]));
+                            lines.push(Line::from(vec![
+                                Span::styled("   Binary Path   : ", Style::default().fg(Color::DarkGray)),
+                                Span::styled(bin_str, Style::default().fg(Color::White)),
+                            ]));
+                            lines.push(Line::from(vec![
+                                Span::styled("   Phase Host    : ", Style::default().fg(Color::DarkGray)),
+                                Span::styled(host_str, Style::default().fg(Color::White)),
+                                Span::styled(format!(" (Org: {})", org_str), Style::default().fg(Color::DarkGray)),
+                            ]));
+                            lines.push(Line::from(""));
+                            lines.push(Line::from(Span::styled(
+                                "Native CLI uses `phase apps` & secrets export.",
+                                Style::default().fg(Color::DarkGray),
+                            )));
+                        } else {
+                            lines.extend(modern_vertical_radio_options(
+                                "2. Server Mode:",
+                                &[
+                                    ("cloud", "Official Cloud (https://console.phase.dev)"),
+                                    ("self_hosted", "Self-Hosted Console (Custom URL)"),
+                                ],
+                                if *host_mode == HostMode::Cloud { 0 } else { 1 },
+                                *active_field == 1,
+                            ));
+                            lines.push(Line::from(""));
+
+                            if *host_mode == HostMode::SelfHosted {
+                                lines.extend(modern_input_lines(
+                                    "3. Self-Hosted URL:",
+                                    custom_url,
+                                    "https://phase.yourdomain.com",
+                                    *active_field == 2,
+                                    42,
+                                    self.input_cursor,
+                                ));
+                                lines.push(Line::from(""));
+                            }
+
+                            let pat_idx = if *host_mode == HostMode::Cloud { 2 } else { 3 };
+                            let masked_pat = if pat_token.len() > 18 {
+                                format!("{}...{}", &pat_token[..14], &pat_token[pat_token.len() - 4..])
+                            } else {
+                                pat_token.clone()
+                            };
+
+                            lines.extend(modern_input_lines(
+                                "Phase API Token (pss_user:... / pss_service:...):",
+                                &masked_pat,
+                                "Enter or paste PAT token",
+                                *active_field == pat_idx,
+                                42,
+                                self.input_cursor,
+                            ));
+                        }
+                    }
+                }
 
                 if let Some(err) = error {
                     lines.push(Line::from(""));
@@ -3280,87 +3483,62 @@ impl App {
 
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(1), Constraint::Length(1)])
+                    .constraints([Constraint::Min(1), Constraint::Length(1), Constraint::Length(1)])
                     .split(inner);
 
                 let key_style = Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD);
-                let sec_style = Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD);
                 let desc_style = Style::default().fg(Color::White);
 
                 let lines = vec![
-                    Line::from(Span::styled(
-                        "Keyboard Shortcuts & Mouse Controls",
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                    )),
-                    Line::from(""),
-                    Line::from(Span::styled("Mouse Actions", sec_style)),
                     Line::from(vec![
-                        Span::styled("  Left Click         ", key_style),
-                        Span::styled("Focus pane, select item, toggle [✓] collection, or click buttons", desc_style),
+                        Span::styled("  [Ctrl+N]           ", key_style),
+                        Span::styled("Create a new collection", desc_style),
                     ]),
-                    Line::from(vec![
-                        Span::styled("  Right Click        ", key_style),
-                        Span::styled("Select item & open Context Menu (Edit, Delete, Toggle, etc.)", desc_style),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("  Scroll Wheel       ", key_style),
-                        Span::styled("Scroll items in the hovered pane or context menu", desc_style),
-                    ]),
-                    Line::from(""),
-                    Line::from(Span::styled("Collection & Variable Actions", sec_style)),
                     Line::from(vec![
                         Span::styled("  [Space]            ", key_style),
                         Span::styled("Toggle selected collection ON / OFF", desc_style),
                     ]),
                     Line::from(vec![
                         Span::styled("  [u / d]            ", key_style),
-                        Span::styled("Move Priority up / down (top collection wins)", desc_style),
+                        Span::styled("Move priority up / down (top collection wins)", desc_style),
                     ]),
                     Line::from(vec![
-                        Span::styled("  [n]                ", key_style),
-                        Span::styled("Create a New Collection (Custom or Phase.dev)", desc_style),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("  [a]                ", key_style),
+                        Span::styled("  [Ctrl+A]           ", key_style),
                         Span::styled("Add a custom environment variable", desc_style),
                     ]),
                     Line::from(vec![
-                        Span::styled("  [e / Enter]        ", key_style),
+                        Span::styled("  [Ctrl+E / Enter]   ", key_style),
                         Span::styled("Edit selected collection or variable", desc_style),
                     ]),
                     Line::from(vec![
-                        Span::styled("  [x / Delete]       ", key_style),
+                        Span::styled("  [Delete]           ", key_style),
                         Span::styled("Delete selected collection or variable", desc_style),
                     ]),
-                    Line::from(""),
-                    Line::from(Span::styled("Phase.dev, View & System", sec_style)),
                     Line::from(vec![
-                        Span::styled("  [p / P]            ", key_style),
-                        Span::styled("Sync Phase.dev secrets / Rebind Phase App & Env", desc_style),
+                        Span::styled("  [Ctrl+R]           ", key_style),
+                        Span::styled("Show or hide masked secret values", desc_style),
                     ]),
                     Line::from(vec![
-                        Span::styled("  [c]                ", key_style),
-                        Span::styled("Configure Phase.dev authentication (CLI / Token)", desc_style),
+                        Span::styled("  [Ctrl+B]           ", key_style),
+                        Span::styled("Sync the selected environment", desc_style),
                     ]),
                     Line::from(vec![
-                        Span::styled("  [v]                ", key_style),
-                        Span::styled("Show / Hide (mask) secret values", desc_style),
+                        Span::styled("  [Ctrl+Shift+B]     ", key_style),
+                        Span::styled("Sync all environments", desc_style),
                     ]),
                     Line::from(vec![
-                        Span::styled("  [s]                ", key_style),
-                        Span::styled("Open application Settings", desc_style),
+                        Span::styled("  [Ctrl+S]           ", key_style),
+                        Span::styled("Save encrypted state and reload the environment", desc_style),
                     ]),
                     Line::from(vec![
-                        Span::styled("  [r]                ", key_style),
-                        Span::styled("Save encrypted state & reload shell environment", desc_style),
+                        Span::styled("  [Ctrl+P]           ", key_style),
+                        Span::styled("Open application settings", desc_style),
                     ]),
                     Line::from(vec![
                         Span::styled("  [Tab / Shift+Tab]  ", key_style),
-                        Span::styled("Cycle focus between Collections, Variables, and Effective panes", desc_style),
+                        Span::styled("Cycle focus between panes", desc_style),
                     ]),
                     Line::from(vec![
                         Span::styled("  [?] / [q]          ", key_style),
@@ -3373,7 +3551,7 @@ impl App {
                     chunks[0],
                 );
                 if let Some(btns) = get_modal_buttons(&self.modal) {
-                    render_modal_buttons(frame, chunks[1], btns);
+                    render_modal_buttons(frame, chunks[2], btns);
                 }
             }
         }
@@ -3700,7 +3878,8 @@ impl App {
     pub fn handle_paste(&mut self, pasted: &str) {
         let clean = pasted.trim_matches(|c| c == '\r' || c == '\n');
         match &mut self.modal {
-            Modal::PhaseConnect {
+            Modal::Settings {
+                tab: SettingsTab::PhaseAuth,
                 auth_method,
                 host_mode,
                 custom_url,
@@ -3782,7 +3961,14 @@ impl App {
             .constraints([Constraint::Min(1), Constraint::Length(1)])
             .split(block_inner);
 
-        let btn_chunk = chunks[1];
+        let btn_chunk = if matches!(self.modal, Modal::Help) {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(1), Constraint::Length(1)])
+                .split(block_inner)[2]
+        } else {
+            chunks[1]
+        };
 
         if let Some(btns) = get_modal_buttons(&self.modal) {
             let total_len = if btns.cancel.is_empty() {
@@ -3860,28 +4046,99 @@ impl App {
                 }
             }
             Modal::Settings {
-                active_field,
+                tab,
                 draft,
+                active_field,
+                auth_method,
+                host_mode,
+                cli_status,
+                custom_url,
+                pat_token,
                 ..
             } => {
-                let start_row = block_inner.y + 2;
-                if row >= start_row && row < start_row + 5 {
-                    let idx = (row - start_row) as usize;
-                    *active_field = idx;
-                    if col >= block_inner.x + 36 {
-                        match idx {
-                            0 => {
+                if row == block_inner.y {
+                    let pref_tab_end = block_inner.x + 15;
+                    let phase_tab_end = block_inner.x + 33;
+                    if col <= pref_tab_end {
+                        *tab = SettingsTab::Preferences;
+                        *active_field = 0;
+                    } else if col <= phase_tab_end {
+                        *tab = SettingsTab::PhaseAuth;
+                        *active_field = 0;
+                    }
+                    return;
+                }
+
+                match tab {
+                    SettingsTab::Preferences => {
+                        let start_row = block_inner.y + 4;
+                        if row == start_row {
+                            *active_field = 0;
+                            if col >= block_inner.x + 36 {
                                 draft.sync_only_enabled_collections =
-                                    !draft.sync_only_enabled_collections
+                                    !draft.sync_only_enabled_collections;
                             }
-                            1 => draft.phase_export_all_paths = !draft.phase_export_all_paths,
-                            2 => draft.mask_secrets_by_default = !draft.mask_secrets_by_default,
-                            3 => {
+                        } else if row == start_row + 2 {
+                            *active_field = 1;
+                            if col >= block_inner.x + 36 {
                                 draft.insert_new_collection_at_top =
-                                    !draft.insert_new_collection_at_top
+                                    !draft.insert_new_collection_at_top;
                             }
-                            4 => draft.shell_prompt_hook = !draft.shell_prompt_hook,
-                            _ => {}
+                        } else if row == start_row + 4 {
+                            *active_field = 2;
+                            if col >= block_inner.x + 36 {
+                                draft.shell_prompt_hook = !draft.shell_prompt_hook;
+                            }
+                        }
+                    }
+                    SettingsTab::PhaseAuth => {
+                        if row == block_inner.y + 4 {
+                            *active_field = 0;
+                        } else if row == block_inner.y + 5 {
+                            *active_field = 0;
+                            *auth_method = PhaseAuthMethod::Cli;
+                            *cli_status = detect_phase_cli_detailed();
+                        } else if row == block_inner.y + 6 {
+                            *active_field = 0;
+                            *auth_method = PhaseAuthMethod::Token;
+                        } else if *auth_method == PhaseAuthMethod::Token {
+                            if row == block_inner.y + 8 {
+                                *active_field = 1;
+                            } else if row == block_inner.y + 9 {
+                                *active_field = 1;
+                                *host_mode = HostMode::Cloud;
+                            } else if row == block_inner.y + 10 {
+                                *active_field = 1;
+                                *host_mode = HostMode::SelfHosted;
+                            } else if *host_mode == HostMode::SelfHosted {
+                                if row >= block_inner.y + 12 && row <= block_inner.y + 13 {
+                                    *active_field = 2;
+                                    if col >= block_inner.x + 6 {
+                                        self.input_cursor = ((col - (block_inner.x + 6)) as usize)
+                                            .min(custom_url.chars().count());
+                                    } else {
+                                        self.input_cursor = custom_url.chars().count();
+                                    }
+                                } else if row >= block_inner.y + 15 && row <= block_inner.y + 16 {
+                                    *active_field = 3;
+                                    if col >= block_inner.x + 6 {
+                                        self.input_cursor = ((col - (block_inner.x + 6)) as usize)
+                                            .min(pat_token.chars().count());
+                                    } else {
+                                        self.input_cursor = pat_token.chars().count();
+                                    }
+                                }
+                            } else if *host_mode == HostMode::Cloud
+                                && row >= block_inner.y + 12 && row <= block_inner.y + 13
+                            {
+                                *active_field = 2;
+                                if col >= block_inner.x + 6 {
+                                    self.input_cursor = ((col - (block_inner.x + 6)) as usize)
+                                        .min(pat_token.chars().count());
+                                } else {
+                                    self.input_cursor = pat_token.chars().count();
+                                }
+                            }
                         }
                     }
                 }
@@ -3889,59 +4146,37 @@ impl App {
             Modal::PhasePicker {
                 selected_app,
                 selected_env,
-                selecting_env,
+                picker_step,
+                export_all_paths,
                 apps,
                 ..
             } => {
                 let list_start_y = block_inner.y + 1;
-                let list_end_y = btn_chunk.y.saturating_sub(1);
-                if row >= list_start_y && row < list_end_y {
+                let path_scope_start_y = btn_chunk.y.saturating_sub(3);
+                if row >= list_start_y && row < path_scope_start_y {
                     let offset = (row - list_start_y) as usize;
                     let mid_x = block_inner.x + block_inner.width / 2;
                     if col < mid_x {
                         if offset < apps.len() {
                             *selected_app = offset;
                             *selected_env = 0;
-                            *selecting_env = false;
+                            *picker_step = 0;
+                            if let Some(app) = apps.get_mut(offset) {
+                                if app.environments.iter().any(|e| e.var_count.is_none()) {
+                                    populate_app_env_var_counts(&self.data.phase, app);
+                                }
+                            }
                         }
                     } else if let Some(app) = apps.get(*selected_app) {
                         if offset < app.environments.len() {
                             *selected_env = offset;
-                            *selecting_env = true;
+                            *picker_step = 1;
                         }
                     }
-                }
-            }
-            Modal::PhaseConnect {
-                active_field,
-                auth_method,
-                host_mode,
-                ..
-            } => {
-                if row == block_inner.y + 2 {
-                    *active_field = 0;
-                } else if row == block_inner.y + 3 {
-                    *active_field = 0;
-                    *auth_method = PhaseAuthMethod::Cli;
-                } else if row == block_inner.y + 4 {
-                    *active_field = 0;
-                    *auth_method = PhaseAuthMethod::Token;
-                } else if *auth_method == PhaseAuthMethod::Token {
-                    if row == block_inner.y + 6 {
-                        *active_field = 1;
-                    } else if row == block_inner.y + 7 {
-                        *active_field = 1;
-                        *host_mode = HostMode::Cloud;
-                    } else if row == block_inner.y + 8 {
-                        *active_field = 1;
-                        *host_mode = HostMode::SelfHosted;
-                    } else if *host_mode == HostMode::SelfHosted
-                        && (row >= block_inner.y + 10 && row <= block_inner.y + 11)
-                    {
-                        *active_field = 2;
-                    } else if row >= block_inner.y + 12 {
-                        let pat_idx = if *host_mode == HostMode::Cloud { 2 } else { 3 };
-                        *active_field = pat_idx;
+                } else if row >= path_scope_start_y && row < btn_chunk.y {
+                    *picker_step = 2;
+                    if col >= block_inner.x + 3 && col <= block_inner.x + 35 {
+                        *export_all_paths = !*export_all_paths;
                     }
                 }
             }
@@ -3967,10 +4202,9 @@ pub fn get_modal_rect(modal: &Modal, area: Rect) -> Rect {
         Modal::EditCollection { .. } => compact_modal_rect(58, 12, area),
         Modal::NewCollection { .. } => compact_modal_rect(64, 14, area),
         Modal::VarEditor { .. } => compact_modal_rect(64, 14, area),
-        Modal::Settings { .. } => compact_modal_rect(70, 16, area),
-        Modal::PhaseConnect { .. } => compact_modal_rect(70, 20, area),
-        Modal::PhasePicker { .. } => compact_modal_rect(70, 18, area),
-        Modal::Help => compact_modal_rect(74, 24, area),
+        Modal::Settings { .. } => compact_modal_rect(82, 23, area),
+        Modal::PhasePicker { .. } => compact_modal_rect(76, 20, area),
+        Modal::Help => compact_modal_rect(76, 20, area),
     }
 }
 
@@ -4004,21 +4238,33 @@ pub fn get_modal_buttons(modal: &Modal) -> Option<ModalButtons> {
             cancel: " [Cancel] ",
             is_danger: true,
         }),
-        Modal::Settings { .. } => Some(ModalButtons {
-            primary: " [Save] ",
-            cancel: " [Cancel] ",
-            is_danger: false,
-        }),
-        Modal::PhaseConnect { .. } => Some(ModalButtons {
-            primary: " [Connect] ",
-            cancel: " [Cancel] ",
-            is_danger: false,
-        }),
-        Modal::PhasePicker { .. } => Some(ModalButtons {
-            primary: " [Select] ",
-            cancel: " [Cancel] ",
-            is_danger: false,
-        }),
+        Modal::Settings { tab, .. } => match tab {
+            SettingsTab::Preferences => Some(ModalButtons {
+                primary: " [Save] ",
+                cancel: " [Cancel] ",
+                is_danger: false,
+            }),
+            SettingsTab::PhaseAuth => Some(ModalButtons {
+                primary: " [Connect / Save] ",
+                cancel: " [Cancel] ",
+                is_danger: false,
+            }),
+        },
+        Modal::PhasePicker { picker_step, .. } => {
+            if *picker_step < 2 {
+                Some(ModalButtons {
+                    primary: " [Next ▶] ",
+                    cancel: " [Cancel] ",
+                    is_danger: false,
+                })
+            } else {
+                Some(ModalButtons {
+                    primary: " [Connect & Import] ",
+                    cancel: " [Back] ",
+                    is_danger: false,
+                })
+            }
+        },
         Modal::Help => Some(ModalButtons {
             primary: " [Close] ",
             cancel: "",
@@ -4405,7 +4651,10 @@ pub fn run_tui() -> Result<(), String> {
         stdout,
         crossterm::terminal::EnterAlternateScreen,
         crossterm::event::EnableBracketedPaste,
-        crossterm::event::EnableMouseCapture
+        crossterm::event::EnableMouseCapture,
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        )
     )
     .map_err(|e| format!("Failed to enter alternate screen: {}", e))?;
 
@@ -4446,6 +4695,7 @@ pub fn run_tui() -> Result<(), String> {
 
     let _ = crossterm::execute!(
         terminal.backend_mut(),
+        crossterm::event::PopKeyboardEnhancementFlags,
         crossterm::event::DisableMouseCapture,
         crossterm::event::DisableBracketedPaste,
         crossterm::terminal::LeaveAlternateScreen
@@ -4502,15 +4752,15 @@ mod tests {
         // 1. Toggle OFF
         app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
         assert!(!app.data.collections[0].enabled);
-        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.status_message.is_empty(), "Toggle must not pop up a status message");
 
         // 2. Toggle ON
         app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
         assert!(app.data.collections[0].enabled);
-        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.status_message.is_empty(), "Toggle must not pop up a status message");
 
-        // 3. Edit (Rename) via 'e'
-        app.handle_key(KeyEvent::from(KeyCode::Char('e')));
+        // 3. Edit (Rename) via Ctrl+E
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
         match &app.modal {
             Modal::EditCollection {
                 collection_idx, name, ..
@@ -4531,8 +4781,10 @@ mod tests {
         assert_eq!(app.data.collections[0].name, "staging");
         app.handle_key(KeyEvent::from(KeyCode::Enter));
 
-        // 4. Delete via 'x'
+        // 4. Delete via Delete (bare 'x' is removed and does nothing)
         app.handle_key(KeyEvent::from(KeyCode::Char('x')));
+        assert!(matches!(app.modal, Modal::None));
+        app.handle_key(KeyEvent::from(KeyCode::Delete));
         assert!(matches!(app.modal, Modal::ConfirmDeleteCollection { .. }));
         app.handle_key(KeyEvent::from(KeyCode::Char('y')));
         assert!(app.data.collections.is_empty());
@@ -4557,13 +4809,13 @@ mod tests {
         assert_eq!(app.data.collections[0].name, "second_collection");
         assert_eq!(app.data.collections[1].name, "default");
         assert_eq!(app.selected_collection, 0);
-        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.status_message.is_empty(), "Move priority must not pop up a status message");
 
         app.handle_key(KeyEvent::from(KeyCode::Char('d')));
         assert_eq!(app.data.collections[0].name, "default");
         assert_eq!(app.data.collections[1].name, "second_collection");
         assert_eq!(app.selected_collection, 1);
-        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.status_message.is_empty(), "Move priority must not pop up a status message");
 
         app.handle_key(KeyEvent::from(KeyCode::Char('K')));
         assert_eq!(app.data.collections[1].name, "second_collection");
@@ -4576,12 +4828,12 @@ mod tests {
         let mut app = make_test_app();
 
         app.focus = FocusPane::Collections;
-        app.handle_key(KeyEvent::from(KeyCode::Char('e')));
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
         assert!(matches!(app.modal, Modal::EditCollection { .. }));
         app.modal = Modal::None;
 
         app.focus = FocusPane::Vars;
-        app.handle_key(KeyEvent::from(KeyCode::Char('e')));
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
         match &app.modal {
             Modal::VarEditor {
                 is_edit,
@@ -4598,7 +4850,7 @@ mod tests {
         app.modal = Modal::None;
 
         app.focus = FocusPane::Effective;
-        app.handle_key(KeyEvent::from(KeyCode::Char('e')));
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
         match &app.modal {
             Modal::VarEditor {
                 is_edit, var_key, ..
@@ -4622,25 +4874,26 @@ mod tests {
                     app_name: "MyService".to_string(),
                     env_id: "env1".to_string(),
                     env_name: "Production".to_string(),
+                    export_all_paths: true,
                 },
                 vec![("PHASE_SECRET".to_string(), "val123456".to_string())],
             ),
         );
         app.selected_collection = 0;
 
-        // Pressing 'a' on a Phase collection must NOT open VarEditor
-        app.handle_key(KeyEvent::from(KeyCode::Char('a')));
+        // Pressing Ctrl+A on a Phase collection must NOT open VarEditor
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
         assert!(matches!(app.modal, Modal::None));
         assert!(app.is_error_status);
 
-        // Pressing 'e' on Vars pane of a Phase collection must NOT open VarEditor
+        // Pressing Ctrl+E on Vars pane of a Phase collection must NOT open VarEditor
         app.focus = FocusPane::Vars;
-        app.handle_key(KeyEvent::from(KeyCode::Char('e')));
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
         assert!(matches!(app.modal, Modal::None));
         assert!(app.is_error_status);
 
-        // Pressing 'x' on Vars pane of a Phase collection must NOT open ConfirmDeleteVar
-        app.handle_key(KeyEvent::from(KeyCode::Char('x')));
+        // Pressing Delete on Vars pane of a Phase collection must NOT open ConfirmDeleteVar
+        app.handle_key(KeyEvent::from(KeyCode::Delete));
         assert!(matches!(app.modal, Modal::None));
         assert!(app.is_error_status);
     }
@@ -4650,8 +4903,8 @@ mod tests {
         let mut app = make_test_app();
         assert!(app.data.settings.sync_only_enabled_collections);
 
-        // Open settings with 's'
-        app.handle_key(KeyEvent::from(KeyCode::Char('s')));
+        // Open settings with Ctrl+P
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
         assert!(matches!(app.modal, Modal::Settings { .. }));
 
         // Field 0: toggle sync_only_enabled_collections with Space
@@ -4693,6 +4946,7 @@ mod tests {
                 app_name: "MyService".to_string(),
                 env_id: "env1".to_string(),
                 env_name: "Production".to_string(),
+                export_all_paths: true,
             },
             vec![("PHASE_KEY".to_string(), "val".to_string())],
         );
@@ -4803,9 +5057,23 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(content.contains("Keyboard Shortcuts & Mouse Controls"));
-        assert!(content.contains("Move Priority"));
-        assert!(content.contains("Right Click"));
+        let popup = get_modal_rect(&app.modal, app.last_area);
+        let popup_content: String = (popup.y..popup.y + popup.height)
+            .map(|y| {
+                (popup.x..popup.x + popup.width)
+                    .map(|x| buffer.get(x, y).symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(popup_content.contains("Keyboard Shortcuts & Help"));
+        assert!(popup_content.contains("Move priority up / down"));
+        assert!(popup_content.contains("Sync all environments"));
+        assert!(!popup_content.contains("Phase.dev"));
+        assert!(!popup_content.contains("phase.dev"));
+        assert!(!popup_content.contains("Mouse Actions"));
+        assert!(!popup_content.contains("Right Click"));
 
         // Close with '?' or Esc
         app.handle_key(KeyEvent::from(KeyCode::Esc));
@@ -5125,6 +5393,7 @@ mod tests {
             app_name: "my-app".to_string(),
             env_id: "env-1".to_string(),
             env_name: "prod".to_string(),
+            export_all_paths: true,
         });
 
         let backend = TestBackend::new(120, 30);
@@ -5442,6 +5711,7 @@ mod tests {
                 app_name: "my-app".to_string(),
                 env_id: "env-1".to_string(),
                 env_name: "production".to_string(),
+                export_all_paths: true,
             },
             vec![("DATABASE_URL".to_string(), "postgres://...".to_string())],
         ));
@@ -5518,6 +5788,8 @@ mod tests {
         assert!(!content_vars.contains("Mask Secret Values"));
         assert!(content_vars.contains("Copy Key"));
         assert!(content_vars.contains("Copy Value"));
+        assert!(content_vars.contains("[Y]"));
+        assert!(content_vars.contains("[Shift+Y]"));
         let vars_bracket_col = vars_menu_rect.x + vars_menu_rect.width - 3;
         for row in (vars_menu_rect.y + 1)..(vars_menu_rect.y + vars_menu_rect.height - 1) {
             let ch = buffer[(vars_bracket_col, row)].symbol();
@@ -5545,6 +5817,8 @@ mod tests {
         assert!(!content_eff.contains("Mask Secret Values"));
         assert!(content_eff.contains("Copy Key"));
         assert!(content_eff.contains("Copy Value"));
+        assert!(content_eff.contains("[Y]"));
+        assert!(content_eff.contains("[Shift+Y]"));
         let eff_bracket_col = eff_menu_rect.x + eff_menu_rect.width - 3;
         for row in (eff_menu_rect.y + 1)..(eff_menu_rect.y + eff_menu_rect.height - 1) {
             let ch = buffer[(eff_bracket_col, row)].symbol();
@@ -5709,6 +5983,7 @@ mod tests {
             app_name: "my-app".to_string(),
             env_id: "env-1".to_string(),
             env_name: "prod".to_string(),
+            export_all_paths: true,
         });
 
         app.set_info("Phase.dev sync in progress...");
@@ -5732,8 +6007,8 @@ mod tests {
         let mut app = make_test_app();
         assert!(!app.show_values);
 
-        // Press 'v' to show values
-        app.handle_key(KeyEvent::from(KeyCode::Char('v')));
+        // Press Ctrl+R to show values
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
         assert!(app.show_values);
         assert!(app.status_message.is_empty(), "Toggling mask must NOT set an informational prompt");
 
@@ -5755,6 +6030,7 @@ mod tests {
                     app_name: "MyService".to_string(),
                     env_id: "env1".to_string(),
                     env_name: "Production".to_string(),
+                    export_all_paths: true,
                 },
                 vec![("SECRET_TOKEN".to_string(), "super_secret_val_123".to_string())],
             ),
@@ -5784,8 +6060,8 @@ mod tests {
         assert!(!screen.contains("Edit Variable"), "Edit Variable must be hidden for Phase.dev collections");
         assert!(!screen.contains("Delete Variable"), "Delete Variable must be hidden for Phase.dev collections");
 
-        // 2. Sync Phase.dev must be present
-        assert!(screen.contains("Sync Phase.dev"));
+        // 2. Sync Environment must be present
+        assert!(screen.contains("Sync Environment"));
 
         // 3. Mask Secret Values must be removed
         assert!(!screen.contains("Mask Secret Values"));
@@ -5799,5 +6075,548 @@ mod tests {
         app.selected_var = 0;
         app.execute_context_action(ContextAction::CopyKey);
         app.execute_context_action(ContextAction::CopyValue);
+    }
+
+    #[test]
+    fn test_sync_all_shortcut_shift_s() {
+        let mut app = make_test_app();
+        app.data.phase.auth_method = PhaseAuthMethod::Token;
+        app.data.phase.pat_token = "pss_user:token".to_string();
+        app.data.collections.push(Collection::new_phase(
+            "phase_test".to_string(),
+            PhaseBinding {
+                app_id: "app1".to_string(),
+                app_name: "App".to_string(),
+                env_id: "env1".to_string(),
+                env_name: "Env".to_string(),
+                export_all_paths: true,
+            },
+            vec![],
+        ));
+
+        // Press Ctrl+Shift+B
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL | KeyModifiers::SHIFT));
+        assert_eq!(app.pending_phase_sync, Some(PendingSyncTarget::All));
+        assert_eq!(app.status_message, "Phase.dev sync in progress...");
+    }
+
+    #[test]
+    fn test_shortcut_c_removed_and_settings_phase_auth_integration() {
+        let mut app = make_test_app();
+
+        // 1. Press 'c' -> should not open anything (modal remains None)
+        app.handle_key(KeyEvent::from(KeyCode::Char('c')));
+        assert!(matches!(app.modal, Modal::None));
+
+        // 2. Press Ctrl+P -> opens Settings on Preferences tab
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        match &app.modal {
+            Modal::Settings { tab, active_field, .. } => {
+                assert_eq!(*tab, SettingsTab::Preferences);
+                assert_eq!(*active_field, 0);
+            }
+            _ => panic!("Expected Modal::Settings"),
+        }
+
+        // 3. Switch to PhaseAuth tab with '2'
+        app.handle_key(KeyEvent::from(KeyCode::Char('2')));
+        match &app.modal {
+            Modal::Settings { tab, .. } => {
+                assert_eq!(*tab, SettingsTab::PhaseAuth);
+            }
+            _ => panic!("Expected Modal::Settings"),
+        }
+
+        // 4. Switch back to Preferences tab with '1'
+        app.handle_key(KeyEvent::from(KeyCode::Char('1')));
+        match &app.modal {
+            Modal::Settings { tab, .. } => {
+                assert_eq!(*tab, SettingsTab::Preferences);
+            }
+            _ => panic!("Expected Modal::Settings"),
+        }
+
+        // 5. Navigate with Tab to switch from Preferences to PhaseAuth tab
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        match &app.modal {
+            Modal::Settings { tab, .. } => {
+                assert_eq!(*tab, SettingsTab::PhaseAuth);
+            }
+            _ => panic!("Expected Modal::Settings"),
+        }
+    }
+
+    #[test]
+    fn test_secrets_always_masked_at_startup() {
+        let app = make_test_app();
+        assert!(!app.show_values, "Secret values must always be masked automatically at startup");
+    }
+
+    #[test]
+    fn test_settings_popup_dimensions_and_no_wrap() {
+        let mut app = make_test_app();
+        app.open_settings_modal();
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Verify label does NOT have "Phase" in collection sync scope
+        assert!(screen.contains("Sync Collection Scope"), "Label must not contain Phase");
+        assert!(!screen.contains("Phase Sync Collection Scope"), "Label must not contain Phase");
+        // Verify other items are present and intact
+        assert!(screen.contains("New Collection Default Place"));
+        assert!(screen.contains("Shell Prompt Auto-Reload Hook"));
+        assert!(!screen.contains("Phase.dev Authentication Setup"));
+        assert!(screen.contains("[● Top]"));
+        assert!(screen.contains("[○ Bottom]"));
+        assert!(screen.contains("[ General ]"));
+        assert!(screen.contains("[ Phase.dev ]"));
+
+        // Verify modal rect has width 82, height 23 on 120-wide terminal
+        let rect = get_modal_rect(&app.modal, Rect::new(0, 0, 120, 30));
+        assert_eq!(rect.width, 82);
+        assert_eq!(rect.height, 23);
+    }
+
+    #[test]
+    fn test_phase_picker_flow_three_steps_and_path_scope() {
+        let mut app = make_test_app();
+        let test_apps = vec![PhaseAppInfo {
+            id: "app-1".to_string(),
+            name: "BackendApp".to_string(),
+            environments: vec![
+                crate::phase::PhaseEnvInfo {
+                    id: "env-1".to_string(),
+                    name: "production".to_string(),
+                    identity_key: String::new(),
+                    wrapped_seed: String::new(),
+                    wrapped_salt: String::new(),
+                    var_count: Some(5),
+                },
+            ],
+        }];
+
+        app.modal = Modal::PhasePicker {
+            target_collection_idx: None,
+            new_collection_name: Some("imported_phase".to_string()),
+            apps: test_apps,
+            selected_app: 0,
+            selected_env: 0,
+            picker_step: 0,
+            export_all_paths: true,
+            error: None,
+        };
+
+        // Draw and verify:
+        // 1. App name is shown without environment count
+        // 2. Environment selector displays variable count ("production (5 vars)")
+        // 3. Path scope does NOT show the removed description line
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("BackendApp"));
+        assert!(!screen.contains("BackendApp ("));
+        assert!(screen.contains("production (5 vars)"));
+        assert!(!screen.contains("imports across all folder paths"));
+        assert!(!screen.contains("Press Space or Left/Right"));
+
+        // Step 0: Select App, press Enter -> advances to Step 1 (Select Environment)
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        match &app.modal {
+            Modal::PhasePicker { picker_step, .. } => assert_eq!(*picker_step, 1),
+            _ => panic!("Expected PhasePicker at step 1"),
+        }
+
+        // Step 1: Select Environment, press Enter -> advances to Step 2 (Choose Path Scope)
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        match &app.modal {
+            Modal::PhasePicker { picker_step, export_all_paths, .. } => {
+                assert_eq!(*picker_step, 2);
+                assert!(*export_all_paths);
+            }
+            _ => panic!("Expected PhasePicker at step 2"),
+        }
+
+        // Step 2: Toggle path scope with Space -> switches export_all_paths to false (root only)
+        app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        match &app.modal {
+            Modal::PhasePicker { picker_step, export_all_paths, .. } => {
+                assert_eq!(*picker_step, 2);
+                assert!(!*export_all_paths);
+            }
+            _ => panic!("Expected PhasePicker at step 2 with export_all_paths == false"),
+        }
+
+        // Press Esc -> goes back to step 1
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        match &app.modal {
+            Modal::PhasePicker { picker_step, .. } => assert_eq!(*picker_step, 1),
+            _ => panic!("Expected PhasePicker at step 1"),
+        }
+    }
+
+    #[test]
+    fn test_phase_auth_vertical_arrow_navigation() {
+        let mut app = make_test_app();
+        app.data.phase.host_mode = HostMode::Cloud;
+        app.open_settings_modal_with_tab(SettingsTab::PhaseAuth, None, None);
+
+        // Initial state on PhaseAuth: active_field = 0, auth_method = Cli
+        match &app.modal {
+            Modal::Settings { active_field, auth_method, .. } => {
+                assert_eq!(*active_field, 0);
+                assert_eq!(*auth_method, PhaseAuthMethod::Cli);
+            }
+            _ => panic!("Expected Modal::Settings"),
+        }
+
+        // Right arrow does NOT change auth_method (only vertical Up/Down)
+        app.handle_key(KeyEvent::from(KeyCode::Right));
+        match &app.modal {
+            Modal::Settings { auth_method, .. } => assert_eq!(*auth_method, PhaseAuthMethod::Cli),
+            _ => panic!("Expected Modal::Settings"),
+        }
+
+        // Down arrow on CLI switches to API Token (option below)
+        app.handle_key(KeyEvent::from(KeyCode::Down));
+        match &app.modal {
+            Modal::Settings { active_field, auth_method, .. } => {
+                assert_eq!(*active_field, 0);
+                assert_eq!(*auth_method, PhaseAuthMethod::Token);
+            }
+            _ => panic!("Expected Modal::Settings"),
+        }
+
+        // Down arrow on API Token advances to field 1 (Server Mode)
+        app.handle_key(KeyEvent::from(KeyCode::Down));
+        match &app.modal {
+            Modal::Settings { active_field, host_mode, .. } => {
+                assert_eq!(*active_field, 1);
+                assert_eq!(*host_mode, HostMode::Cloud);
+            }
+            _ => panic!("Expected Modal::Settings"),
+        }
+
+        // Down arrow on Cloud switches to Self-Hosted (option below)
+        app.handle_key(KeyEvent::from(KeyCode::Down));
+        match &app.modal {
+            Modal::Settings { active_field, host_mode, .. } => {
+                assert_eq!(*active_field, 1);
+                assert_eq!(*host_mode, HostMode::SelfHosted);
+            }
+            _ => panic!("Expected Modal::Settings"),
+        }
+
+        // Down arrow on Self-Hosted advances to field 2 (Self-Hosted URL)
+        app.handle_key(KeyEvent::from(KeyCode::Down));
+        match &app.modal {
+            Modal::Settings { active_field, .. } => assert_eq!(*active_field, 2),
+            _ => panic!("Expected Modal::Settings"),
+        }
+
+        // Down arrow on field 2 advances to field 3 (Phase API Token)
+        app.handle_key(KeyEvent::from(KeyCode::Down));
+        match &app.modal {
+            Modal::Settings { active_field, .. } => assert_eq!(*active_field, 3),
+            _ => panic!("Expected Modal::Settings"),
+        }
+
+        // Up arrow on field 3 moves to field 2 (URL)
+        app.handle_key(KeyEvent::from(KeyCode::Up));
+        match &app.modal {
+            Modal::Settings { active_field, .. } => assert_eq!(*active_field, 2),
+            _ => panic!("Expected Modal::Settings"),
+        }
+
+        // Up arrow on field 2 moves to field 1 (Server Mode: Self-Hosted)
+        app.handle_key(KeyEvent::from(KeyCode::Up));
+        match &app.modal {
+            Modal::Settings { active_field, host_mode, .. } => {
+                assert_eq!(*active_field, 1);
+                assert_eq!(*host_mode, HostMode::SelfHosted);
+            }
+            _ => panic!("Expected Modal::Settings"),
+        }
+
+        // Up arrow on Self-Hosted switches to Cloud (option above)
+        app.handle_key(KeyEvent::from(KeyCode::Up));
+        match &app.modal {
+            Modal::Settings { active_field, host_mode, .. } => {
+                assert_eq!(*active_field, 1);
+                assert_eq!(*host_mode, HostMode::Cloud);
+            }
+            _ => panic!("Expected Modal::Settings"),
+        }
+
+        // Up arrow on Cloud moves to field 0 (Auth Method: Token)
+        app.handle_key(KeyEvent::from(KeyCode::Up));
+        match &app.modal {
+            Modal::Settings { active_field, auth_method, .. } => {
+                assert_eq!(*active_field, 0);
+                assert_eq!(*auth_method, PhaseAuthMethod::Token);
+            }
+            _ => panic!("Expected Modal::Settings"),
+        }
+
+        // Up arrow on Token switches to CLI (option above)
+        app.handle_key(KeyEvent::from(KeyCode::Up));
+        match &app.modal {
+            Modal::Settings { active_field, auth_method, .. } => {
+                assert_eq!(*active_field, 0);
+                assert_eq!(*auth_method, PhaseAuthMethod::Cli);
+            }
+            _ => panic!("Expected Modal::Settings"),
+        }
+    }
+
+    #[test]
+    fn test_phase_auth_mouse_clicks_on_radio_buttons() {
+        let mut app = make_test_app();
+        app.data.phase.host_mode = HostMode::Cloud;
+        app.last_area = Rect::new(0, 0, 120, 30);
+        app.open_settings_modal_with_tab(SettingsTab::PhaseAuth, None, None);
+
+        let popup = get_modal_rect(&app.modal, app.last_area);
+        let block_inner = Block::default()
+            .borders(Borders::ALL)
+            .padding(Padding::new(1, 1, 1, 0))
+            .inner(popup);
+
+        // Click row 6: "API Token" radio button
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: block_inner.x + 8,
+            row: block_inner.y + 6,
+            modifiers: KeyModifiers::empty(),
+        });
+        match &app.modal {
+            Modal::Settings { active_field, auth_method, .. } => {
+                assert_eq!(*active_field, 0);
+                assert_eq!(*auth_method, PhaseAuthMethod::Token);
+            }
+            _ => panic!("Expected Modal::Settings"),
+        }
+
+        // Click row 10: "Self-Hosted Console" radio button
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: block_inner.x + 8,
+            row: block_inner.y + 10,
+            modifiers: KeyModifiers::empty(),
+        });
+        match &app.modal {
+            Modal::Settings { active_field, host_mode, .. } => {
+                assert_eq!(*active_field, 1);
+                assert_eq!(*host_mode, HostMode::SelfHosted);
+            }
+            _ => panic!("Expected Modal::Settings"),
+        }
+
+        // Click row 9: "Official Cloud" radio button
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: block_inner.x + 8,
+            row: block_inner.y + 9,
+            modifiers: KeyModifiers::empty(),
+        });
+        match &app.modal {
+            Modal::Settings { active_field, host_mode, .. } => {
+                assert_eq!(*active_field, 1);
+                assert_eq!(*host_mode, HostMode::Cloud);
+            }
+            _ => panic!("Expected Modal::Settings"),
+        }
+
+        // Click row 5: "Phase CLI" radio button
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: block_inner.x + 8,
+            row: block_inner.y + 5,
+            modifiers: KeyModifiers::empty(),
+        });
+        match &app.modal {
+            Modal::Settings { active_field, auth_method, .. } => {
+                assert_eq!(*active_field, 0);
+                assert_eq!(*auth_method, PhaseAuthMethod::Cli);
+            }
+            _ => panic!("Expected Modal::Settings"),
+        }
+    }
+
+    #[test]
+    fn test_updated_keyboard_shortcuts() {
+        let mut app = make_test_app();
+
+        // 1. Create a new collection: Ctrl+N
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert!(matches!(app.modal, Modal::NewCollection { .. }));
+        app.modal = Modal::None;
+
+        // Bare 'n' should NOT create a collection
+        app.handle_key(KeyEvent::from(KeyCode::Char('n')));
+        assert!(matches!(app.modal, Modal::None));
+
+        // 2. Add custom environment variable: Ctrl+A
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert!(matches!(app.modal, Modal::VarEditor { is_edit: false, .. }));
+        app.modal = Modal::None;
+
+        // Bare 'a' should NOT add a variable
+        app.handle_key(KeyEvent::from(KeyCode::Char('a')));
+        assert!(matches!(app.modal, Modal::None));
+
+        // 3. Edit selected collection: Ctrl+E or Enter
+        app.focus = FocusPane::Collections;
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert!(matches!(app.modal, Modal::EditCollection { .. }));
+        app.modal = Modal::None;
+
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.modal, Modal::EditCollection { .. }));
+        app.modal = Modal::None;
+
+        // Bare 'e' should NOT edit
+        app.handle_key(KeyEvent::from(KeyCode::Char('e')));
+        assert!(matches!(app.modal, Modal::None));
+
+        // 4. Delete: Delete only; remove X
+        app.handle_key(KeyEvent::from(KeyCode::Char('x')));
+        assert!(matches!(app.modal, Modal::None), "Bare 'x' must be removed and do nothing");
+
+        app.handle_key(KeyEvent::from(KeyCode::Delete));
+        assert!(matches!(app.modal, Modal::ConfirmDeleteCollection { .. }));
+        app.modal = Modal::None;
+
+        // 5. Open application settings: Ctrl+P
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(matches!(app.modal, Modal::Settings { .. }));
+        app.modal = Modal::None;
+
+        // Bare 's' should NOT open settings
+        app.handle_key(KeyEvent::from(KeyCode::Char('s')));
+        assert!(matches!(app.modal, Modal::None));
+
+        // 6. Show or hide masked secret values: Ctrl+R (Reveal)
+        assert!(!app.show_values);
+        app.focus = FocusPane::Collections;
+        // Ctrl+R must toggle mask
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(app.show_values);
+        assert!(matches!(app.modal, Modal::None), "Ctrl+R must NOT open edit collection form");
+
+        // Bare 'r' should NOT toggle mask or reload
+        app.handle_key(KeyEvent::from(KeyCode::Char('r')));
+        assert!(app.show_values);
+        assert!(app.status_message.is_empty());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(!app.show_values);
+
+        // 7. Save encrypted state and reload environment: Ctrl+S
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(app.status_message.contains("Synced state.enc & shell environment"));
+        app.status_message.clear();
+
+        // Bare 'r' should NOT reload
+        app.handle_key(KeyEvent::from(KeyCode::Char('r')));
+        assert!(app.status_message.is_empty());
+
+        // 8. Sync selected environment: Ctrl+B on custom collection does NOTHING
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert!(app.status_message.is_empty(), "Sync on custom collection must do nothing");
+        assert_eq!(app.pending_phase_sync, None);
+
+        // 9. Sync all environments: Ctrl+Shift+B
+        app.data.collections.push(Collection::new_phase(
+            "phase_test".to_string(),
+            PhaseBinding {
+                app_id: "app1".to_string(),
+                app_name: "App".to_string(),
+                env_id: "env1".to_string(),
+                env_name: "Env".to_string(),
+                export_all_paths: true,
+            },
+            vec![],
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL | KeyModifiers::SHIFT));
+        assert_eq!(app.pending_phase_sync, Some(PendingSyncTarget::All));
+    }
+
+    #[test]
+    fn test_help_popup_no_phase_text_and_no_group_divisions() {
+        let mut app = make_test_app();
+        app.last_area = Rect::new(0, 0, 120, 30);
+        app.modal = Modal::Help;
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let popup = get_modal_rect(&app.modal, app.last_area);
+        let block_inner = Block::default()
+            .borders(Borders::ALL)
+            .padding(Padding::new(1, 1, 1, 0))
+            .inner(popup);
+
+        let popup_text: String = (popup.y..popup.y + popup.height)
+            .map(|y| {
+                (popup.x..popup.x + popup.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Verify no "phase.dev" or "Phase.dev" in the popup content
+        assert!(!popup_text.contains("Phase.dev"));
+        assert!(!popup_text.contains("phase.dev"));
+
+        // Verify group divisions and redundant header are removed
+        assert!(!popup_text.contains("Collection & Variable Actions"));
+        assert!(!popup_text.contains("Phase.dev, View & System"));
+
+        // Verify redundant header inside the box is gone (title is on top border only)
+        let inner_text: String = (block_inner.y..block_inner.y + block_inner.height.saturating_sub(2))
+            .map(|y| {
+                (block_inner.x..block_inner.x + block_inner.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!inner_text.contains("Keyboard Shortcuts & Help"));
+
+        // Verify all shortcuts are listed together
+        assert!(popup_text.contains("[Ctrl+N]"));
+        assert!(popup_text.contains("[Ctrl+A]"));
+        assert!(popup_text.contains("[Ctrl+E / Enter]"));
+        assert!(popup_text.contains("[Delete]"));
+        assert!(popup_text.contains("[Ctrl+R]"));
+        assert!(popup_text.contains("[Ctrl+B]"));
+        assert!(popup_text.contains("[Ctrl+Shift+B]"));
+        assert!(popup_text.contains("[Ctrl+S]"));
+        assert!(popup_text.contains("[Ctrl+P]"));
+        assert!(popup_text.contains("Cycle focus between panes"));
     }
 }

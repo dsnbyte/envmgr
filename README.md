@@ -50,19 +50,20 @@ When you want to sync secrets from Phase.dev:
 
 | Key | Action |
 |---|---|
+| `Ctrl+N` | Create a new collection |
 | `Space` | Toggle selected collection ON / OFF |
-| `u` | Move collection **UP** (higher priority) |
-| `d` | Move collection **DOWN** (lower priority) |
-| `Tab` | Switch between Collections, Variables, and Active System View |
-| `a` | Add custom manual variable |
-| `e` / `Enter` | Edit selected collection (rename) or variable |
-| `x` / `Del` | Delete selected variable or collection |
-| `n` | Create new collection (manual or pull from Phase) |
-| `p` | Pull secrets from Phase.dev into current target |
-| `c` | Open Phase.dev connection setup |
-| `v` | Show / Hide masked secret values |
-| `r` | **Reload Shell** (save encrypted state, verify `.bashrc`, and refresh environment) |
-| `q` | Quit (automatically injects updated variables into active terminal session) |
+| `u` / `d` | Move collection priority up / down |
+| `Ctrl+A` | Add a custom environment variable |
+| `Ctrl+E` / `Enter` | Edit selected collection or variable |
+| `Delete` | Delete selected collection or variable |
+| `Ctrl+R` | Show or hide masked secret values |
+| `Ctrl+B` | Sync selected environment |
+| `Ctrl+Shift+B` | Sync all environments |
+| `Ctrl+S` | Save encrypted state and reload shell environment |
+| `Ctrl+P` | Open application settings |
+| `Tab` / `Shift+Tab` | Cycle focus between panes |
+| `?` | Toggle shortcut info & help |
+| `q` | Quit application |
 
 ---
 
