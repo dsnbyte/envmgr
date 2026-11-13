@@ -9,6 +9,7 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -511,6 +512,8 @@ struct RawSecret {
     #[serde(default)]
     path: String,
     #[serde(default)]
+    comment: String,
+    #[serde(default)]
     override_val: Option<RawOverride>,
     #[serde(rename = "override")]
     override_field: Option<RawOverride>,
@@ -607,12 +610,37 @@ fn fetch_apps_and_envs_via_cli() -> Result<Vec<PhaseAppInfo>, String> {
     parse_cli_apps_json(&stdout)
 }
 
+#[derive(Debug, Deserialize)]
+struct CliSecretDetail {
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    comment: String,
+}
+
+pub fn parse_cli_secrets_comments(raw_json: &str) -> HashMap<String, String> {
+    let mut comments = HashMap::new();
+    let trimmed = raw_json.trim();
+    if let Ok(list) = serde_json::from_str::<Vec<CliSecretDetail>>(trimmed) {
+        for item in list {
+            if !item.key.is_empty() {
+                comments.insert(item.key, item.comment);
+            }
+        }
+    } else if let Ok(single) = serde_json::from_str::<CliSecretDetail>(trimmed) {
+        if !single.key.is_empty() {
+            comments.insert(single.key, single.comment);
+        }
+    }
+    comments
+}
+
 fn fetch_secrets_for_env_via_cli(
     app_id: &str,
     env_id: &str,
     env_name_hint: Option<&str>,
     export_all_paths: bool,
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<Vec<(String, String, String)>, String> {
     let Some(bin) = find_phase_binary() else {
         return Err("Phase CLI binary (`phase`) not found in PATH.".to_string());
     };
@@ -655,7 +683,41 @@ fn fetch_secrets_for_env_via_cli(
     }
 
     let stdout = String::from_utf8_lossy(&out.stdout);
-    parse_cli_secrets_json(&stdout)
+    let pairs = parse_cli_secrets_json(&stdout)?;
+    if pairs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut comments = HashMap::new();
+    let mut get_cmd = clean_phase_command(&bin_str);
+    get_cmd.args(["secrets", "get"]);
+    for (k, _) in &pairs {
+        get_cmd.arg(k);
+    }
+    if !app_id.trim().is_empty() {
+        get_cmd.args(["--app-id", app_id.trim()]);
+    }
+    get_cmd.args(["--env", &resolved_env_name]);
+    if export_all_paths {
+        get_cmd.args(["--path", ""]);
+    } else {
+        get_cmd.args(["--path", "/"]);
+    }
+
+    if let Ok(get_out) = get_cmd.output() {
+        if get_out.status.success() {
+            let get_stdout = String::from_utf8_lossy(&get_out.stdout);
+            comments = parse_cli_secrets_comments(&get_stdout);
+        }
+    }
+
+    let mut result = Vec::with_capacity(pairs.len());
+    for (k, v) in pairs {
+        let comment = comments.remove(&k).unwrap_or_default();
+        result.push((k, v, comment));
+    }
+
+    Ok(result)
 }
 
 /// Fetches the list of accessible Applications and Environments from Phase.dev
@@ -723,7 +785,7 @@ pub fn fetch_secrets_for_env(
     env_id: &str,
     env_name_hint: Option<&str>,
     export_all_paths: bool,
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<Vec<(String, String, String)>, String> {
     if config.auth_method == PhaseAuthMethod::Cli {
         return fetch_secrets_for_env_via_cli(app_id, env_id, env_name_hint, export_all_paths);
     }
@@ -802,8 +864,16 @@ pub fn fetch_secrets_for_env(
         } else {
             decrypt_asymmetric(val_cipher, &env_priv_key, &env_pub_key)?
         };
+        let comment_plain = if item.comment.is_empty() {
+            String::new()
+        } else if item.comment.starts_with("ph:v1:") {
+            decrypt_asymmetric(&item.comment, &env_priv_key, &env_pub_key)
+                .unwrap_or_else(|_| item.comment.clone())
+        } else {
+            item.comment.clone()
+        };
 
-        pairs.push((key_plain, val_plain));
+        pairs.push((key_plain, val_plain, comment_plain));
     }
 
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
@@ -990,5 +1060,58 @@ mod tests {
                 ("Z_KEY".to_string(), "z_val".to_string()),
             ]
         );
+
+        // Test parse_cli_secrets_comments with array of secrets
+        let details_array_json = r#"[
+            { "key": "A_KEY", "value": "a_val", "comment": "Primary API key" },
+            { "key": "Z_KEY", "value": "z_val", "comment": "Zero-index marker" }
+        ]"#;
+        let comments_map = parse_cli_secrets_comments(details_array_json);
+        assert_eq!(comments_map.get("A_KEY").map(String::as_str), Some("Primary API key"));
+        assert_eq!(comments_map.get("Z_KEY").map(String::as_str), Some("Zero-index marker"));
+
+        // Test parse_cli_secrets_comments with single secret object
+        let single_detail_json = r#"{ "key": "SINGLE_KEY", "value": "foo", "comment": "Single comment test" }"#;
+        let single_map = parse_cli_secrets_comments(single_detail_json);
+        assert_eq!(single_map.get("SINGLE_KEY").map(String::as_str), Some("Single comment test"));
+    }
+
+    #[test]
+    fn test_phase_encrypted_comment_decryption() {
+        let seed_hex = "102030405060708090a0b0c0d0e0f001112131415161718191a1b1c1d1e1f102";
+        let (server_pub_hex, server_priv_hex) =
+            generate_env_keypair(seed_hex).expect("derive keypair");
+
+        let client_seed = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+        let (client_pub_hex, client_priv_hex) =
+            generate_env_keypair(client_seed).expect("derive client keypair");
+
+        let server_pk = decode_hex_32(&server_pub_hex, "srv_pk").unwrap();
+        let client_pk = decode_hex_32(&client_pub_hex, "cli_pk").unwrap();
+        let client_sk = decode_hex_32(&client_priv_hex, "cli_sk").unwrap();
+
+        let shared = x25519_dalek::x25519(client_sk, server_pk);
+        let mut h = Blake2b512::new();
+        Digest::update(&mut h, shared);
+        Digest::update(&mut h, client_pk);
+        Digest::update(&mut h, server_pk);
+        let digest = h.finalize();
+        let mut client_tx = [0u8; 32];
+        client_tx.copy_from_slice(&digest[32..64]);
+
+        let nonce_bytes = [9u8; 24];
+        let cipher = XChaCha20Poly1305::new((&client_tx).into());
+        let mut ct = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce_bytes),
+                b"Postgres primary database URL".as_ref(),
+            )
+            .unwrap();
+        ct.extend_from_slice(&nonce_bytes);
+        let encrypted_comment = format!("ph:v1:{}:{}", client_pub_hex, BASE64.encode(&ct));
+
+        let decrypted =
+            decrypt_asymmetric(&encrypted_comment, &server_priv_hex, &server_pub_hex).unwrap();
+        assert_eq!(decrypted, "Postgres primary database URL");
     }
 }

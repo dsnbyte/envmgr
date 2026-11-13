@@ -63,7 +63,8 @@ pub enum Modal {
         original_index: Option<usize>,
         var_key: String,
         var_value: String,
-        active_field: usize, // 0 = key, 1 = value
+        var_comment: String,
+        active_field: usize, // 0 = key, 1 = value, 2 = comment
         error: Option<String>,
     },
     ConfirmDeleteCollection {
@@ -422,6 +423,7 @@ impl App {
                             original_index: None,
                             var_key: String::new(),
                             var_value: String::new(),
+                            var_comment: String::new(),
                             active_field: 0,
                             error: None,
                         };
@@ -659,6 +661,7 @@ impl App {
                 original_index: Some(self.selected_var),
                 var_key: var.key,
                 var_value: var.value,
+                var_comment: var.comment,
                 active_field: 1,
                 error: None,
             };
@@ -689,12 +692,14 @@ impl App {
                     self.focus = FocusPane::Vars;
                     let key = coll.vars[v_idx].key.clone();
                     let val = coll.vars[v_idx].value.clone();
+                    let comment = coll.vars[v_idx].comment.clone();
                     self.input_cursor = val.chars().count();
                     self.modal = Modal::VarEditor {
                         is_edit: true,
                         original_index: Some(v_idx),
                         var_key: key,
                         var_value: val,
+                        var_comment: comment,
                         active_field: 1,
                         error: None,
                     };
@@ -799,6 +804,7 @@ impl App {
                 original_index: None,
                 var_key: String::new(),
                 var_value: String::new(),
+                var_comment: String::new(),
                 active_field: 0,
                 error: None,
             };
@@ -1590,6 +1596,7 @@ impl App {
                 original_index,
                 mut var_key,
                 mut var_value,
+                mut var_comment,
                 mut active_field,
                 mut error,
             } => {
@@ -1597,16 +1604,34 @@ impl App {
                     KeyCode::Esc => {
                         return;
                     }
-                    KeyCode::Tab | KeyCode::Down | KeyCode::Up | KeyCode::BackTab => {
-                        active_field = 1 - active_field;
-                        self.input_cursor = if active_field == 0 { var_key.chars().count() } else { var_value.chars().count() };
+                    KeyCode::Tab | KeyCode::Down => {
+                        active_field = (active_field + 1) % 3;
+                        self.input_cursor = match active_field {
+                            0 => var_key.chars().count(),
+                            1 => var_value.chars().count(),
+                            _ => var_comment.chars().count(),
+                        };
+                        error = None;
+                    }
+                    KeyCode::Up | KeyCode::BackTab => {
+                        active_field = if active_field == 0 { 2 } else { active_field - 1 };
+                        self.input_cursor = match active_field {
+                            0 => var_key.chars().count(),
+                            1 => var_value.chars().count(),
+                            _ => var_comment.chars().count(),
+                        };
+                        error = None;
                     }
                     KeyCode::Left => {
                         self.input_cursor = self.input_cursor.saturating_sub(1);
                         error = None;
                     }
                     KeyCode::Right => {
-                        let len = if active_field == 0 { var_key.chars().count() } else { var_value.chars().count() };
+                        let len = match active_field {
+                            0 => var_key.chars().count(),
+                            1 => var_value.chars().count(),
+                            _ => var_comment.chars().count(),
+                        };
                         self.input_cursor = (self.input_cursor + 1).min(len);
                         error = None;
                     }
@@ -1618,44 +1643,54 @@ impl App {
                     KeyCode::End | KeyCode::Char('e')
                         if key.code == KeyCode::End || key.modifiers.contains(KeyModifiers::CONTROL) =>
                     {
-                        let len = if active_field == 0 { var_key.chars().count() } else { var_value.chars().count() };
+                        let len = match active_field {
+                            0 => var_key.chars().count(),
+                            1 => var_value.chars().count(),
+                            _ => var_comment.chars().count(),
+                        };
                         self.input_cursor = len;
                     }
                     KeyCode::Backspace => {
                         if self.input_cursor > 0 {
-                            if active_field == 0 {
-                                remove_char_at(&mut var_key, self.input_cursor - 1);
-                            } else {
-                                remove_char_at(&mut var_value, self.input_cursor - 1);
-                            }
+                            match active_field {
+                                0 => remove_char_at(&mut var_key, self.input_cursor - 1),
+                                1 => remove_char_at(&mut var_value, self.input_cursor - 1),
+                                _ => remove_char_at(&mut var_comment, self.input_cursor - 1),
+                            };
                             self.input_cursor -= 1;
                             error = None;
                         }
                     }
                     KeyCode::Delete => {
-                        if active_field == 0 {
-                            remove_char_at(&mut var_key, self.input_cursor);
-                        } else {
-                            remove_char_at(&mut var_value, self.input_cursor);
-                        }
+                        match active_field {
+                            0 => remove_char_at(&mut var_key, self.input_cursor),
+                            1 => remove_char_at(&mut var_value, self.input_cursor),
+                            _ => remove_char_at(&mut var_comment, self.input_cursor),
+                        };
                         error = None;
                     }
                     KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        if active_field == 0 {
-                            var_key.clear();
-                        } else {
-                            var_value.clear();
-                        }
+                        match active_field {
+                            0 => var_key.clear(),
+                            1 => var_value.clear(),
+                            _ => var_comment.clear(),
+                        };
                         self.input_cursor = 0;
                         error = None;
                     }
                     KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                         if active_field == 0 {
                             insert_char_at(&mut var_key, self.input_cursor, c);
-                        } else {
+                            self.input_cursor += 1;
+                        } else if active_field == 1 {
                             insert_char_at(&mut var_value, self.input_cursor, c);
+                            self.input_cursor += 1;
+                        } else if active_field == 2 {
+                            if var_comment.chars().count() < 100 {
+                                insert_char_at(&mut var_comment, self.input_cursor, c);
+                                self.input_cursor += 1;
+                            }
                         }
-                        self.input_cursor += 1;
                         error = None;
                     }
                     KeyCode::Enter => {
@@ -1672,22 +1707,20 @@ impl App {
                                         .to_string(),
                                 );
                             } else {
+                                let trimmed_comment: String = var_comment.trim().chars().take(100).collect();
                                 if is_edit {
                                     if let Some(idx) = original_index {
                                         if let Some(v) = coll.vars.get_mut(idx) {
                                             v.key = k.clone();
                                             v.set_value(var_value.clone());
+                                            v.comment = trimmed_comment;
                                         }
                                     }
                                 } else {
-                                    let _ = coll.upsert_custom_var(k.clone(), var_value.clone());
+                                    let _ = coll.upsert_custom_var(k.clone(), var_value.clone(), trimmed_comment);
                                 }
                                 self.clamp_selections();
-                                let target_name = self.current_target_title();
-                                self.sync_to_system(&format!(
-                                    "Saved variable '{}' in {}",
-                                    k, target_name
-                                ));
+                                self.sync_to_system_silent();
                                 return;
                             }
                         }
@@ -1700,6 +1733,7 @@ impl App {
                     original_index,
                     var_key,
                     var_value,
+                    var_comment,
                     active_field,
                     error,
                 };
@@ -2410,11 +2444,11 @@ impl App {
             .iter()
             .map(|v| {
                 let val_display = v.masked_display(self.show_values);
-                Row::new(vec![v.key.clone(), val_display])
+                Row::new(vec![v.key.clone(), val_display, v.comment.clone()])
             })
             .collect();
 
-        let header = Row::new(vec!["KEY", "VALUE"]).style(
+        let header = Row::new(vec!["KEY", "VALUE", "COMMENT"]).style(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -2451,8 +2485,9 @@ impl App {
         let table = Table::new(
             rows,
             [
-                Constraint::Percentage(26),
-                Constraint::Percentage(74),
+                Constraint::Percentage(24),
+                Constraint::Percentage(36),
+                Constraint::Percentage(40),
             ],
         )
         .header(header)
@@ -3018,6 +3053,7 @@ impl App {
                 is_edit,
                 var_key,
                 var_value,
+                var_comment,
                 active_field,
                 error,
                 ..
@@ -3067,6 +3103,15 @@ impl App {
                     var_value,
                     "enter secret or value...",
                     *active_field == 1,
+                    36,
+                    self.input_cursor,
+                ));
+                lines.push(Line::from(""));
+                lines.extend(modern_input_lines(
+                    "3. Comment (optional, max 100 chars):",
+                    var_comment,
+                    "enter comment...",
+                    *active_field == 2,
                     36,
                     self.input_cursor,
                 ));
@@ -3904,6 +3949,7 @@ impl App {
             Modal::VarEditor {
                 var_key,
                 var_value,
+                var_comment,
                 active_field,
                 error,
                 ..
@@ -3913,10 +3959,17 @@ impl App {
                         insert_char_at(var_key, self.input_cursor, c);
                         self.input_cursor += 1;
                     }
-                } else {
+                } else if *active_field == 1 {
                     for c in clean.chars() {
                         insert_char_at(var_value, self.input_cursor, c);
                         self.input_cursor += 1;
+                    }
+                } else if *active_field == 2 {
+                    for c in clean.chars() {
+                        if var_comment.chars().count() < 100 {
+                            insert_char_at(var_comment, self.input_cursor, c);
+                            self.input_cursor += 1;
+                        }
                     }
                 }
                 *error = None;
@@ -4003,7 +4056,7 @@ impl App {
                     *pull_from_phase = true;
                 }
             }
-            Modal::VarEditor { active_field, var_key, var_value, .. } => {
+            Modal::VarEditor { active_field, var_key, var_value, var_comment, .. } => {
                 if row >= block_inner.y + 2 && row <= block_inner.y + 3 {
                     *active_field = 0;
                     if col >= block_inner.x + 6 {
@@ -4017,6 +4070,13 @@ impl App {
                         self.input_cursor = ((col - (block_inner.x + 6)) as usize).min(var_value.chars().count());
                     } else {
                         self.input_cursor = var_value.chars().count();
+                    }
+                } else if row >= block_inner.y + 8 && row <= block_inner.y + 9 {
+                    *active_field = 2;
+                    if col >= block_inner.x + 6 {
+                        self.input_cursor = ((col - (block_inner.x + 6)) as usize).min(var_comment.chars().count());
+                    } else {
+                        self.input_cursor = var_comment.chars().count();
                     }
                 }
             }
@@ -4209,7 +4269,7 @@ pub fn get_modal_rect(modal: &Modal, area: Rect) -> Rect {
         }
         Modal::EditCollection { .. } => compact_modal_rect(58, 12, area),
         Modal::NewCollection { .. } => compact_modal_rect(64, 14, area),
-        Modal::VarEditor { .. } => compact_modal_rect(64, 14, area),
+        Modal::VarEditor { .. } => compact_modal_rect(64, 18, area),
         Modal::Settings { .. } => compact_modal_rect(82, 23, area),
         Modal::PhasePicker { .. } => compact_modal_rect(76, 20, area),
         Modal::Help => compact_modal_rect(76, 20, area),
@@ -4884,7 +4944,7 @@ mod tests {
                     env_name: "Production".to_string(),
                     export_all_paths: true,
                 },
-                vec![("PHASE_SECRET".to_string(), "val123456".to_string())],
+                vec![("PHASE_SECRET".to_string(), "val123456".to_string(), String::new())],
             ),
         );
         app.selected_collection = 0;
@@ -4956,7 +5016,7 @@ mod tests {
                 env_name: "Production".to_string(),
                 export_all_paths: true,
             },
-            vec![("PHASE_KEY".to_string(), "val".to_string())],
+            vec![("PHASE_KEY".to_string(), "val".to_string(), String::new())],
         );
         app.data.collections.push(phase_coll);
         app.selected_collection = 1;
@@ -5554,6 +5614,7 @@ mod tests {
             original_index: None,
             var_key: "NEW_KEY".to_string(),
             var_value: "new_value".to_string(),
+            var_comment: String::new(),
             active_field: 0,
             error: None,
         };
@@ -5721,7 +5782,7 @@ mod tests {
                 env_name: "production".to_string(),
                 export_all_paths: true,
             },
-            vec![("DATABASE_URL".to_string(), "postgres://...".to_string())],
+            vec![("DATABASE_URL".to_string(), "postgres://...".to_string(), String::new())],
         ));
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -6040,7 +6101,7 @@ mod tests {
                     env_name: "Production".to_string(),
                     export_all_paths: true,
                 },
-                vec![("SECRET_TOKEN".to_string(), "super_secret_val_123".to_string())],
+                vec![("SECRET_TOKEN".to_string(), "super_secret_val_123".to_string(), String::new())],
             ),
         );
         app.selected_collection = 0;
@@ -6865,5 +6926,132 @@ mod tests {
             }
             _ => panic!("Expected PhasePicker"),
         }
+    }
+
+    #[test]
+    fn test_save_new_custom_variable_without_popup_and_display_comment() {
+        let mut app = make_test_app();
+        let area = Rect::new(0, 0, 120, 30);
+        app.last_area = area;
+
+        // Open VarEditor to add a new custom variable
+        app.modal = Modal::VarEditor {
+            is_edit: false,
+            original_index: None,
+            var_key: "DATABASE_TIMEOUT".to_string(),
+            var_value: "30s".to_string(),
+            var_comment: "Timeout for client database queries".to_string(),
+            active_field: 0,
+            error: None,
+        };
+
+        // Press Enter to save the variable
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+
+        // 1. Modal must be closed
+        assert!(matches!(app.modal, Modal::None));
+
+        // 2. NO popup must be displayed! status_message must be empty!
+        assert!(app.status_message.is_empty(), "Saving custom variable must NOT display a status popup");
+
+        // 3. Variable must be added with key, value, and comment
+        let default_coll = &app.data.collections[0];
+        let var = default_coll.vars.iter().find(|v| v.key == "DATABASE_TIMEOUT").expect("variable exists");
+        assert_eq!(var.value, "30s");
+        assert_eq!(var.comment, "Timeout for client database queries");
+
+        // 4. Render and verify COMMENT column in upper-right panel (vars_pane)
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen_text: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen_text.contains("KEY"));
+        assert!(screen_text.contains("VALUE"));
+        assert!(screen_text.contains("COMMENT"));
+        assert!(screen_text.contains("Timeout for client database"));
+    }
+
+    #[test]
+    fn test_var_editor_comment_100_character_limit_and_navigation() {
+        let mut app = make_test_app();
+        app.focus = FocusPane::Vars;
+
+        // Open add variable modal via Ctrl+A
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert!(matches!(app.modal, Modal::VarEditor { active_field: 0, .. }));
+
+        // Tab to field 1 (VALUE), then Tab to field 2 (COMMENT)
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert!(matches!(app.modal, Modal::VarEditor { active_field: 1, .. }));
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert!(matches!(app.modal, Modal::VarEditor { active_field: 2, .. }));
+
+        // Typing characters up to 105 characters in COMMENT field
+        for _ in 0..105 {
+            app.handle_key(KeyEvent::from(KeyCode::Char('c')));
+        }
+        match &app.modal {
+            Modal::VarEditor { var_comment, .. } => {
+                assert_eq!(var_comment.chars().count(), 100, "Comment must be strictly limited to 100 characters");
+            }
+            _ => panic!("Expected VarEditor"),
+        }
+
+        // Up arrow navigates back to field 1
+        app.handle_key(KeyEvent::from(KeyCode::Up));
+        assert!(matches!(app.modal, Modal::VarEditor { active_field: 1, .. }));
+
+        // Up arrow navigates back to field 0
+        app.handle_key(KeyEvent::from(KeyCode::Up));
+        assert!(matches!(app.modal, Modal::VarEditor { active_field: 0, .. }));
+
+        // Up arrow wraps to field 2
+        app.handle_key(KeyEvent::from(KeyCode::Up));
+        assert!(matches!(app.modal, Modal::VarEditor { active_field: 2, .. }));
+    }
+
+    #[test]
+    fn test_phase_synced_collection_displays_comments_in_upper_right_panel() {
+        let mut app = make_test_app();
+        let phase_coll = Collection::new_phase(
+            "phase_prod".to_string(),
+            PhaseBinding {
+                app_id: "app1".to_string(),
+                app_name: "Backend".to_string(),
+                env_id: "env1".to_string(),
+                env_name: "Production".to_string(),
+                export_all_paths: true,
+            },
+            vec![
+                ("API_URL".to_string(), "https://api.phase.dev".to_string(), "Main Phase API endpoint".to_string()),
+            ],
+        );
+        app.data.collections.push(phase_coll);
+        app.selected_collection = 1;
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen_text: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen_text.contains("API_URL"));
+        assert!(screen_text.contains("Main Phase API endpoint"));
     }
 }

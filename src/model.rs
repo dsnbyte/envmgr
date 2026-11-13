@@ -219,6 +219,8 @@ pub struct EnvVar {
     pub key: String,
     pub value: String,
     #[serde(default)]
+    pub comment: String,
+    #[serde(default)]
     pub prefix: String,
     #[serde(default)]
     pub suffix: String,
@@ -237,11 +239,17 @@ pub fn compute_prefix_suffix(value: &str) -> (String, String) {
 }
 
 impl EnvVar {
+    #[allow(dead_code)]
     pub fn new(key: String, value: String, source: VarSource) -> Self {
+        Self::with_comment(key, value, String::new(), source)
+    }
+
+    pub fn with_comment(key: String, value: String, comment: String, source: VarSource) -> Self {
         let (prefix, suffix) = compute_prefix_suffix(&value);
         Self {
             key,
             value,
+            comment,
             prefix,
             suffix,
             source,
@@ -318,7 +326,11 @@ impl Collection {
         }
     }
 
-    pub fn new_phase(name: String, binding: PhaseBinding, fetched: Vec<(String, String)>) -> Self {
+    pub fn new_phase(
+        name: String,
+        binding: PhaseBinding,
+        fetched: Vec<(String, String, String)>,
+    ) -> Self {
         let mut coll = Self {
             name,
             enabled: true,
@@ -346,16 +358,21 @@ impl Collection {
     }
 
     /// Replaces the collection's variables exclusively with Phase.dev variables for the bound app/env.
-    pub fn set_phase_vars(&mut self, binding: PhaseBinding, fetched: Vec<(String, String)>) {
+    pub fn set_phase_vars(
+        &mut self,
+        binding: PhaseBinding,
+        fetched: Vec<(String, String, String)>,
+    ) {
         let app_name = binding.app_name.clone();
         let env_name = binding.env_name.clone();
         self.phase_binding = Some(binding);
         self.last_sync_epoch = Some(AppStateData::current_epoch_secs());
         self.vars.clear();
-        for (k, v) in fetched {
-            self.vars.push(EnvVar::new(
+        for (k, v, c) in fetched {
+            self.vars.push(EnvVar::with_comment(
                 k,
                 v,
+                c,
                 VarSource::Phase {
                     app_name: app_name.clone(),
                     env_name: env_name.clone(),
@@ -366,14 +383,19 @@ impl Collection {
 
     /// Upserts a custom variable if and only if this collection is a Custom collection.
     /// Returns an error if the collection is bound to Phase.dev.
-    pub fn upsert_custom_var(&mut self, key: String, value: String) -> Result<(), String> {
+    pub fn upsert_custom_var(
+        &mut self,
+        key: String,
+        value: String,
+        comment: String,
+    ) -> Result<(), String> {
         if self.is_phase() {
             return Err(format!(
                 "Collection '{}' is synchronized with Phase.dev; custom variables cannot be mixed.",
                 self.name
             ));
         }
-        AppStateData::upsert_custom_var(&mut self.vars, key, value);
+        AppStateData::upsert_custom_var(&mut self.vars, key, value, comment);
         Ok(())
     }
 
@@ -564,13 +586,24 @@ impl AppStateData {
             .collect()
     }
 
-    pub fn upsert_custom_var(target: &mut Vec<EnvVar>, key: String, value: String) {
+    pub fn upsert_custom_var(
+        target: &mut Vec<EnvVar>,
+        key: String,
+        value: String,
+        comment: String,
+    ) {
         target.retain(|v| matches!(v.source, VarSource::Custom));
+        let comment = if comment.chars().count() > 100 {
+            comment.chars().take(100).collect()
+        } else {
+            comment
+        };
         if let Some(existing) = target.iter_mut().find(|v| v.key == key) {
             existing.set_value(value);
+            existing.comment = comment;
             existing.source = VarSource::Custom;
         } else {
-            target.push(EnvVar::new(key, value, VarSource::Custom));
+            target.push(EnvVar::with_comment(key, value, comment, VarSource::Custom));
         }
     }
 }
@@ -774,12 +807,13 @@ mod tests {
         let mut phase_coll = Collection::new_phase(
             "phase_prod".to_string(),
             binding.clone(),
-            vec![("DB_URL".to_string(), "postgres://prod".to_string())],
+            vec![("DB_URL".to_string(), "postgres://prod".to_string(), "Prod DB connection".to_string())],
         );
         assert!(phase_coll.is_phase());
         assert!(!phase_coll.is_custom());
+        assert_eq!(phase_coll.vars[0].comment, "Prod DB connection");
         assert!(phase_coll
-            .upsert_custom_var("CUSTOM_KEY".to_string(), "123".to_string())
+            .upsert_custom_var("CUSTOM_KEY".to_string(), "123".to_string(), "comment".to_string())
             .is_err());
         assert_eq!(phase_coll.vars.len(), 1);
 
@@ -796,8 +830,9 @@ mod tests {
         // Custom collection strips any Phase vars on sanitize
         let mut custom_coll = Collection::new_custom("local_dev".to_string());
         custom_coll
-            .upsert_custom_var("LOCAL_PORT".to_string(), "8080".to_string())
+            .upsert_custom_var("LOCAL_PORT".to_string(), "8080".to_string(), "Local listening port".to_string())
             .unwrap();
+        assert_eq!(custom_coll.vars[0].comment, "Local listening port");
         custom_coll.vars.push(EnvVar::new(
             "PHASE_LEAK".to_string(),
             "secret".to_string(),
@@ -809,6 +844,17 @@ mod tests {
         custom_coll.sanitize_single_source();
         assert_eq!(custom_coll.vars.len(), 1);
         assert_eq!(custom_coll.vars[0].key, "LOCAL_PORT");
+    }
+
+    #[test]
+    fn test_custom_var_comment_100_char_limit() {
+        let mut coll = Collection::new_custom("dev".to_string());
+        let long_comment = "x".repeat(150);
+        coll.upsert_custom_var("MY_KEY".to_string(), "my_val".to_string(), long_comment)
+            .unwrap();
+        assert_eq!(coll.vars.len(), 1);
+        assert_eq!(coll.vars[0].comment.chars().count(), 100);
+        assert_eq!(coll.vars[0].comment, "x".repeat(100));
     }
 
     #[test]
