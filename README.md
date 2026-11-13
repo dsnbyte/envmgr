@@ -24,12 +24,12 @@ Super lightweight TUI environment manager written in Rust with whole-state AEAD 
 ## How It Works
 
 - **Encrypted State (`state.enc`)**:
-  - Profiles, variable keys, values, and Phase.dev tokens are serialized and encrypted with `ChaCha20-Poly1305` using a hardcoded source key (`HARDCODED_MASTER_KEY` in `src/model.rs`). Changing the encryption key requires updating the source code and rebuilding.
-- **Profiles & Priority**:
-  - `Profiles`: Can be toggled on/off independently. A predefined `default` profile is provided on initial setup and can be edited, renamed, deleted, or toggled like any other profile.
-  - `Priority (Top Wins)`: When multiple profiles are enabled, the profile highest in the list (index #1) takes precedence and overwrites duplicate keys from lower profiles. Reorder profile priority anytime using `u` (move up) or `d` (move down).
+  - Collections, variable keys, values, and Phase.dev tokens are serialized and encrypted with `ChaCha20-Poly1305` using a hardcoded source key (`HARDCODED_MASTER_KEY` in `src/model.rs`). Changing the encryption key requires updating the source code and rebuilding.
+- **Collections & Priority**:
+  - `Collections`: Can be toggled on/off independently. A predefined `default` collection is provided on initial setup and can be edited, renamed, deleted, or toggled like any other collection.
+  - `Priority (Top Wins)`: When multiple collections are enabled, the collection highest in the list (index #1) takes precedence and overwrites duplicate keys from lower collections. Reorder collection priority anytime using `u` (move up) or `d` (move down).
 - **Clean Unsets**:
-  - When you disable a profile, its variables don't linger in your shell session—`envmgr` tracks exported keys via `_ENVMGR_KEYS` and unsets removed ones on reload.
+  - When you disable a collection, its variables don't linger in your shell session—`envmgr` tracks exported keys via `_ENVMGR_KEYS` and unsets removed ones on reload.
 
 ---
 
@@ -41,8 +41,8 @@ When you want to sync secrets from Phase.dev:
 1. Press `c` to open the connection dialog.
 2. Select **Cloud** (uses `https://console.phase.dev`) or **Self-Hosted** (enter your custom console URL).
 3. Paste your Personal Access Token (PAT) or Service Token (`pss_user:v1:...` / `pss_service:v2:...`).
-4. Pull secrets into an existing profile (`p`) or when creating a new profile (`n`).
-5. Custom manual variables and Phase secrets coexist in the same profile.
+4. Pull secrets into an existing collection (`p`) or when creating a new collection (`n`).
+5. Custom manual variables and Phase secrets coexist in the same collection.
 
 ---
 
@@ -50,14 +50,14 @@ When you want to sync secrets from Phase.dev:
 
 | Key | Action |
 |---|---|
-| `Space` | Toggle selected profile ON / OFF |
-| `u` | Move profile **UP** (higher priority) |
-| `d` | Move profile **DOWN** (lower priority) |
-| `Tab` | Switch between Profiles, Variables, and Active System View |
+| `Space` | Toggle selected collection ON / OFF |
+| `u` | Move collection **UP** (higher priority) |
+| `d` | Move collection **DOWN** (lower priority) |
+| `Tab` | Switch between Collections, Variables, and Active System View |
 | `a` | Add custom manual variable |
-| `e` / `Enter` | Edit selected profile (rename) or variable |
-| `x` / `Del` | Delete selected variable or profile |
-| `n` | Create new profile (manual or pull from Phase) |
+| `e` / `Enter` | Edit selected collection (rename) or variable |
+| `x` / `Del` | Delete selected variable or collection |
+| `n` | Create new collection (manual or pull from Phase) |
 | `p` | Pull secrets from Phase.dev into current target |
 | `c` | Open Phase.dev connection setup |
 | `v` | Show / Hide masked secret values |
@@ -71,7 +71,7 @@ When you want to sync secrets from Phase.dev:
 - `envmgr` — Launch interactive TUI.
 - `envmgr reload` (or `envmgr apply`) — Save encrypted `state.enc`, verify `~/.bashrc`, and reload active shell environment.
 - `envmgr export` — Decrypt active variables from `state.enc` and output shell export statements to stdout.
-- `envmgr status` — Print active profiles and effective variable breakdown.
+- `envmgr status` — Print active collections and effective variable breakdown.
 
 ---
 

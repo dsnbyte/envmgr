@@ -14,14 +14,14 @@
 ## Core Architecture Principles
 - **Keep it Lightweight**: Avoid adding heavy dependencies or large runtime frameworks (such as SQLite/C database engines). Maintain sub-millisecond startup, small binary size, and zero external runtime dependencies.
 - **Priority Resolution Rule**:
-  - All variables belong to profiles. A predefined `default` profile is provided on initial setup and functions like any other profile (can be edited, renamed, deleted, or toggled).
-  - When multiple profiles are enabled, the profile highest in the list (index #1) takes precedence and overwrites duplicate keys from lower profiles. Reorder with `u` (up) and `d` (down).
+  - All variables belong to collections. A predefined `default` collection is provided on initial setup and functions like any other collection (can be edited, renamed, deleted, or toggled).
+  - When multiple collections are enabled, the collection highest in the list (index #1) takes precedence and overwrites duplicate keys from lower collections. Reorder with `u` (up) and `d` (down).
 - **Encrypted State Storage & Runtime Shell Injection**:
-  - All state (variables, keys, profiles, and Phase PAT tokens) is serialized as JSON and encrypted as a whole payload using **ChaCha20-Poly1305** AEAD (with a hardcoded master key in `src/model.rs`) into `~/.config/envmgr/state.enc` (or `$ENVMGR_CONFIG_DIR/state.enc`).
+  - All state (variables, keys, collections, and Phase PAT tokens) is serialized as JSON and encrypted as a whole payload using **ChaCha20-Poly1305** AEAD (with a hardcoded master key in `src/model.rs`) into `~/.config/envmgr/state.enc` (or `$ENVMGR_CONFIG_DIR/state.enc`).
   - Never write plaintext variable names or values to disk or into `~/.bashrc`.
   - `~/.bashrc` only contains the runtime evaluation hook (`eval "$(command envmgr export 2>/dev/null)"`) and the `envmgr()` shell wrapper function so variables are automatically injected into the active terminal session without manually running `source ~/.bashrc`.
   - Always clean up removed variables on reload (via `_ENVMGR_KEYS` unsetting).
 - **Phase.dev Decryption**:
   - Direct REST E2EE client using personal/service access tokens (`pss_user:` / `pss_service:`).
   - Preserves custom manual variables when synchronizing Phase secrets.
-  - Offline/unconfigured state must never block local variable and profile management.
+  - Offline/unconfigured state must never block local variable and collection management.

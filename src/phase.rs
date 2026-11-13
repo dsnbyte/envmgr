@@ -810,33 +810,33 @@ pub fn fetch_secrets_for_env(
     Ok(pairs)
 }
 
-/// Synchronizes Phase.dev profiles in `state`.
-/// If `only_profile_idx` is `Some(idx)`, syncs only that profile; otherwise syncs all eligible Phase profiles.
-/// Returns `(synced_profile_count, total_vars_fetched)`.
-pub fn sync_phase_profiles(
+/// Synchronizes Phase.dev collections in `state`.
+/// If `only_collection_idx` is `Some(idx)`, syncs only that collection; otherwise syncs all eligible Phase collections.
+/// Returns `(synced_collection_count, total_vars_fetched)`.
+pub fn sync_phase_collections(
     state: &mut AppStateData,
-    only_profile_idx: Option<usize>,
+    only_collection_idx: Option<usize>,
 ) -> Result<(usize, usize), String> {
     if !state.phase.is_configured() {
         return Err("Phase.dev authentication is not configured.".to_string());
     }
 
     let export_all_paths = state.settings.phase_export_all_paths;
-    let only_enabled = state.settings.sync_only_enabled_profiles && only_profile_idx.is_none();
+    let only_enabled = state.settings.sync_only_enabled_collections && only_collection_idx.is_none();
 
     let targets: Vec<(usize, crate::model::PhaseBinding)> = state
-        .profiles
+        .collections
         .iter()
         .enumerate()
-        .filter_map(|(idx, p)| {
-            if let Some(target_idx) = only_profile_idx {
+        .filter_map(|(idx, c)| {
+            if let Some(target_idx) = only_collection_idx {
                 if idx != target_idx {
                     return None;
                 }
-            } else if only_enabled && !p.enabled {
+            } else if only_enabled && !c.enabled {
                 return None;
             }
-            p.phase_binding.clone().map(|b| (idx, b))
+            c.phase_binding.clone().map(|b| (idx, b))
         })
         .collect();
 
@@ -844,7 +844,7 @@ pub fn sync_phase_profiles(
         return Ok((0, 0));
     }
 
-    let mut synced_profiles = 0;
+    let mut synced_collections = 0;
     let mut total_vars = 0;
 
     for (idx, binding) in targets {
@@ -856,14 +856,14 @@ pub fn sync_phase_profiles(
             export_all_paths,
         )?;
         total_vars += fetched.len();
-        if let Some(prof) = state.profiles.get_mut(idx) {
-            prof.set_phase_vars(binding, fetched);
-            synced_profiles += 1;
+        if let Some(coll) = state.collections.get_mut(idx) {
+            coll.set_phase_vars(binding, fetched);
+            synced_collections += 1;
         }
     }
 
     state.last_phase_sync_epoch = AppStateData::current_epoch_secs();
-    Ok((synced_profiles, total_vars))
+    Ok((synced_collections, total_vars))
 }
 
 #[cfg(test)]

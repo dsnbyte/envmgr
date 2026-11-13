@@ -183,18 +183,18 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppSettings {
-    /// When syncing Phase.dev profiles, only sync enabled profiles (default: true).
-    #[serde(default = "default_true")]
-    pub sync_only_enabled_profiles: bool,
+    /// When syncing Phase.dev collections, only sync enabled collections (default: true).
+    #[serde(default = "default_true", alias = "sync_only_enabled_profiles")]
+    pub sync_only_enabled_collections: bool,
     /// Export secrets across all Phase paths (`--path ""`) instead of root `/` only (default: true).
     #[serde(default = "default_true")]
     pub phase_export_all_paths: bool,
     /// Mask secret values by default when launching the TUI (default: true).
     #[serde(default = "default_true")]
     pub mask_secrets_by_default: bool,
-    /// Insert newly created profiles at top priority (#1) instead of bottom (default: true).
-    #[serde(default = "default_true")]
-    pub insert_new_profile_at_top: bool,
+    /// Insert newly created collections at top priority (#1) instead of bottom (default: true).
+    #[serde(default = "default_true", alias = "insert_new_profile_at_top")]
+    pub insert_new_collection_at_top: bool,
     /// Enable live shell prompt auto-reload hook in ~/.bashrc (default: true).
     #[serde(default = "default_true")]
     pub shell_prompt_hook: bool,
@@ -203,10 +203,10 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            sync_only_enabled_profiles: true,
+            sync_only_enabled_collections: true,
             phase_export_all_paths: true,
             mask_secrets_by_default: true,
-            insert_new_profile_at_top: true,
+            insert_new_collection_at_top: true,
             shell_prompt_hook: true,
         }
     }
@@ -285,7 +285,7 @@ pub struct PhaseBinding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Profile {
+pub struct Collection {
     pub name: String,
     pub enabled: bool,
     pub phase_binding: Option<PhaseBinding>,
@@ -294,7 +294,7 @@ pub struct Profile {
     pub vars: Vec<EnvVar>,
 }
 
-impl Profile {
+impl Collection {
     pub fn new_custom(name: String) -> Self {
         Self {
             name,
@@ -306,15 +306,15 @@ impl Profile {
     }
 
     pub fn new_phase(name: String, binding: PhaseBinding, fetched: Vec<(String, String)>) -> Self {
-        let mut prof = Self {
+        let mut coll = Self {
             name,
             enabled: true,
             phase_binding: Some(binding.clone()),
             last_sync_epoch: Some(AppStateData::current_epoch_secs()),
             vars: Vec::new(),
         };
-        prof.set_phase_vars(binding, fetched);
-        prof
+        coll.set_phase_vars(binding, fetched);
+        coll
     }
 
     pub fn is_phase(&self) -> bool {
@@ -332,7 +332,7 @@ impl Profile {
         }
     }
 
-    /// Replaces the profile's variables exclusively with Phase.dev variables for the bound app/env.
+    /// Replaces the collection's variables exclusively with Phase.dev variables for the bound app/env.
     pub fn set_phase_vars(&mut self, binding: PhaseBinding, fetched: Vec<(String, String)>) {
         let app_name = binding.app_name.clone();
         let env_name = binding.env_name.clone();
@@ -351,12 +351,12 @@ impl Profile {
         }
     }
 
-    /// Upserts a custom variable if and only if this profile is a Custom profile.
-    /// Returns an error if the profile is bound to Phase.dev.
+    /// Upserts a custom variable if and only if this collection is a Custom collection.
+    /// Returns an error if the collection is bound to Phase.dev.
     pub fn upsert_custom_var(&mut self, key: String, value: String) -> Result<(), String> {
         if self.is_phase() {
             return Err(format!(
-                "Profile '{}' is synchronized with Phase.dev; custom variables cannot be mixed.",
+                "Collection '{}' is synchronized with Phase.dev; custom variables cannot be mixed.",
                 self.name
             ));
         }
@@ -364,7 +364,7 @@ impl Profile {
         Ok(())
     }
 
-    /// Ensures the profile contains variables from only one data source matching its profile type.
+    /// Ensures the collection contains variables from only one data source matching its collection type.
     pub fn sanitize_single_source(&mut self) {
         if let Some(binding) = &self.phase_binding {
             let app_name = binding.app_name.clone();
@@ -423,8 +423,8 @@ impl EffectiveVar {
 pub struct AppStateData {
     #[serde(default)]
     pub phase: PhaseConfig,
-    #[serde(default)]
-    pub profiles: Vec<Profile>,
+    #[serde(default, alias = "profiles")]
+    pub collections: Vec<Collection>,
     #[serde(default)]
     pub settings: AppSettings,
     #[serde(default)]
@@ -435,7 +435,7 @@ impl Default for AppStateData {
     fn default() -> Self {
         Self {
             phase: PhaseConfig::default(),
-            profiles: vec![Profile::new_custom("default".to_string())],
+            collections: vec![Collection::new_custom("default".to_string())],
             settings: AppSettings::default(),
             last_phase_sync_epoch: 0,
         }
@@ -478,9 +478,9 @@ impl AppStateData {
         };
         let mut state: Self = serde_json::from_slice(&decrypted).unwrap_or_default();
         state.phase.auto_detect_cli();
-        for prof in &mut state.profiles {
-            prof.sanitize_single_source();
-            for var in &mut prof.vars {
+        for coll in &mut state.collections {
+            coll.sanitize_single_source();
+            for var in &mut coll.vars {
                 if var.prefix.is_empty() && var.suffix.is_empty() && !var.value.is_empty() {
                     let (p, s) = compute_prefix_suffix(&var.value);
                     var.prefix = p;
@@ -514,20 +514,20 @@ impl AppStateData {
 
     /// Computes the final effective environment variables.
     /// Rules:
-    /// 1. Only enabled profiles contribute variables.
-    /// 2. Among enabled profiles, the profile highest in the list (smallest index, e.g. #1 at top) wins!
+    /// 1. Only enabled collections contribute variables.
+    /// 2. Among enabled collections, the collection highest in the list (smallest index, e.g. #1 at top) wins!
     pub fn compute_effective_vars(&self) -> Vec<EffectiveVar> {
         let mut map: HashMap<String, EffectiveVar> = HashMap::new();
         let mut order: Vec<String> = Vec::new();
 
-        // Apply enabled profiles from bottom to top so the topmost enabled profile overwrites lower ones
-        for profile in self.profiles.iter().rev() {
-            if !profile.enabled {
+        // Apply enabled collections from bottom to top so the topmost enabled collection overwrites lower ones
+        for collection in self.collections.iter().rev() {
+            if !collection.enabled {
                 continue;
             }
-            let owner = profile.name.clone();
-            let prof_source = profile.source_label();
-            for var in &profile.vars {
+            let owner = collection.name.clone();
+            let coll_source = collection.source_label();
+            for var in &collection.vars {
                 if !map.contains_key(&var.key) {
                     order.push(var.key.clone());
                 }
@@ -539,7 +539,7 @@ impl AppStateData {
                         prefix: var.prefix.clone(),
                         suffix: var.suffix.clone(),
                         winning_owner: owner.clone(),
-                        source_label: prof_source.clone(),
+                        source_label: coll_source.clone(),
                     },
                 );
             }
@@ -672,8 +672,8 @@ mod tests {
                 custom_url: String::new(),
                 pat_token: "pss_user:v1:secret_pat_token_12345".to_string(),
             },
-            profiles: vec![
-                Profile {
+            collections: vec![
+                Collection {
                     name: "default".to_string(),
                     enabled: true,
                     phase_binding: None,
@@ -684,8 +684,8 @@ mod tests {
                         VarSource::Custom,
                     )],
                 },
-                Profile {
-                    name: "prod_profile_secret".to_string(),
+                Collection {
+                    name: "prod_collection_secret".to_string(),
                     enabled: true,
                     phase_binding: Some(PhaseBinding {
                         app_id: "app-1".to_string(),
@@ -738,52 +738,52 @@ mod tests {
 
         let loaded = AppStateData::load_from_dir(&temp_dir);
         assert_eq!(loaded.phase.pat_token, "pss_user:v1:secret_pat_token_12345");
-        assert_eq!(loaded.profiles.len(), 2);
-        assert_eq!(loaded.profiles[0].vars[0].key, plaintext_key);
-        assert_eq!(loaded.profiles[0].vars[0].value, plaintext_secret_1);
-        assert_eq!(loaded.profiles[0].vars[0].prefix, "MY_");
-        assert_eq!(loaded.profiles[0].vars[0].suffix, "999");
-        assert_eq!(loaded.profiles[1].vars[0].value, plaintext_secret_2);
+        assert_eq!(loaded.collections.len(), 2);
+        assert_eq!(loaded.collections[0].vars[0].key, plaintext_key);
+        assert_eq!(loaded.collections[0].vars[0].value, plaintext_secret_1);
+        assert_eq!(loaded.collections[0].vars[0].prefix, "MY_");
+        assert_eq!(loaded.collections[0].vars[0].suffix, "999");
+        assert_eq!(loaded.collections[1].vars[0].value, plaintext_secret_2);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
-    fn test_single_source_per_profile_never_mixes() {
+    fn test_single_source_per_collection_never_mixes() {
         let binding = PhaseBinding {
             app_id: "app1".to_string(),
             app_name: "Backend".to_string(),
             env_id: "env1".to_string(),
             env_name: "Prod".to_string(),
         };
-        let mut phase_prof = Profile::new_phase(
+        let mut phase_coll = Collection::new_phase(
             "phase_prod".to_string(),
             binding.clone(),
             vec![("DB_URL".to_string(), "postgres://prod".to_string())],
         );
-        assert!(phase_prof.is_phase());
-        assert!(!phase_prof.is_custom());
-        assert!(phase_prof
+        assert!(phase_coll.is_phase());
+        assert!(!phase_coll.is_custom());
+        assert!(phase_coll
             .upsert_custom_var("CUSTOM_KEY".to_string(), "123".to_string())
             .is_err());
-        assert_eq!(phase_prof.vars.len(), 1);
+        assert_eq!(phase_coll.vars.len(), 1);
 
-        // Even if corrupted in memory and sanitized, custom vars are stripped from Phase profile
-        phase_prof.vars.push(EnvVar::new(
+        // Even if corrupted in memory and sanitized, custom vars are stripped from Phase collection
+        phase_coll.vars.push(EnvVar::new(
             "MIXED".to_string(),
             "bad".to_string(),
             VarSource::Custom,
         ));
-        phase_prof.sanitize_single_source();
-        assert_eq!(phase_prof.vars.len(), 1);
-        assert_eq!(phase_prof.vars[0].key, "DB_URL");
+        phase_coll.sanitize_single_source();
+        assert_eq!(phase_coll.vars.len(), 1);
+        assert_eq!(phase_coll.vars[0].key, "DB_URL");
 
-        // Custom profile strips any Phase vars on sanitize
-        let mut custom_prof = Profile::new_custom("local_dev".to_string());
-        custom_prof
+        // Custom collection strips any Phase vars on sanitize
+        let mut custom_coll = Collection::new_custom("local_dev".to_string());
+        custom_coll
             .upsert_custom_var("LOCAL_PORT".to_string(), "8080".to_string())
             .unwrap();
-        custom_prof.vars.push(EnvVar::new(
+        custom_coll.vars.push(EnvVar::new(
             "PHASE_LEAK".to_string(),
             "secret".to_string(),
             VarSource::Phase {
@@ -791,15 +791,15 @@ mod tests {
                 env_name: "Prod".to_string(),
             },
         ));
-        custom_prof.sanitize_single_source();
-        assert_eq!(custom_prof.vars.len(), 1);
-        assert_eq!(custom_prof.vars[0].key, "LOCAL_PORT");
+        custom_coll.sanitize_single_source();
+        assert_eq!(custom_coll.vars.len(), 1);
+        assert_eq!(custom_coll.vars[0].key, "LOCAL_PORT");
     }
 
     #[test]
     fn test_settings_defaults_and_relative_sync_time() {
         let settings = AppSettings::default();
-        assert!(settings.sync_only_enabled_profiles);
+        assert!(settings.sync_only_enabled_collections);
         assert!(settings.phase_export_all_paths);
         assert!(settings.mask_secrets_by_default);
 
@@ -823,27 +823,27 @@ mod tests {
     }
 
     #[test]
-    fn test_priority_top_profile_wins_over_lower() {
+    fn test_priority_top_collection_wins_over_lower() {
         let state = AppStateData {
             phase: PhaseConfig::default(),
-            profiles: vec![
-                Profile {
-                    name: "profile_satu".to_string(),
+            collections: vec![
+                Collection {
+                    name: "collection_satu".to_string(),
                     enabled: true,
                     phase_binding: None,
                     last_sync_epoch: None,
                     vars: vec![
-                        EnvVar::new("A".to_string(), "from_profile_satu".to_string(), VarSource::Custom),
+                        EnvVar::new("A".to_string(), "from_collection_satu".to_string(), VarSource::Custom),
                         EnvVar::new("B".to_string(), "b_from_satu".to_string(), VarSource::Custom),
                     ],
                 },
-                Profile {
-                    name: "profile_dua".to_string(),
+                Collection {
+                    name: "collection_dua".to_string(),
                     enabled: true,
                     phase_binding: None,
                     last_sync_epoch: None,
                     vars: vec![
-                        EnvVar::new("A".to_string(), "from_profile_dua".to_string(), VarSource::Custom),
+                        EnvVar::new("A".to_string(), "from_collection_dua".to_string(), VarSource::Custom),
                         EnvVar::new("C".to_string(), "c_from_dua".to_string(), VarSource::Custom),
                     ],
                 },
@@ -855,33 +855,33 @@ mod tests {
         let effective = state.compute_effective_vars();
         let map: HashMap<_, _> = effective.into_iter().map(|v| (v.key.clone(), v)).collect();
 
-        // Profile profile_satu wins over Profile profile_dua for key A
-        assert_eq!(map["A"].value, "from_profile_satu");
-        assert_eq!(map["A"].winning_owner, "profile_satu");
+        // Collection collection_satu wins over Collection collection_dua for key A
+        assert_eq!(map["A"].value, "from_collection_satu");
+        assert_eq!(map["A"].winning_owner, "collection_satu");
         assert_eq!(map["B"].value, "b_from_satu");
-        assert_eq!(map["B"].winning_owner, "profile_satu");
+        assert_eq!(map["B"].winning_owner, "collection_satu");
         assert_eq!(map["C"].value, "c_from_dua");
-        assert_eq!(map["C"].winning_owner, "profile_dua");
+        assert_eq!(map["C"].winning_owner, "collection_dua");
     }
 
     #[test]
-    fn test_disabled_top_profile_falls_back_to_next_enabled() {
+    fn test_disabled_top_collection_falls_back_to_next_enabled() {
         let mut state = AppStateData {
             phase: PhaseConfig::default(),
-            profiles: vec![
-                Profile {
-                    name: "profile_satu".to_string(),
+            collections: vec![
+                Collection {
+                    name: "collection_satu".to_string(),
                     enabled: false,
                     phase_binding: None,
                     last_sync_epoch: None,
-                    vars: vec![EnvVar::new("A".to_string(), "from_profile_satu".to_string(), VarSource::Custom)],
+                    vars: vec![EnvVar::new("A".to_string(), "from_collection_satu".to_string(), VarSource::Custom)],
                 },
-                Profile {
-                    name: "profile_dua".to_string(),
+                Collection {
+                    name: "collection_dua".to_string(),
                     enabled: true,
                     phase_binding: None,
                     last_sync_epoch: None,
-                    vars: vec![EnvVar::new("A".to_string(), "from_profile_dua".to_string(), VarSource::Custom)],
+                    vars: vec![EnvVar::new("A".to_string(), "from_collection_dua".to_string(), VarSource::Custom)],
                 },
             ],
             settings: AppSettings::default(),
@@ -890,9 +890,9 @@ mod tests {
 
         let effective = state.compute_effective_vars();
         assert_eq!(effective.len(), 1);
-        assert_eq!(effective[0].value, "from_profile_dua");
+        assert_eq!(effective[0].value, "from_collection_dua");
 
-        state.profiles[1].enabled = false;
+        state.collections[1].enabled = false;
         let effective2 = state.compute_effective_vars();
         assert!(effective2.is_empty());
     }

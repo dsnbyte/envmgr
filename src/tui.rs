@@ -1,9 +1,9 @@
 use crate::model::{
     is_valid_env_key, AppSettings, AppStateData, EnvVar, HostMode, PhaseAuthMethod, PhaseBinding,
-    PhaseConfig, Profile, PHASE_CLOUD_HOST,
+    PhaseConfig, Collection, PHASE_CLOUD_HOST,
 };
 use crate::phase::{
-    detect_phase_cli_detailed, fetch_apps_and_envs, fetch_secrets_for_env, sync_phase_profiles,
+    detect_phase_cli_detailed, fetch_apps_and_envs, fetch_secrets_for_env, sync_phase_collections,
     try_detect_local_phase_cli_host, PhaseAppInfo, PhaseCliStatus,
 };
 use crate::shell::{apply_state_to_system, reload_shell_environment};
@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusPane {
-    Profiles,
+    Collections,
     Vars,
     Effective,
 }
@@ -43,18 +43,18 @@ pub enum Modal {
         pat_token: String,
         cli_status: PhaseCliStatus,
         active_field: usize,
-        pending_new_profile: Option<String>,
+        pending_new_collection: Option<String>,
         error: Option<String>,
     },
-    NewProfile {
+    NewCollection {
         name: String,
         pull_from_phase: bool,
         active_field: usize, // 0 = name, 1 = data source
         error: Option<String>,
     },
     PhasePicker {
-        target_profile_idx: Option<usize>,
-        new_profile_name: Option<String>,
+        target_collection_idx: Option<usize>,
+        new_collection_name: Option<String>,
         apps: Vec<PhaseAppInfo>,
         selected_app: usize,
         selected_env: usize,
@@ -69,16 +69,16 @@ pub enum Modal {
         active_field: usize, // 0 = key, 1 = value
         error: Option<String>,
     },
-    ConfirmDeleteProfile {
-        profile_idx: usize,
-        profile_name: String,
+    ConfirmDeleteCollection {
+        collection_idx: usize,
+        collection_name: String,
     },
     ConfirmDeleteVar {
         var_idx: usize,
         var_key: String,
     },
-    EditProfile {
-        profile_idx: usize,
+    EditCollection {
+        collection_idx: usize,
         name: String,
         error: Option<String>,
     },
@@ -92,12 +92,12 @@ pub enum Modal {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextAction {
-    ToggleProfile,
+    ToggleCollection,
     Edit,
     Delete,
     MoveUp,
     MoveDown,
-    NewProfile,
+    NewCollection,
     AddVar,
     PhaseSync,
     PhaseRebind,
@@ -144,14 +144,14 @@ impl ContextMenu {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingSyncTarget {
-    Profile(usize),
+    Collection(usize),
     All,
 }
 
 pub struct App {
     pub data: AppStateData,
     pub focus: FocusPane,
-    pub selected_profile: usize,
+    pub selected_collection: usize,
     pub selected_var: usize,
     pub selected_effective: usize,
     pub show_values: bool,
@@ -185,8 +185,8 @@ impl App {
 
         let mut app = Self {
             data,
-            focus: FocusPane::Profiles,
-            selected_profile: 0,
+            focus: FocusPane::Collections,
+            selected_collection: 0,
             selected_var: 0,
             selected_effective: 0,
             show_values,
@@ -274,40 +274,40 @@ impl App {
         }
     }
 
-    pub fn current_profile(&self) -> Option<&Profile> {
-        self.data.profiles.get(self.selected_profile)
+    pub fn current_collection(&self) -> Option<&Collection> {
+        self.data.collections.get(self.selected_collection)
     }
 
-    pub fn current_profile_mut(&mut self) -> Option<&mut Profile> {
-        self.data.profiles.get_mut(self.selected_profile)
+    pub fn current_collection_mut(&mut self) -> Option<&mut Collection> {
+        self.data.collections.get_mut(self.selected_collection)
     }
 
     pub fn current_vars(&self) -> &[EnvVar] {
-        if let Some(prof) = self.current_profile() {
-            &prof.vars
+        if let Some(coll) = self.current_collection() {
+            &coll.vars
         } else {
             &[]
         }
     }
 
     pub fn current_target_title(&self) -> String {
-        if let Some(prof) = self.current_profile() {
-            let state_str = if prof.enabled { "ON" } else { "OFF" };
-            let phase_str = match &prof.phase_binding {
+        if let Some(coll) = self.current_collection() {
+            let state_str = if coll.enabled { "ON" } else { "OFF" };
+            let phase_str = match &coll.phase_binding {
                 Some(b) => format!(" | Phase: {}/{}", b.app_name, b.env_name),
                 None => String::new(),
             };
-            format!("Profile: {} [{}]{}", prof.name, state_str, phase_str)
+            format!("Collection: {} [{}]{}", coll.name, state_str, phase_str)
         } else {
-            "No Profile Selected".to_string()
+            "No Collection Selected".to_string()
         }
     }
 
     pub fn clamp_selections(&mut self) {
-        if self.data.profiles.is_empty() {
-            self.selected_profile = 0;
-        } else if self.selected_profile >= self.data.profiles.len() {
-            self.selected_profile = self.data.profiles.len() - 1;
+        if self.data.collections.is_empty() {
+            self.selected_collection = 0;
+        } else if self.selected_collection >= self.data.collections.len() {
+            self.selected_collection = self.data.collections.len() - 1;
         }
         let vars_len = self.current_vars().len();
         if vars_len == 0 {
@@ -323,7 +323,7 @@ impl App {
         }
     }
 
-    pub fn open_phase_connect_modal(&mut self, pending_new_profile: Option<String>, error: Option<String>) {
+    pub fn open_phase_connect_modal(&mut self, pending_new_collection: Option<String>, error: Option<String>) {
         let cli_status = detect_phase_cli_detailed();
         let auth_method = if self.data.phase.pat_token.trim().is_empty() && cli_status.installed {
             PhaseAuthMethod::Cli
@@ -338,7 +338,7 @@ impl App {
             pat_token: self.data.phase.pat_token.clone(),
             cli_status,
             active_field: 0,
-            pending_new_profile,
+            pending_new_collection,
             error,
         };
     }
@@ -392,23 +392,23 @@ impl App {
             }
             KeyCode::Tab => {
                 self.focus = match self.focus {
-                    FocusPane::Profiles => FocusPane::Vars,
+                    FocusPane::Collections => FocusPane::Vars,
                     FocusPane::Vars => FocusPane::Effective,
-                    FocusPane::Effective => FocusPane::Profiles,
+                    FocusPane::Effective => FocusPane::Collections,
                 };
             }
             KeyCode::BackTab => {
                 self.focus = match self.focus {
-                    FocusPane::Profiles => FocusPane::Effective,
-                    FocusPane::Vars => FocusPane::Profiles,
+                    FocusPane::Collections => FocusPane::Effective,
+                    FocusPane::Vars => FocusPane::Collections,
                     FocusPane::Effective => FocusPane::Vars,
                 };
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                self.focus = FocusPane::Profiles;
+                self.focus = FocusPane::Collections;
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                if self.focus == FocusPane::Profiles {
+                if self.focus == FocusPane::Collections {
                     self.focus = FocusPane::Vars;
                 }
             }
@@ -422,7 +422,7 @@ impl App {
                 self.open_settings_modal();
             }
             KeyCode::Char('n') => {
-                self.modal = Modal::NewProfile {
+                self.modal = Modal::NewCollection {
                     name: String::new(),
                     pull_from_phase: false,
                     active_field: 0,
@@ -430,15 +430,15 @@ impl App {
                 };
             }
             KeyCode::Char('a') => {
-                let Some(prof) = self.current_profile() else {
-                    self.set_error("No profile available. Create a profile first with [n].");
+                let Some(coll) = self.current_collection() else {
+                    self.set_error("No collection available. Create a collection first with [n].");
                     return;
                 };
-                if prof.is_phase() {
-                    let pname = prof.name.clone();
+                if coll.is_phase() {
+                    let cname = coll.name.clone();
                     self.set_error(format!(
-                        "Profile '{}' uses Phase.dev synchronization. Sources cannot be mixed (create a Custom profile with [n]).",
-                        pname
+                        "Collection '{}' uses Phase.dev synchronization. Sources cannot be mixed (create a Custom collection with [n]).",
+                        cname
                     ));
                 } else {
                     self.modal = Modal::VarEditor {
@@ -467,7 +467,7 @@ impl App {
                 self.reload_shell();
             }
             _ => match self.focus {
-                FocusPane::Profiles => self.handle_profiles_pane_key(key),
+                FocusPane::Collections => self.handle_collections_pane_key(key),
                 FocusPane::Vars => self.handle_vars_pane_key(key),
                 FocusPane::Effective => self.handle_effective_pane_key(key),
             },
@@ -475,13 +475,13 @@ impl App {
     }
 
     fn handle_phase_sync_action(&mut self, force_rebind_picker: bool) {
-        let Some(prof) = self.current_profile() else {
-            self.set_error("No profile available. Press [n] to create a Phase.dev profile.");
+        let Some(coll) = self.current_collection() else {
+            self.set_error("No collection available. Press [n] to create a Phase.dev collection.");
             return;
         };
 
-        if prof.is_phase() {
-            let idx = self.selected_profile;
+        if coll.is_phase() {
+            let idx = self.selected_collection;
             if force_rebind_picker {
                 self.open_phase_picker(Some(idx), None);
                 return;
@@ -489,22 +489,22 @@ impl App {
             if !self.data.phase.is_configured() {
                 self.open_phase_connect_modal(
                     None,
-                    Some("Configure Phase.dev authentication to sync this profile.".to_string()),
+                    Some("Configure Phase.dev authentication to sync this collection.".to_string()),
                 );
                 return;
             }
             self.set_info("Phase.dev sync in progress...");
             self.sync_start_time = Some(Instant::now());
-            self.pending_phase_sync = Some(PendingSyncTarget::Profile(idx));
+            self.pending_phase_sync = Some(PendingSyncTarget::Collection(idx));
         } else {
-            // Selected profile is a Custom profile: never mix Phase vars into it.
-            // If other Phase profiles exist, sync all Phase profiles; otherwise inform the user.
-            let has_any_phase = self.data.profiles.iter().any(|p| p.is_phase());
+            // Selected collection is a Custom collection: never mix Phase vars into it.
+            // If other Phase collections exist, sync all Phase collections; otherwise inform the user.
+            let has_any_phase = self.data.collections.iter().any(|c| c.is_phase());
             if has_any_phase {
                 if !self.data.phase.is_configured() {
                     self.open_phase_connect_modal(
                         None,
-                        Some("Configure Phase.dev authentication to sync Phase profiles.".to_string()),
+                        Some("Configure Phase.dev authentication to sync Phase collections.".to_string()),
                     );
                     return;
                 }
@@ -512,10 +512,10 @@ impl App {
                 self.sync_start_time = Some(Instant::now());
                 self.pending_phase_sync = Some(PendingSyncTarget::All);
             } else {
-                let pname = prof.name.clone();
+                let cname = coll.name.clone();
                 self.set_error(format!(
-                    "Profile '{}' uses a Custom environment (sources cannot be mixed). Create a Phase.dev profile with [n].",
-                    pname
+                    "Collection '{}' uses a Custom environment (sources cannot be mixed). Create a Phase.dev collection with [n].",
+                    cname
                 ));
             }
         }
@@ -529,15 +529,15 @@ impl App {
         let sync_start = self.sync_start_time.take();
 
         let result = match target {
-            PendingSyncTarget::Profile(idx) => {
-                if idx >= self.data.profiles.len() {
+            PendingSyncTarget::Collection(idx) => {
+                if idx >= self.data.collections.len() {
                     return true;
                 }
-                let res = sync_phase_profiles(&mut self.data, Some(idx));
+                let res = sync_phase_collections(&mut self.data, Some(idx));
                 (target, res)
             }
             PendingSyncTarget::All => {
-                let res = sync_phase_profiles(&mut self.data, None);
+                let res = sync_phase_collections(&mut self.data, None);
                 (target, res)
             }
         };
@@ -552,34 +552,34 @@ impl App {
         }
 
         match result {
-            (PendingSyncTarget::Profile(idx), Ok((_, vars_count))) => {
+            (PendingSyncTarget::Collection(idx), Ok((_, vars_count))) => {
                 self.clamp_selections();
-                let pname = self.data.profiles[idx].name.clone();
+                let cname = self.data.collections[idx].name.clone();
                 self.sync_to_system(&format!(
                     "Phase.dev sync succeeded for '{}' ({} vars)",
-                    pname, vars_count
+                    cname, vars_count
                 ));
             }
-            (PendingSyncTarget::Profile(_), Err(e)) => {
+            (PendingSyncTarget::Collection(_), Err(e)) => {
                 self.set_error(format!("Phase.dev sync failed: {}", e));
             }
             (PendingSyncTarget::All, Ok((_, vars_count))) => {
-                let prof_names: Vec<String> = self
+                let coll_names: Vec<String> = self
                     .data
-                    .profiles
+                    .collections
                     .iter()
-                    .filter(|p| p.is_phase())
-                    .map(|p| p.name.clone())
+                    .filter(|c| c.is_phase())
+                    .map(|c| c.name.clone())
                     .collect();
-                let prof_desc = if prof_names.len() == 1 {
-                    format!("'{}'", prof_names[0])
+                let coll_desc = if coll_names.len() == 1 {
+                    format!("'{}'", coll_names[0])
                 } else {
-                    format!("{} profiles", prof_names.len())
+                    format!("{} collections", coll_names.len())
                 };
                 self.clamp_selections();
                 self.sync_to_system(&format!(
                     "Phase.dev sync succeeded for {} ({} vars)",
-                    prof_desc, vars_count
+                    coll_desc, vars_count
                 ));
             }
             (PendingSyncTarget::All, Err(e)) => {
@@ -591,8 +591,8 @@ impl App {
 
     fn handle_edit_action(&mut self) {
         match self.focus {
-            FocusPane::Profiles => {
-                self.open_edit_profile();
+            FocusPane::Collections => {
+                self.open_edit_collection();
             }
             FocusPane::Vars => {
                 self.open_edit_var();
@@ -603,30 +603,30 @@ impl App {
         }
     }
 
-    fn open_edit_profile(&mut self) {
-        if let Some(prof) = self.current_profile() {
-            let n = prof.name.clone();
+    fn open_edit_collection(&mut self) {
+        if let Some(coll) = self.current_collection() {
+            let n = coll.name.clone();
             self.input_cursor = n.chars().count();
-            self.modal = Modal::EditProfile {
-                profile_idx: self.selected_profile,
+            self.modal = Modal::EditCollection {
+                collection_idx: self.selected_collection,
                 name: n,
                 error: None,
             };
         } else {
-            self.set_info("No profile selected to edit.");
+            self.set_info("No collection selected to edit.");
         }
     }
 
     fn open_edit_var(&mut self) {
-        let Some(prof) = self.current_profile() else {
-            self.set_info("No profile selected.");
+        let Some(coll) = self.current_collection() else {
+            self.set_info("No collection selected.");
             return;
         };
-        if prof.is_phase() {
-            let pname = prof.name.clone();
+        if coll.is_phase() {
+            let cname = coll.name.clone();
             self.set_error(format!(
-                "Profile '{}' is synced with Phase.dev. Variables cannot be edited manually (press [p] to sync).",
-                pname
+                "Collection '{}' is synced with Phase.dev. Variables cannot be edited manually (press [p] to sync).",
+                cname
             ));
             return;
         }
@@ -648,25 +648,25 @@ impl App {
     fn open_edit_effective_var(&mut self) {
         let eff = self.data.compute_effective_vars();
         if let Some(ev) = eff.get(self.selected_effective) {
-            for (p_idx, prof) in self.data.profiles.iter().enumerate() {
-                if !prof.enabled {
+            for (c_idx, coll) in self.data.collections.iter().enumerate() {
+                if !coll.enabled {
                     continue;
                 }
-                if let Some(v_idx) = prof.vars.iter().position(|v| v.key == ev.key) {
-                    if prof.is_phase() {
-                        let pname = prof.name.clone();
+                if let Some(v_idx) = coll.vars.iter().position(|v| v.key == ev.key) {
+                    if coll.is_phase() {
+                        let cname = coll.name.clone();
                         let vkey = ev.key.clone();
                         self.set_error(format!(
-                            "Variable '{}' belongs to Phase.dev profile '{}' and cannot be edited manually.",
-                            vkey, pname
+                            "Variable '{}' belongs to Phase.dev collection '{}' and cannot be edited manually.",
+                            vkey, cname
                         ));
                         return;
                     }
-                    self.selected_profile = p_idx;
+                    self.selected_collection = c_idx;
                     self.selected_var = v_idx;
                     self.focus = FocusPane::Vars;
-                    let key = prof.vars[v_idx].key.clone();
-                    let val = prof.vars[v_idx].value.clone();
+                    let key = coll.vars[v_idx].key.clone();
+                    let val = coll.vars[v_idx].value.clone();
                     self.input_cursor = val.chars().count();
                     self.modal = Modal::VarEditor {
                         is_edit: true,
@@ -685,23 +685,23 @@ impl App {
 
     fn handle_delete_action(&mut self) {
         match self.focus {
-            FocusPane::Profiles => {
-                if let Some(prof) = self.current_profile() {
-                    self.modal = Modal::ConfirmDeleteProfile {
-                        profile_idx: self.selected_profile,
-                        profile_name: prof.name.clone(),
+            FocusPane::Collections => {
+                if let Some(coll) = self.current_collection() {
+                    self.modal = Modal::ConfirmDeleteCollection {
+                        collection_idx: self.selected_collection,
+                        collection_name: coll.name.clone(),
                     };
                 }
             }
             FocusPane::Vars => {
-                let Some(prof) = self.current_profile() else {
+                let Some(coll) = self.current_collection() else {
                     return;
                 };
-                if prof.is_phase() {
-                    let pname = prof.name.clone();
+                if coll.is_phase() {
+                    let cname = coll.name.clone();
                     self.set_error(format!(
-                        "Profile '{}' is synced with Phase.dev. Manage variables in Phase.dev and press [p] to sync.",
-                        pname
+                        "Collection '{}' is synced with Phase.dev. Manage variables in Phase.dev and press [p] to sync.",
+                        cname
                     ));
                     return;
                 }
@@ -721,21 +721,21 @@ impl App {
     fn open_delete_effective_var(&mut self) {
         let eff = self.data.compute_effective_vars();
         if let Some(ev) = eff.get(self.selected_effective) {
-            for (p_idx, prof) in self.data.profiles.iter().enumerate() {
-                if !prof.enabled {
+            for (c_idx, coll) in self.data.collections.iter().enumerate() {
+                if !coll.enabled {
                     continue;
                 }
-                if let Some(v_idx) = prof.vars.iter().position(|v| v.key == ev.key) {
-                    if prof.is_phase() {
-                        let pname = prof.name.clone();
+                if let Some(v_idx) = coll.vars.iter().position(|v| v.key == ev.key) {
+                    if coll.is_phase() {
+                        let cname = coll.name.clone();
                         let vkey = ev.key.clone();
                         self.set_error(format!(
-                            "Variable '{}' belongs to Phase.dev profile '{}' and cannot be deleted manually.",
-                            vkey, pname
+                            "Variable '{}' belongs to Phase.dev collection '{}' and cannot be deleted manually.",
+                            vkey, cname
                         ));
                         return;
                     }
-                    self.selected_profile = p_idx;
+                    self.selected_collection = c_idx;
                     self.selected_var = v_idx;
                     self.focus = FocusPane::Vars;
                     self.modal = Modal::ConfirmDeleteVar {
@@ -749,9 +749,9 @@ impl App {
         self.set_info("No effective variable selected to delete.");
     }
 
-    fn open_new_profile_modal(&mut self) {
+    fn open_new_collection_modal(&mut self) {
         self.input_cursor = 0;
-        self.modal = Modal::NewProfile {
+        self.modal = Modal::NewCollection {
             name: String::new(),
             pull_from_phase: false,
             active_field: 0,
@@ -760,15 +760,15 @@ impl App {
     }
 
     fn open_add_var_modal(&mut self) {
-        let Some(prof) = self.current_profile() else {
-            self.set_error("No profile available. Create a profile first with [n].");
+        let Some(coll) = self.current_collection() else {
+            self.set_error("No collection available. Create a collection first with [n].");
             return;
         };
-        if prof.is_phase() {
-            let pname = prof.name.clone();
+        if coll.is_phase() {
+            let cname = coll.name.clone();
             self.set_error(format!(
-                "Profile '{}' uses Phase.dev synchronization. Sources cannot be mixed (create a Custom profile with [n]).",
-                pname
+                "Collection '{}' uses Phase.dev synchronization. Sources cannot be mixed (create a Custom collection with [n]).",
+                cname
             ));
         } else {
             self.input_cursor = 0;
@@ -783,25 +783,25 @@ impl App {
         }
     }
 
-    fn toggle_current_profile(&mut self) {
-        if let Some(prof) = self.current_profile_mut() {
-            prof.enabled = !prof.enabled;
-            let name = prof.name.clone();
-            let status = if prof.enabled { "ON" } else { "OFF" };
-            self.sync_to_system(&format!("Toggled profile '{}' {}", name, status));
+    fn toggle_current_collection(&mut self) {
+        if let Some(coll) = self.current_collection_mut() {
+            coll.enabled = !coll.enabled;
+            let name = coll.name.clone();
+            let status = if coll.enabled { "ON" } else { "OFF" };
+            self.sync_to_system(&format!("Toggled collection '{}' {}", name, status));
         }
     }
 
-    pub fn sync_all_phase_profiles(&mut self) {
-        let has_any_phase = self.data.profiles.iter().any(|p| p.is_phase());
+    pub fn sync_all_phase_collections(&mut self) {
+        let has_any_phase = self.data.collections.iter().any(|c| c.is_phase());
         if !has_any_phase {
-            self.set_error("No Phase.dev profiles found to sync. Press [n] to create one.");
+            self.set_error("No Phase.dev collections found to sync. Press [n] to create one.");
             return;
         }
         if !self.data.phase.is_configured() {
             self.open_phase_connect_modal(
                 None,
-                Some("Configure Phase.dev authentication to sync Phase profiles.".to_string()),
+                Some("Configure Phase.dev authentication to sync Phase collections.".to_string()),
             );
             return;
         }
@@ -850,12 +850,12 @@ impl App {
 
     pub fn execute_context_action(&mut self, action: ContextAction) {
         match action {
-            ContextAction::ToggleProfile => self.toggle_current_profile(),
+            ContextAction::ToggleCollection => self.toggle_current_collection(),
             ContextAction::Edit => self.handle_edit_action(),
             ContextAction::Delete => self.handle_delete_action(),
-            ContextAction::MoveUp => self.move_selected_profile_up(),
-            ContextAction::MoveDown => self.move_selected_profile_down(),
-            ContextAction::NewProfile => self.open_new_profile_modal(),
+            ContextAction::MoveUp => self.move_selected_collection_up(),
+            ContextAction::MoveDown => self.move_selected_collection_down(),
+            ContextAction::NewCollection => self.open_new_collection_modal(),
             ContextAction::AddVar => self.open_add_var_modal(),
             ContextAction::PhaseSync => self.handle_phase_sync_action(false),
             ContextAction::PhaseRebind => self.handle_phase_sync_action(true),
@@ -869,15 +869,15 @@ impl App {
     pub fn open_context_menu_for_pane(&mut self, pane: FocusPane, x: u16, y: u16) {
         let mut items = Vec::new();
         match pane {
-            FocusPane::Profiles => {
-                if let Some(prof) = self.current_profile() {
-                    let toggle_label = if prof.enabled {
-                        "Disable Profile"
+            FocusPane::Collections => {
+                if let Some(coll) = self.current_collection() {
+                    let toggle_label = if coll.enabled {
+                        "Disable Collection"
                     } else {
-                        "Enable Profile"
+                        "Enable Collection"
                     };
                     items.push(ContextMenuItem {
-                        label: "Edit Profile".to_string(),
+                        label: "Edit Collection".to_string(),
                         shortcut: "e",
                         action: ContextAction::Edit,
                         is_danger: false,
@@ -885,7 +885,7 @@ impl App {
                     items.push(ContextMenuItem {
                         label: toggle_label.to_string(),
                         shortcut: "Space",
-                        action: ContextAction::ToggleProfile,
+                        action: ContextAction::ToggleCollection,
                         is_danger: false,
                     });
                     items.push(ContextMenuItem {
@@ -900,7 +900,7 @@ impl App {
                         action: ContextAction::MoveDown,
                         is_danger: false,
                     });
-                    if prof.is_phase() {
+                    if coll.is_phase() {
                         items.push(ContextMenuItem {
                             label: "Sync Phase.dev".to_string(),
                             shortcut: "p",
@@ -922,22 +922,22 @@ impl App {
                         });
                     }
                     items.push(ContextMenuItem {
-                        label: "New Profile".to_string(),
+                        label: "New Collection".to_string(),
                         shortcut: "n",
-                        action: ContextAction::NewProfile,
+                        action: ContextAction::NewCollection,
                         is_danger: false,
                     });
                     items.push(ContextMenuItem {
-                        label: "Delete Profile".to_string(),
+                        label: "Delete Collection".to_string(),
                         shortcut: "x",
                         action: ContextAction::Delete,
                         is_danger: true,
                     });
                 } else {
                     items.push(ContextMenuItem {
-                        label: "New Profile".to_string(),
+                        label: "New Collection".to_string(),
                         shortcut: "n",
-                        action: ContextAction::NewProfile,
+                        action: ContextAction::NewCollection,
                         is_danger: false,
                     });
                 }
@@ -945,7 +945,7 @@ impl App {
             FocusPane::Vars => {
                 let has_vars = !self.current_vars().is_empty();
                 let is_phase = self
-                    .current_profile()
+                    .current_collection()
                     .map(|p| p.is_phase())
                     .unwrap_or(false);
                 if has_vars && !is_phase {
@@ -1065,10 +1065,10 @@ impl App {
             KeyCode::Char('x') | KeyCode::Delete => {
                 self.execute_context_action(ContextAction::Delete)
             }
-            KeyCode::Char(' ') => self.execute_context_action(ContextAction::ToggleProfile),
+            KeyCode::Char(' ') => self.execute_context_action(ContextAction::ToggleCollection),
             KeyCode::Char('u') => self.execute_context_action(ContextAction::MoveUp),
             KeyCode::Char('d') => self.execute_context_action(ContextAction::MoveDown),
-            KeyCode::Char('n') => self.execute_context_action(ContextAction::NewProfile),
+            KeyCode::Char('n') => self.execute_context_action(ContextAction::NewCollection),
             KeyCode::Char('a') => self.execute_context_action(ContextAction::AddVar),
             KeyCode::Char('p') => self.execute_context_action(ContextAction::PhaseSync),
             KeyCode::Char('P') => self.execute_context_action(ContextAction::PhaseRebind),
@@ -1086,67 +1086,67 @@ impl App {
         }
     }
 
-    fn handle_profiles_pane_key(&mut self, key: KeyEvent) {
-        let total_items = self.data.profiles.len();
+    fn handle_collections_pane_key(&mut self, key: KeyEvent) {
+        let total_items = self.data.collections.len();
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
-                if self.selected_profile > 0 {
-                    self.selected_profile -= 1;
+                if self.selected_collection > 0 {
+                    self.selected_collection -= 1;
                     self.selected_var = 0;
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.selected_profile + 1 < total_items {
-                    self.selected_profile += 1;
+                if self.selected_collection + 1 < total_items {
+                    self.selected_collection += 1;
                     self.selected_var = 0;
                 }
             }
             KeyCode::Char('u') => {
-                self.move_selected_profile_up();
+                self.move_selected_collection_up();
             }
             KeyCode::Char('d') => {
-                self.move_selected_profile_down();
+                self.move_selected_collection_down();
             }
             KeyCode::Char(' ') => {
-                if let Some(prof) = self.current_profile_mut() {
-                    prof.enabled = !prof.enabled;
-                    let name = prof.name.clone();
-                    let status = if prof.enabled { "ON" } else { "OFF" };
-                    self.sync_to_system(&format!("Toggled profile '{}' {}", name, status));
+                if let Some(coll) = self.current_collection_mut() {
+                    coll.enabled = !coll.enabled;
+                    let name = coll.name.clone();
+                    let status = if coll.enabled { "ON" } else { "OFF" };
+                    self.sync_to_system(&format!("Toggled collection '{}' {}", name, status));
                 }
             }
             KeyCode::Enter => {
-                self.open_edit_profile();
+                self.open_edit_collection();
             }
             _ => {}
         }
     }
 
-    fn move_selected_profile_up(&mut self) {
-        if self.selected_profile == 0 {
-            if !self.data.profiles.is_empty() {
-                self.set_info("Profile is already at top priority.");
+    fn move_selected_collection_up(&mut self) {
+        if self.selected_collection == 0 {
+            if !self.data.collections.is_empty() {
+                self.set_info("Collection is already at top priority.");
             }
             return;
         }
         self.data
-            .profiles
-            .swap(self.selected_profile, self.selected_profile - 1);
-        self.selected_profile -= 1;
-        let name = self.data.profiles[self.selected_profile].name.clone();
-        self.sync_to_system(&format!("Moved profile '{}' up", name));
+            .collections
+            .swap(self.selected_collection, self.selected_collection - 1);
+        self.selected_collection -= 1;
+        let name = self.data.collections[self.selected_collection].name.clone();
+        self.sync_to_system(&format!("Moved collection '{}' up", name));
     }
 
-    fn move_selected_profile_down(&mut self) {
-        if self.data.profiles.is_empty() || self.selected_profile + 1 >= self.data.profiles.len() {
+    fn move_selected_collection_down(&mut self) {
+        if self.data.collections.is_empty() || self.selected_collection + 1 >= self.data.collections.len() {
             return;
         }
         self.data
-            .profiles
-            .swap(self.selected_profile, self.selected_profile + 1);
-        self.selected_profile += 1;
-        let name = self.data.profiles[self.selected_profile].name.clone();
-        self.sync_to_system(&format!("Moved profile '{}' down", name));
+            .collections
+            .swap(self.selected_collection, self.selected_collection + 1);
+        self.selected_collection += 1;
+        let name = self.data.collections[self.selected_collection].name.clone();
+        self.sync_to_system(&format!("Moved collection '{}' down", name));
     }
 
     fn handle_vars_pane_key(&mut self, key: KeyEvent) {
@@ -1203,16 +1203,16 @@ impl App {
 
     fn open_phase_picker(
         &mut self,
-        target_profile_idx: Option<usize>,
-        new_profile_name: Option<String>,
+        target_collection_idx: Option<usize>,
+        new_collection_name: Option<String>,
     ) {
-        if let Some(idx) = target_profile_idx {
-            if let Some(prof) = self.data.profiles.get(idx) {
-                if prof.is_custom() {
-                    let pname = prof.name.clone();
+        if let Some(idx) = target_collection_idx {
+            if let Some(coll) = self.data.collections.get(idx) {
+                if coll.is_custom() {
+                    let cname = coll.name.clone();
                     self.set_error(format!(
-                        "Profile '{}' is a Custom profile; sources cannot be mixed.",
-                        pname
+                        "Collection '{}' is a Custom collection; sources cannot be mixed.",
+                        cname
                     ));
                     return;
                 }
@@ -1221,7 +1221,7 @@ impl App {
 
         if !self.data.phase.is_configured() {
             self.open_phase_connect_modal(
-                new_profile_name,
+                new_collection_name,
                 Some("Please configure Phase.dev authentication first.".to_string()),
             );
             return;
@@ -1235,8 +1235,8 @@ impl App {
                 }
                 self.cached_apps = apps.clone();
                 self.modal = Modal::PhasePicker {
-                    target_profile_idx,
-                    new_profile_name,
+                    target_collection_idx,
+                    new_collection_name,
                     apps,
                     selected_app: 0,
                     selected_env: 0,
@@ -1246,18 +1246,18 @@ impl App {
             }
             Err(e) => {
                 self.set_error(format!("Phase.dev error: {}", e));
-                self.open_phase_connect_modal(new_profile_name, Some(e));
+                self.open_phase_connect_modal(new_collection_name, Some(e));
             }
         }
     }
 
-    fn insert_new_profile(&mut self, profile: Profile) {
-        if self.data.settings.insert_new_profile_at_top {
-            self.data.profiles.insert(0, profile);
-            self.selected_profile = 0;
+    fn insert_new_collection(&mut self, collection: Collection) {
+        if self.data.settings.insert_new_collection_at_top {
+            self.data.collections.insert(0, collection);
+            self.selected_collection = 0;
         } else {
-            self.data.profiles.push(profile);
-            self.selected_profile = self.data.profiles.len().saturating_sub(1);
+            self.data.collections.push(collection);
+            self.selected_collection = self.data.collections.len().saturating_sub(1);
         }
         self.selected_var = 0;
     }
@@ -1273,7 +1273,7 @@ impl App {
                 mut pat_token,
                 mut cli_status,
                 mut active_field,
-                pending_new_profile,
+                pending_new_collection,
                 mut error,
             } => {
                 // Fields:
@@ -1432,10 +1432,10 @@ impl App {
                                         self.cached_apps = apps.clone();
                                         self.data.phase = new_cfg;
                                         let _ = self.data.save();
-                                        if let Some(prof_name) = pending_new_profile {
+                                        if let Some(coll_name) = pending_new_collection {
                                             self.modal = Modal::PhasePicker {
-                                                target_profile_idx: None,
-                                                new_profile_name: Some(prof_name),
+                                                target_collection_idx: None,
+                                                new_collection_name: Some(coll_name),
                                                 apps,
                                                 selected_app: 0,
                                                 selected_env: 0,
@@ -1478,10 +1478,10 @@ impl App {
                                     self.cached_apps = apps.clone();
                                     self.data.phase = new_cfg;
                                     let _ = self.data.save();
-                                    if let Some(prof_name) = pending_new_profile {
+                                    if let Some(coll_name) = pending_new_collection {
                                         self.modal = Modal::PhasePicker {
-                                            target_profile_idx: None,
-                                            new_profile_name: Some(prof_name),
+                                            target_collection_idx: None,
+                                            new_collection_name: Some(coll_name),
                                             apps,
                                             selected_app: 0,
                                             selected_env: 0,
@@ -1534,12 +1534,12 @@ impl App {
                     pat_token,
                     cli_status,
                     active_field,
-                    pending_new_profile,
+                    pending_new_collection,
                     error,
                 };
             }
 
-            Modal::NewProfile {
+            Modal::NewCollection {
                 mut name,
                 mut pull_from_phase,
                 mut active_field,
@@ -1607,21 +1607,21 @@ impl App {
                     KeyCode::Enter => {
                         let trimmed = name.trim().to_string();
                         if trimmed.is_empty() {
-                            error = Some("Profile name cannot be empty.".to_string());
+                            error = Some("Collection name cannot be empty.".to_string());
                         } else if self
                             .data
-                            .profiles
+                            .collections
                             .iter()
-                            .any(|p| p.name.eq_ignore_ascii_case(&trimmed))
+                            .any(|c| c.name.eq_ignore_ascii_case(&trimmed))
                         {
-                            error = Some(format!("Profile '{}' already exists.", trimmed));
+                            error = Some(format!("Collection '{}' already exists.", trimmed));
                         } else if pull_from_phase {
                             self.open_phase_picker(None, Some(trimmed));
                             return;
                         } else {
-                            self.insert_new_profile(Profile::new_custom(trimmed.clone()));
+                            self.insert_new_collection(Collection::new_custom(trimmed.clone()));
                             self.sync_to_system(&format!(
-                                "Created custom profile '{}'",
+                                "Created custom collection '{}'",
                                 trimmed
                             ));
                             return;
@@ -1630,7 +1630,7 @@ impl App {
                     _ => {}
                 }
 
-                self.modal = Modal::NewProfile {
+                self.modal = Modal::NewCollection {
                     name,
                     pull_from_phase,
                     active_field,
@@ -1639,8 +1639,8 @@ impl App {
             }
 
             Modal::PhasePicker {
-                target_profile_idx,
-                new_profile_name,
+                target_collection_idx,
+                new_collection_name,
                 apps,
                 mut selected_app,
                 mut selected_env,
@@ -1713,24 +1713,24 @@ impl App {
                                         self.data.last_phase_sync_epoch =
                                             AppStateData::current_epoch_secs();
 
-                                        if let Some(prof_name) = new_profile_name {
-                                            let new_prof = Profile::new_phase(
-                                                prof_name.clone(),
+                                        if let Some(coll_name) = new_collection_name {
+                                            let new_coll = Collection::new_phase(
+                                                coll_name.clone(),
                                                 binding,
                                                 fetched_pairs,
                                             );
-                                            self.insert_new_profile(new_prof);
+                                            self.insert_new_collection(new_coll);
                                             self.sync_to_system(&format!(
-                                                "Created Phase.dev profile '{}' with {} var(s) ({}/{})",
-                                                prof_name, fetched_len, app.name, env.name
+                                                "Created Phase.dev collection '{}' with {} var(s) ({}/{})",
+                                                coll_name, fetched_len, app.name, env.name
                                             ));
-                                        } else if let Some(idx) = target_profile_idx {
-                                            if let Some(prof) = self.data.profiles.get_mut(idx) {
-                                                prof.set_phase_vars(binding, fetched_pairs);
-                                                let pname = prof.name.clone();
+                                        } else if let Some(idx) = target_collection_idx {
+                                            if let Some(coll) = self.data.collections.get_mut(idx) {
+                                                coll.set_phase_vars(binding, fetched_pairs);
+                                                let cname = coll.name.clone();
                                                 self.sync_to_system(&format!(
                                                     "Synced {} var(s) from Phase ({}/{}) into '{}'",
-                                                    fetched_len, app.name, env.name, pname
+                                                    fetched_len, app.name, env.name, cname
                                                 ));
                                             }
                                         }
@@ -1748,8 +1748,8 @@ impl App {
                 }
 
                 self.modal = Modal::PhasePicker {
-                    target_profile_idx,
-                    new_profile_name,
+                    target_collection_idx,
+                    new_collection_name,
                     apps,
                     selected_app,
                     selected_env,
@@ -1838,22 +1838,22 @@ impl App {
                                 "Invalid variable name. Use letters, digits, '_' (cannot start with digit)."
                                     .to_string(),
                             );
-                        } else if let Some(prof) = self.current_profile_mut() {
-                            if prof.is_phase() {
+                        } else if let Some(coll) = self.current_collection_mut() {
+                            if coll.is_phase() {
                                 error = Some(
-                                    "Cannot modify variables manually in a Phase.dev profile."
+                                    "Cannot modify variables manually in a Phase.dev collection."
                                         .to_string(),
                                 );
                             } else {
                                 if is_edit {
                                     if let Some(idx) = original_index {
-                                        if let Some(v) = prof.vars.get_mut(idx) {
+                                        if let Some(v) = coll.vars.get_mut(idx) {
                                             v.key = k.clone();
                                             v.set_value(var_value.clone());
                                         }
                                     }
                                 } else {
-                                    let _ = prof.upsert_custom_var(k.clone(), var_value.clone());
+                                    let _ = coll.upsert_custom_var(k.clone(), var_value.clone());
                                 }
                                 self.clamp_selections();
                                 let target_name = self.current_target_title();
@@ -1878,31 +1878,31 @@ impl App {
                 };
             }
 
-            Modal::ConfirmDeleteProfile {
-                profile_idx,
-                profile_name,
+            Modal::ConfirmDeleteCollection {
+                collection_idx,
+                collection_name,
             } => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    if profile_idx < self.data.profiles.len() {
-                        self.data.profiles.remove(profile_idx);
+                    if collection_idx < self.data.collections.len() {
+                        self.data.collections.remove(collection_idx);
                         self.clamp_selections();
-                        self.sync_to_system(&format!("Deleted profile '{}'", profile_name));
+                        self.sync_to_system(&format!("Deleted collection '{}'", collection_name));
                     }
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {}
                 _ => {
-                    self.modal = Modal::ConfirmDeleteProfile {
-                        profile_idx,
-                        profile_name,
+                    self.modal = Modal::ConfirmDeleteCollection {
+                        collection_idx,
+                        collection_name,
                     };
                 }
             },
 
             Modal::ConfirmDeleteVar { var_idx, var_key } => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    if let Some(prof) = self.current_profile_mut() {
-                        if prof.is_custom() && var_idx < prof.vars.len() {
-                            prof.vars.remove(var_idx);
+                    if let Some(coll) = self.current_collection_mut() {
+                        if coll.is_custom() && var_idx < coll.vars.len() {
+                            coll.vars.remove(var_idx);
                             self.clamp_selections();
                             self.sync_to_system(&format!("Deleted variable '{}'", var_key));
                         }
@@ -1914,8 +1914,8 @@ impl App {
                 }
             },
 
-            Modal::EditProfile {
-                profile_idx,
+            Modal::EditCollection {
+                collection_idx,
                 mut name,
                 mut error,
             } => {
@@ -1958,9 +1958,9 @@ impl App {
                         error = None;
                     }
                     KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        if let Some(prof) = self.data.profiles.get(profile_idx) {
-                            if prof.is_phase() {
-                                self.open_phase_picker(Some(profile_idx), None);
+                        if let Some(coll) = self.data.collections.get(collection_idx) {
+                            if coll.is_phase() {
+                                self.open_phase_picker(Some(collection_idx), None);
                                 return;
                             }
                         }
@@ -1973,21 +1973,21 @@ impl App {
                     KeyCode::Enter => {
                         let trimmed = name.trim().to_string();
                         if trimmed.is_empty() {
-                            error = Some("Profile name cannot be empty.".to_string());
+                            error = Some("Collection name cannot be empty.".to_string());
                         } else if self
                             .data
-                            .profiles
+                            .collections
                             .iter()
                             .enumerate()
-                            .any(|(i, p)| i != profile_idx && p.name.eq_ignore_ascii_case(&trimmed))
+                            .any(|(i, c)| i != collection_idx && c.name.eq_ignore_ascii_case(&trimmed))
                         {
-                            error = Some(format!("Profile '{}' already exists.", trimmed));
+                            error = Some(format!("Collection '{}' already exists.", trimmed));
                         } else {
-                            if let Some(prof) = self.data.profiles.get_mut(profile_idx) {
-                                let old_name = prof.name.clone();
-                                prof.name = trimmed.clone();
+                            if let Some(coll) = self.data.collections.get_mut(collection_idx) {
+                                let old_name = coll.name.clone();
+                                coll.name = trimmed.clone();
                                 self.sync_to_system(&format!(
-                                    "Renamed profile '{}' to '{}'",
+                                    "Renamed collection '{}' to '{}'",
                                     old_name, trimmed
                                 ));
                             }
@@ -1997,8 +1997,8 @@ impl App {
                     _ => {}
                 }
 
-                self.modal = Modal::EditProfile {
-                    profile_idx,
+                self.modal = Modal::EditCollection {
+                    collection_idx,
                     name,
                     error,
                 };
@@ -2030,8 +2030,8 @@ impl App {
                         error = None;
                         match active_field {
                             0 => {
-                                draft.sync_only_enabled_profiles =
-                                    !draft.sync_only_enabled_profiles;
+                                draft.sync_only_enabled_collections =
+                                    !draft.sync_only_enabled_collections;
                             }
                             1 => {
                                 draft.phase_export_all_paths = !draft.phase_export_all_paths;
@@ -2040,8 +2040,8 @@ impl App {
                                 draft.mask_secrets_by_default = !draft.mask_secrets_by_default;
                             }
                             3 => {
-                                draft.insert_new_profile_at_top =
-                                    !draft.insert_new_profile_at_top;
+                                draft.insert_new_collection_at_top =
+                                    !draft.insert_new_collection_at_top;
                             }
                             4 => {
                                 draft.shell_prompt_hook = !draft.shell_prompt_hook;
@@ -2082,11 +2082,11 @@ impl App {
     pub fn draw(&mut self, frame: &mut Frame) {
         self.clear_expired_status();
         self.last_area = frame.area();
-        let (header_rect, profiles_rect, vars_rect, effective_rect, status_bar_rect) =
+        let (header_rect, collections_rect, vars_rect, effective_rect, status_bar_rect) =
             compute_layout_chunks(frame.area());
 
         self.draw_header(frame, header_rect);
-        self.draw_profiles_pane(frame, profiles_rect);
+        self.draw_collections_pane(frame, collections_rect);
         self.draw_vars_pane(frame, vars_rect);
         self.draw_effective_pane(frame, effective_rect);
         self.draw_footer(frame, status_bar_rect);
@@ -2120,10 +2120,10 @@ impl App {
                 .add_modifier(Modifier::BOLD),
         );
 
-        if inner.width >= 90 {
+        if inner.width >= 93 {
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(34), Constraint::Length(56)])
+                .constraints([Constraint::Min(34), Constraint::Length(59)])
                 .split(inner);
 
             frame.render_widget(
@@ -2143,7 +2143,7 @@ impl App {
             };
 
             let toolbar = Line::from(vec![
-                Span::styled(" [+Profile] ", btn_style),
+                Span::styled(" [+Collection] ", btn_style),
                 sep.clone(),
                 Span::styled(" [+Var] ", btn_style),
                 sep.clone(),
@@ -2165,36 +2165,36 @@ impl App {
         }
     }
 
-    fn draw_profiles_pane(&self, frame: &mut Frame, area: Rect) {
-        let is_focused = self.focus == FocusPane::Profiles;
+    fn draw_collections_pane(&self, frame: &mut Frame, area: Rect) {
+        let is_focused = self.focus == FocusPane::Collections;
         let border_style = if is_focused {
             Style::default().fg(Color::Cyan)
         } else {
             Style::default().fg(Color::DarkGray)
         };
 
-        let mut items: Vec<ListItem> = Vec::with_capacity(self.data.profiles.len());
+        let mut items: Vec<ListItem> = Vec::with_capacity(self.data.collections.len());
 
-        for prof in &self.data.profiles {
-            let check = if prof.enabled { "[✓] " } else { "[ ] " };
-            let check_style = if prof.enabled {
+        for coll in &self.data.collections {
+            let check = if coll.enabled { "[✓] " } else { "[ ] " };
+            let check_style = if coll.enabled {
                 Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let name_style = if prof.enabled {
+            let name_style = if coll.enabled {
                 Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Gray)
             };
-            let badge = match &prof.phase_binding {
+            let badge = match &coll.phase_binding {
                 Some(b) => format!(" [Phase:{}/{}]", b.app_name, b.env_name),
                 None => " [Custom]".to_string(),
             };
 
             let line = Line::from(vec![
                 Span::styled(check, check_style),
-                Span::styled(&prof.name, name_style),
+                Span::styled(&coll.name, name_style),
                 Span::styled(
                     badge,
                     Style::default().fg(Color::DarkGray),
@@ -2205,15 +2205,15 @@ impl App {
 
         if items.is_empty() {
             items.push(ListItem::new(Line::from(Span::styled(
-                "No profiles. Click [+Profile] or press [n] to create one.",
+                "No collections. Click [+Collection] or press [n] to create one.",
                 Style::default().fg(Color::DarkGray),
             ))));
         }
 
         let title = if area.width >= 34 {
-            " Profiles (Top Wins Priority) "
+            " Collections (Top Wins Priority) "
         } else {
-            " Profiles (Top Wins) "
+            " Collections (Top Wins) "
         };
         let list = List::new(items)
             .block(
@@ -2232,8 +2232,8 @@ impl App {
             .highlight_symbol("▶ ");
 
         let mut state = ListState::default();
-        if !self.data.profiles.is_empty() {
-            state.select(Some(self.selected_profile));
+        if !self.data.collections.is_empty() {
+            state.select(Some(self.selected_collection));
         }
         frame.render_stateful_widget(list, area, &mut state);
     }
@@ -2261,12 +2261,12 @@ impl App {
                 .add_modifier(Modifier::BOLD),
         );
 
-        let title = if let Some(prof) = self.current_profile() {
+        let title = if let Some(coll) = self.current_collection() {
             let count = vars.len();
             let var_word = if count == 1 { "variable" } else { "variables" };
-            if prof.is_phase() {
+            if coll.is_phase() {
                 let now = AppStateData::current_epoch_secs();
-                let sync_epoch = prof
+                let sync_epoch = coll
                     .last_sync_epoch
                     .filter(|&e| e > 0)
                     .or_else(|| (self.data.last_phase_sync_epoch > 0).then_some(self.data.last_phase_sync_epoch));
@@ -2274,19 +2274,19 @@ impl App {
                 let sync_time = crate::model::format_relative_sync_time(sync_epoch, now, compact);
                 if area.width >= 55 {
                     format!(
-                        " {} {} in {} profile • Last sync: {} ",
-                        count, var_word, prof.name, sync_time
+                        " {} {} in {} collection • Last sync: {} ",
+                        count, var_word, coll.name, sync_time
                     )
                 } else if area.width >= 40 {
-                    format!(" {} {} in {} • Last sync: {} ", count, var_word, prof.name, sync_time)
+                    format!(" {} {} in {} • Last sync: {} ", count, var_word, coll.name, sync_time)
                 } else {
                     format!(" {} vars • Sync: {} ", count, sync_time)
                 }
             } else {
-                format!(" {} {} in {} profile ", count, var_word, prof.name)
+                format!(" {} {} in {} collection ", count, var_word, coll.name)
             }
         } else {
-            " 0 variables in profile ".to_string()
+            " 0 variables in collection ".to_string()
         };
 
         let table = Table::new(
@@ -2330,13 +2330,13 @@ impl App {
         let effective = self.data.compute_effective_vars();
         let (header, constraints, rows): (Row, Vec<Constraint>, Vec<Row>) = if area.width >= 55 {
             (
-                Row::new(vec!["EXPORTED KEY", "EFFECTIVE VALUE", "PROFILE", "SOURCE"]).style(
+                Row::new(vec!["EXPORTED KEY", "EFFECTIVE VALUE", "COLLECTION", "SOURCE"]).style(
                     Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
                 ),
                 vec![
+                    Constraint::Percentage(26),
                     Constraint::Percentage(28),
-                    Constraint::Percentage(30),
-                    Constraint::Percentage(10),
+                    Constraint::Percentage(14),
                     Constraint::Percentage(32),
                 ],
                 effective
@@ -2354,13 +2354,13 @@ impl App {
             )
         } else {
             (
-                Row::new(vec!["KEY", "VAL", "PROFILE", "SOURCE"]).style(
+                Row::new(vec!["KEY", "VAL", "COLLECTION", "SOURCE"]).style(
                     Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
                 ),
                 vec![
                     Constraint::Length(3),
                     Constraint::Length(3),
-                    Constraint::Length(7),
+                    Constraint::Length(10),
                     Constraint::Length(6),
                 ],
                 effective
@@ -2777,7 +2777,7 @@ impl App {
                 }
             }
 
-            Modal::NewProfile {
+            Modal::NewCollection {
                 name,
                 pull_from_phase,
                 active_field,
@@ -2791,7 +2791,7 @@ impl App {
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(Color::Cyan))
                     .padding(Padding::new(1, 1, 1, 0))
-                    .title(" New Profile ");
+                    .title(" New Collection ");
                 let inner = block.inner(popup);
                 frame.render_widget(block, popup);
 
@@ -2802,14 +2802,14 @@ impl App {
 
                 let mut lines = vec![
                     Line::from(Span::styled(
-                        "Create New Environment Profile",
+                        "Create New Environment Collection",
                         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                     )),
                     Line::from(""),
                 ];
 
                 lines.extend(modern_input_lines(
-                    "1. Profile Name:",
+                    "1. Collection Name:",
                     name,
                     "e.g. staging, prod, test",
                     *active_field == 0,
@@ -2818,7 +2818,7 @@ impl App {
                 ));
                 lines.push(Line::from(""));
                 lines.extend(modern_vertical_radio_options(
-                    "2. Profile Data Source:",
+                    "2. Collection Data Source:",
                     &[
                         ("custom", "Custom Environment (Manual Variables)"),
                         ("phase", "Phase.dev Synchronization (Select App & Env)"),
@@ -3018,7 +3018,7 @@ impl App {
                 }
             }
 
-            Modal::ConfirmDeleteProfile { profile_name, .. } => {
+            Modal::ConfirmDeleteCollection { collection_name, .. } => {
                 let popup = get_modal_rect(&self.modal, area);
                 frame.render_widget(Clear, popup);
 
@@ -3027,7 +3027,7 @@ impl App {
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(Color::Red))
                     .padding(Padding::new(1, 1, 1, 0))
-                    .title(" Confirm Delete Profile ");
+                    .title(" Confirm Delete Collection ");
                 let inner = block.inner(popup);
                 frame.render_widget(block, popup);
 
@@ -3039,7 +3039,7 @@ impl App {
                 let lines = vec![
                     Line::from(""),
                     Line::from(Span::styled(
-                        format!("Delete profile '{}' and all its variables?", profile_name),
+                        format!("Delete collection '{}' and all its variables?", collection_name),
                         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                     )),
                     Line::from(""),
@@ -3090,8 +3090,8 @@ impl App {
                 }
             }
 
-            Modal::EditProfile {
-                profile_idx,
+            Modal::EditCollection {
+                collection_idx,
                 name,
                 error,
             } => {
@@ -3100,15 +3100,15 @@ impl App {
 
                 let is_phase = self
                     .data
-                    .profiles
-                    .get(*profile_idx)
-                    .map(|p| p.is_phase())
+                    .collections
+                    .get(*collection_idx)
+                    .map(|c| c.is_phase())
                     .unwrap_or(false);
                 let src_label = self
                     .data
-                    .profiles
-                    .get(*profile_idx)
-                    .map(|p| p.source_label())
+                    .collections
+                    .get(*collection_idx)
+                    .map(|c| c.source_label())
                     .unwrap_or_else(|| "Custom".to_string());
 
                 let block = Block::default()
@@ -3116,7 +3116,7 @@ impl App {
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(Color::Cyan))
                     .padding(Padding::new(1, 1, 1, 0))
-                    .title(" Edit Profile ");
+                    .title(" Edit Collection ");
                 let inner = block.inner(popup);
                 frame.render_widget(block, popup);
 
@@ -3134,9 +3134,9 @@ impl App {
                 ];
 
                 lines.extend(modern_input_lines(
-                    "Rename Profile:",
+                    "Rename Collection:",
                     name,
-                    "enter profile name",
+                    "enter collection name",
                     true,
                     36,
                     self.input_cursor,
@@ -3216,10 +3216,10 @@ impl App {
                     Line::from(""),
                     Line::from(vec![
                         Span::styled(pfx0, s0),
-                        Span::styled("1. Phase Sync Profile Scope       : ", s0),
-                        Span::styled(if draft.sync_only_enabled_profiles { " [● Enabled Only] " } else { " [○ Enabled Only] " }, if draft.sync_only_enabled_profiles { active_pill } else { inactive_pill }),
+                        Span::styled("1. Phase Sync Collection Scope    : ", s0),
+                        Span::styled(if draft.sync_only_enabled_collections { " [● Enabled Only] " } else { " [○ Enabled Only] " }, if draft.sync_only_enabled_collections { active_pill } else { inactive_pill }),
                         Span::raw(" "),
-                        Span::styled(if !draft.sync_only_enabled_profiles { " [● All Phase] " } else { " [○ All Phase] " }, if !draft.sync_only_enabled_profiles { active_pill } else { inactive_pill }),
+                        Span::styled(if !draft.sync_only_enabled_collections { " [● All Phase] " } else { " [○ All Phase] " }, if !draft.sync_only_enabled_collections { active_pill } else { inactive_pill }),
                     ]),
                     Line::from(vec![
                         Span::styled(pfx1, s1),
@@ -3237,10 +3237,10 @@ impl App {
                     ]),
                     Line::from(vec![
                         Span::styled(pfx3, s3),
-                        Span::styled("4. New Profile Default Placement : ", s3),
-                        Span::styled(if draft.insert_new_profile_at_top { " [● Top Priority #1] " } else { " [○ Top Priority #1] " }, if draft.insert_new_profile_at_top { active_pill } else { inactive_pill }),
+                        Span::styled("4. New Collection Default Place  : ", s3),
+                        Span::styled(if draft.insert_new_collection_at_top { " [● Top Priority #1] " } else { " [○ Top Priority #1] " }, if draft.insert_new_collection_at_top { active_pill } else { inactive_pill }),
                         Span::raw(" "),
-                        Span::styled(if !draft.insert_new_profile_at_top { " [● Bottom of List] " } else { " [○ Bottom of List] " }, if !draft.insert_new_profile_at_top { active_pill } else { inactive_pill }),
+                        Span::styled(if !draft.insert_new_collection_at_top { " [● Bottom of List] " } else { " [○ Bottom of List] " }, if !draft.insert_new_collection_at_top { active_pill } else { inactive_pill }),
                     ]),
                     Line::from(vec![
                         Span::styled(pfx4, s4),
@@ -3300,7 +3300,7 @@ impl App {
                     Line::from(Span::styled("Mouse Actions", sec_style)),
                     Line::from(vec![
                         Span::styled("  Left Click         ", key_style),
-                        Span::styled("Focus pane, select item, toggle [✓] profile, or click buttons", desc_style),
+                        Span::styled("Focus pane, select item, toggle [✓] collection, or click buttons", desc_style),
                     ]),
                     Line::from(vec![
                         Span::styled("  Right Click        ", key_style),
@@ -3311,18 +3311,18 @@ impl App {
                         Span::styled("Scroll items in the hovered pane or context menu", desc_style),
                     ]),
                     Line::from(""),
-                    Line::from(Span::styled("Profile & Variable Actions", sec_style)),
+                    Line::from(Span::styled("Collection & Variable Actions", sec_style)),
                     Line::from(vec![
                         Span::styled("  [Space]            ", key_style),
-                        Span::styled("Toggle selected profile ON / OFF", desc_style),
+                        Span::styled("Toggle selected collection ON / OFF", desc_style),
                     ]),
                     Line::from(vec![
                         Span::styled("  [u / d]            ", key_style),
-                        Span::styled("Move Priority up / down (top profile wins)", desc_style),
+                        Span::styled("Move Priority up / down (top collection wins)", desc_style),
                     ]),
                     Line::from(vec![
                         Span::styled("  [n]                ", key_style),
-                        Span::styled("Create a New Profile (Custom or Phase.dev)", desc_style),
+                        Span::styled("Create a New Collection (Custom or Phase.dev)", desc_style),
                     ]),
                     Line::from(vec![
                         Span::styled("  [a]                ", key_style),
@@ -3330,11 +3330,11 @@ impl App {
                     ]),
                     Line::from(vec![
                         Span::styled("  [e / Enter]        ", key_style),
-                        Span::styled("Edit selected profile or variable", desc_style),
+                        Span::styled("Edit selected collection or variable", desc_style),
                     ]),
                     Line::from(vec![
                         Span::styled("  [x / Delete]       ", key_style),
-                        Span::styled("Delete selected profile or variable", desc_style),
+                        Span::styled("Delete selected collection or variable", desc_style),
                     ]),
                     Line::from(""),
                     Line::from(Span::styled("Phase.dev, View & System", sec_style)),
@@ -3360,7 +3360,7 @@ impl App {
                     ]),
                     Line::from(vec![
                         Span::styled("  [Tab / Shift+Tab]  ", key_style),
-                        Span::styled("Cycle focus between Profiles, Variables, and Effective panes", desc_style),
+                        Span::styled("Cycle focus between Collections, Variables, and Effective panes", desc_style),
                     ]),
                     Line::from(vec![
                         Span::styled("  [?] / [q]          ", key_style),
@@ -3379,22 +3379,22 @@ impl App {
         }
     }
 
-    fn profile_index_at_row(&self, profiles_rect: Rect, row: u16) -> Option<usize> {
-        let item_start_y = profiles_rect.y.saturating_add(2);
-        let item_end_y = profiles_rect
+    fn collection_index_at_row(&self, collections_rect: Rect, row: u16) -> Option<usize> {
+        let item_start_y = collections_rect.y.saturating_add(2);
+        let item_end_y = collections_rect
             .y
-            .saturating_add(profiles_rect.height.saturating_sub(1));
-        if row < item_start_y || row >= item_end_y || self.data.profiles.is_empty() {
+            .saturating_add(collections_rect.height.saturating_sub(1));
+        if row < item_start_y || row >= item_end_y || self.data.collections.is_empty() {
             return None;
         }
         let visible_rows = (item_end_y - item_start_y) as usize;
-        let offset = if visible_rows > 0 && self.selected_profile >= visible_rows {
-            self.selected_profile + 1 - visible_rows
+        let offset = if visible_rows > 0 && self.selected_collection >= visible_rows {
+            self.selected_collection + 1 - visible_rows
         } else {
             0
         };
         let idx = offset + (row - item_start_y) as usize;
-        (idx < self.data.profiles.len()).then_some(idx)
+        (idx < self.data.collections.len()).then_some(idx)
     }
 
     fn var_index_at_row(&self, vars_rect: Rect, row: u16) -> Option<usize> {
@@ -3437,9 +3437,9 @@ impl App {
 
     fn scroll_pane_up(&mut self, pane: FocusPane) {
         match pane {
-            FocusPane::Profiles => {
-                if self.selected_profile > 0 {
-                    self.selected_profile -= 1;
+            FocusPane::Collections => {
+                if self.selected_collection > 0 {
+                    self.selected_collection -= 1;
                     self.selected_var = 0;
                 }
             }
@@ -3458,9 +3458,9 @@ impl App {
 
     fn scroll_pane_down(&mut self, pane: FocusPane) {
         match pane {
-            FocusPane::Profiles => {
-                if self.selected_profile + 1 < self.data.profiles.len() {
-                    self.selected_profile += 1;
+            FocusPane::Collections => {
+                if self.selected_collection + 1 < self.data.collections.len() {
+                    self.selected_collection += 1;
                     self.selected_var = 0;
                 }
             }
@@ -3564,7 +3564,7 @@ impl App {
             return;
         }
 
-        let (header_rect, profiles_rect, vars_rect, effective_rect, status_bar_rect) =
+        let (header_rect, collections_rect, vars_rect, effective_rect, status_bar_rect) =
             compute_layout_chunks(area);
 
         match mouse.kind {
@@ -3591,34 +3591,34 @@ impl App {
                         let right_edge = header_rect.x + header_rect.width - 1;
                         let offset_from_right = right_edge.saturating_sub(mouse.column);
                         // Toolbar layout from right edge:
-                        // " [+Profile]  [+Var]  [Sync All]  [Show]  [Settings] " (total 56 chars)
+                        // " [+Collection]  [+Var]  [Sync All]  [Show]  [Settings] " (total 59 chars)
                         if offset_from_right < 13 {
                             self.open_settings_modal();
                         } else if offset_from_right < 22 {
                             self.toggle_mask_values();
                         } else if offset_from_right < 35 {
-                            self.sync_all_phase_profiles();
+                            self.sync_all_phase_collections();
                         } else if offset_from_right < 44 {
                             self.open_add_var_modal();
-                        } else if offset_from_right < 57 {
-                            self.open_new_profile_modal();
+                        } else if offset_from_right < 59 {
+                            self.open_new_collection_modal();
                         }
                     }
                     return;
                 }
 
                 // Panes & items left-click handling
-                if rect_contains(profiles_rect, mouse.column, mouse.row) {
-                    self.focus = FocusPane::Profiles;
-                    if let Some(idx) = self.profile_index_at_row(profiles_rect, mouse.row) {
-                        if self.selected_profile != idx {
-                            self.selected_profile = idx;
+                if rect_contains(collections_rect, mouse.column, mouse.row) {
+                    self.focus = FocusPane::Collections;
+                    if let Some(idx) = self.collection_index_at_row(collections_rect, mouse.row) {
+                        if self.selected_collection != idx {
+                            self.selected_collection = idx;
                             self.selected_var = 0;
                         }
-                        let check_start = profiles_rect.x.saturating_add(4);
-                        let check_end = profiles_rect.x.saturating_add(7);
+                        let check_start = collections_rect.x.saturating_add(4);
+                        let check_end = collections_rect.x.saturating_add(7);
                         if mouse.column >= check_start && mouse.column < check_end {
-                            self.toggle_current_profile();
+                            self.toggle_current_collection();
                         }
                     }
                 } else if rect_contains(vars_rect, mouse.column, mouse.row) {
@@ -3635,16 +3635,16 @@ impl App {
             }
 
             MouseEventKind::Down(MouseButton::Right) => {
-                if rect_contains(profiles_rect, mouse.column, mouse.row) {
-                    self.focus = FocusPane::Profiles;
-                    if let Some(idx) = self.profile_index_at_row(profiles_rect, mouse.row) {
-                        if self.selected_profile != idx {
-                            self.selected_profile = idx;
+                if rect_contains(collections_rect, mouse.column, mouse.row) {
+                    self.focus = FocusPane::Collections;
+                    if let Some(idx) = self.collection_index_at_row(collections_rect, mouse.row) {
+                        if self.selected_collection != idx {
+                            self.selected_collection = idx;
                             self.selected_var = 0;
                         }
                     }
                     self.open_context_menu_for_pane(
-                        FocusPane::Profiles,
+                        FocusPane::Collections,
                         mouse.column,
                         mouse.row,
                     );
@@ -3668,8 +3668,8 @@ impl App {
             }
 
             MouseEventKind::ScrollUp => {
-                let target_pane = if rect_contains(profiles_rect, mouse.column, mouse.row) {
-                    FocusPane::Profiles
+                let target_pane = if rect_contains(collections_rect, mouse.column, mouse.row) {
+                    FocusPane::Collections
                 } else if rect_contains(vars_rect, mouse.column, mouse.row) {
                     FocusPane::Vars
                 } else if rect_contains(effective_rect, mouse.column, mouse.row) {
@@ -3681,8 +3681,8 @@ impl App {
             }
 
             MouseEventKind::ScrollDown => {
-                let target_pane = if rect_contains(profiles_rect, mouse.column, mouse.row) {
-                    FocusPane::Profiles
+                let target_pane = if rect_contains(collections_rect, mouse.column, mouse.row) {
+                    FocusPane::Collections
                 } else if rect_contains(vars_rect, mouse.column, mouse.row) {
                     FocusPane::Vars
                 } else if rect_contains(effective_rect, mouse.column, mouse.row) {
@@ -3726,7 +3726,7 @@ impl App {
                     }
                 }
             }
-            Modal::NewProfile {
+            Modal::NewCollection {
                 name,
                 active_field,
                 error,
@@ -3760,7 +3760,7 @@ impl App {
                 }
                 *error = None;
             }
-            Modal::EditProfile { name, error, .. } => {
+            Modal::EditCollection { name, error, .. } => {
                 for c in clean.chars() {
                     insert_char_at(name, self.input_cursor, c);
                     self.input_cursor += 1;
@@ -3812,7 +3812,7 @@ impl App {
         }
 
         match &mut self.modal {
-            Modal::NewProfile {
+            Modal::NewCollection {
                 active_field,
                 pull_from_phase,
                 name,
@@ -3852,7 +3852,7 @@ impl App {
                     }
                 }
             }
-            Modal::EditProfile { name, .. } => {
+            Modal::EditCollection { name, .. } => {
                 if col >= block_inner.x + 6 {
                     self.input_cursor = ((col - (block_inner.x + 6)) as usize).min(name.chars().count());
                 } else {
@@ -3871,14 +3871,14 @@ impl App {
                     if col >= block_inner.x + 36 {
                         match idx {
                             0 => {
-                                draft.sync_only_enabled_profiles =
-                                    !draft.sync_only_enabled_profiles
+                                draft.sync_only_enabled_collections =
+                                    !draft.sync_only_enabled_collections
                             }
                             1 => draft.phase_export_all_paths = !draft.phase_export_all_paths,
                             2 => draft.mask_secrets_by_default = !draft.mask_secrets_by_default,
                             3 => {
-                                draft.insert_new_profile_at_top =
-                                    !draft.insert_new_profile_at_top
+                                draft.insert_new_collection_at_top =
+                                    !draft.insert_new_collection_at_top
                             }
                             4 => draft.shell_prompt_hook = !draft.shell_prompt_hook,
                             _ => {}
@@ -3961,11 +3961,11 @@ pub fn compact_modal_rect(width: u16, height: u16, area: Rect) -> Rect {
 pub fn get_modal_rect(modal: &Modal, area: Rect) -> Rect {
     match modal {
         Modal::None => Rect::default(),
-        Modal::ConfirmDeleteProfile { .. } | Modal::ConfirmDeleteVar { .. } => {
+        Modal::ConfirmDeleteCollection { .. } | Modal::ConfirmDeleteVar { .. } => {
             compact_modal_rect(54, 9, area)
         }
-        Modal::EditProfile { .. } => compact_modal_rect(58, 12, area),
-        Modal::NewProfile { .. } => compact_modal_rect(64, 14, area),
+        Modal::EditCollection { .. } => compact_modal_rect(58, 12, area),
+        Modal::NewCollection { .. } => compact_modal_rect(64, 14, area),
         Modal::VarEditor { .. } => compact_modal_rect(64, 14, area),
         Modal::Settings { .. } => compact_modal_rect(70, 16, area),
         Modal::PhaseConnect { .. } => compact_modal_rect(70, 20, area),
@@ -3984,7 +3984,7 @@ pub struct ModalButtons {
 pub fn get_modal_buttons(modal: &Modal) -> Option<ModalButtons> {
     match modal {
         Modal::None => None,
-        Modal::NewProfile { .. } => Some(ModalButtons {
+        Modal::NewCollection { .. } => Some(ModalButtons {
             primary: " [Create] ",
             cancel: " [Cancel] ",
             is_danger: false,
@@ -3994,12 +3994,12 @@ pub fn get_modal_buttons(modal: &Modal) -> Option<ModalButtons> {
             cancel: " [Cancel] ",
             is_danger: false,
         }),
-        Modal::EditProfile { .. } => Some(ModalButtons {
+        Modal::EditCollection { .. } => Some(ModalButtons {
             primary: " [Save] ",
             cancel: " [Cancel] ",
             is_danger: false,
         }),
-        Modal::ConfirmDeleteProfile { .. } | Modal::ConfirmDeleteVar { .. } => Some(ModalButtons {
+        Modal::ConfirmDeleteCollection { .. } | Modal::ConfirmDeleteVar { .. } => Some(ModalButtons {
             primary: " [Delete] ",
             cancel: " [Cancel] ",
             is_danger: true,
@@ -4390,8 +4390,8 @@ pub fn compute_layout_chunks(area: Rect) -> (Rect, Rect, Rect, Rect, Rect) {
 
 #[cfg(test)]
 pub fn compute_pane_areas(area: Rect) -> (Rect, Rect, Rect) {
-    let (_, profiles, vars, effective, _) = compute_layout_chunks(area);
-    (profiles, vars, effective)
+    let (_, collections, vars, effective, _) = compute_layout_chunks(area);
+    (collections, vars, effective)
 }
 
 pub fn run_tui() -> Result<(), String> {
@@ -4467,15 +4467,15 @@ mod tests {
 
     fn make_test_app() -> App {
         let mut data = AppStateData::default();
-        data.profiles[0].vars.push(EnvVar::new(
+        data.collections[0].vars.push(EnvVar::new(
             "API_KEY".to_string(),
             "sk-123456789xyz".to_string(),
             VarSource::Custom,
         ));
         App {
             data,
-            focus: FocusPane::Profiles,
-            selected_profile: 0,
+            focus: FocusPane::Collections,
+            selected_collection: 0,
             selected_var: 0,
             selected_effective: 0,
             show_values: false,
@@ -4494,31 +4494,31 @@ mod tests {
     }
 
     #[test]
-    fn test_default_profile_can_be_edited_renamed_toggled_deleted() {
+    fn test_default_collection_can_be_edited_renamed_toggled_deleted() {
         let mut app = make_test_app();
-        assert_eq!(app.data.profiles[0].name, "default");
-        assert!(app.data.profiles[0].enabled);
+        assert_eq!(app.data.collections[0].name, "default");
+        assert!(app.data.collections[0].enabled);
 
         // 1. Toggle OFF
         app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
-        assert!(!app.data.profiles[0].enabled);
+        assert!(!app.data.collections[0].enabled);
         app.handle_key(KeyEvent::from(KeyCode::Enter));
 
         // 2. Toggle ON
         app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
-        assert!(app.data.profiles[0].enabled);
+        assert!(app.data.collections[0].enabled);
         app.handle_key(KeyEvent::from(KeyCode::Enter));
 
         // 3. Edit (Rename) via 'e'
         app.handle_key(KeyEvent::from(KeyCode::Char('e')));
         match &app.modal {
-            Modal::EditProfile {
-                profile_idx, name, ..
+            Modal::EditCollection {
+                collection_idx, name, ..
             } => {
-                assert_eq!(*profile_idx, 0);
+                assert_eq!(*collection_idx, 0);
                 assert_eq!(name, "default");
             }
-            _ => panic!("Expected Modal::EditProfile"),
+            _ => panic!("Expected Modal::EditCollection"),
         }
 
         // Type new name: Ctrl+u to clear, type "staging", Enter
@@ -4528,56 +4528,56 @@ mod tests {
         }
         app.handle_key(KeyEvent::from(KeyCode::Enter));
         assert!(matches!(app.modal, Modal::None));
-        assert_eq!(app.data.profiles[0].name, "staging");
+        assert_eq!(app.data.collections[0].name, "staging");
         app.handle_key(KeyEvent::from(KeyCode::Enter));
 
         // 4. Delete via 'x'
         app.handle_key(KeyEvent::from(KeyCode::Char('x')));
-        assert!(matches!(app.modal, Modal::ConfirmDeleteProfile { .. }));
+        assert!(matches!(app.modal, Modal::ConfirmDeleteCollection { .. }));
         app.handle_key(KeyEvent::from(KeyCode::Char('y')));
-        assert!(app.data.profiles.is_empty());
+        assert!(app.data.collections.is_empty());
     }
 
     #[test]
     fn test_move_priority_shortcut_u_d() {
         let mut app = make_test_app();
-        app.data.profiles.push(Profile {
-            name: "second_profile".to_string(),
+        app.data.collections.push(Collection {
+            name: "second_collection".to_string(),
             enabled: true,
             phase_binding: None,
             last_sync_epoch: None,
             vars: Vec::new(),
         });
-        assert_eq!(app.data.profiles[0].name, "default");
-        assert_eq!(app.data.profiles[1].name, "second_profile");
+        assert_eq!(app.data.collections[0].name, "default");
+        assert_eq!(app.data.collections[1].name, "second_collection");
 
-        app.selected_profile = 1;
+        app.selected_collection = 1;
 
         app.handle_key(KeyEvent::from(KeyCode::Char('u')));
-        assert_eq!(app.data.profiles[0].name, "second_profile");
-        assert_eq!(app.data.profiles[1].name, "default");
-        assert_eq!(app.selected_profile, 0);
+        assert_eq!(app.data.collections[0].name, "second_collection");
+        assert_eq!(app.data.collections[1].name, "default");
+        assert_eq!(app.selected_collection, 0);
         app.handle_key(KeyEvent::from(KeyCode::Enter));
 
         app.handle_key(KeyEvent::from(KeyCode::Char('d')));
-        assert_eq!(app.data.profiles[0].name, "default");
-        assert_eq!(app.data.profiles[1].name, "second_profile");
-        assert_eq!(app.selected_profile, 1);
+        assert_eq!(app.data.collections[0].name, "default");
+        assert_eq!(app.data.collections[1].name, "second_collection");
+        assert_eq!(app.selected_collection, 1);
         app.handle_key(KeyEvent::from(KeyCode::Enter));
 
         app.handle_key(KeyEvent::from(KeyCode::Char('K')));
-        assert_eq!(app.data.profiles[1].name, "second_profile");
+        assert_eq!(app.data.collections[1].name, "second_collection");
         app.handle_key(KeyEvent::from(KeyCode::Char('J')));
-        assert_eq!(app.data.profiles[1].name, "second_profile");
+        assert_eq!(app.data.collections[1].name, "second_collection");
     }
 
     #[test]
     fn test_edit_action_works_across_panes() {
         let mut app = make_test_app();
 
-        app.focus = FocusPane::Profiles;
+        app.focus = FocusPane::Collections;
         app.handle_key(KeyEvent::from(KeyCode::Char('e')));
-        assert!(matches!(app.modal, Modal::EditProfile { .. }));
+        assert!(matches!(app.modal, Modal::EditCollection { .. }));
         app.modal = Modal::None;
 
         app.focus = FocusPane::Vars;
@@ -4611,11 +4611,11 @@ mod tests {
     }
 
     #[test]
-    fn test_phase_profile_disallows_manual_var_mixing() {
+    fn test_phase_collection_disallows_manual_var_mixing() {
         let mut app = make_test_app();
-        app.data.profiles.insert(
+        app.data.collections.insert(
             0,
-            Profile::new_phase(
+            Collection::new_phase(
                 "phase_prod".to_string(),
                 PhaseBinding {
                     app_id: "app1".to_string(),
@@ -4626,20 +4626,20 @@ mod tests {
                 vec![("PHASE_SECRET".to_string(), "val123456".to_string())],
             ),
         );
-        app.selected_profile = 0;
+        app.selected_collection = 0;
 
-        // Pressing 'a' on a Phase profile must NOT open VarEditor
+        // Pressing 'a' on a Phase collection must NOT open VarEditor
         app.handle_key(KeyEvent::from(KeyCode::Char('a')));
         assert!(matches!(app.modal, Modal::None));
         assert!(app.is_error_status);
 
-        // Pressing 'e' on Vars pane of a Phase profile must NOT open VarEditor
+        // Pressing 'e' on Vars pane of a Phase collection must NOT open VarEditor
         app.focus = FocusPane::Vars;
         app.handle_key(KeyEvent::from(KeyCode::Char('e')));
         assert!(matches!(app.modal, Modal::None));
         assert!(app.is_error_status);
 
-        // Pressing 'x' on Vars pane of a Phase profile must NOT open ConfirmDeleteVar
+        // Pressing 'x' on Vars pane of a Phase collection must NOT open ConfirmDeleteVar
         app.handle_key(KeyEvent::from(KeyCode::Char('x')));
         assert!(matches!(app.modal, Modal::None));
         assert!(app.is_error_status);
@@ -4648,29 +4648,29 @@ mod tests {
     #[test]
     fn test_settings_modal_toggle_options() {
         let mut app = make_test_app();
-        assert!(app.data.settings.sync_only_enabled_profiles);
+        assert!(app.data.settings.sync_only_enabled_collections);
 
         // Open settings with 's'
         app.handle_key(KeyEvent::from(KeyCode::Char('s')));
         assert!(matches!(app.modal, Modal::Settings { .. }));
 
-        // Field 0: toggle sync_only_enabled_profiles with Space
+        // Field 0: toggle sync_only_enabled_collections with Space
         app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
         // Save with Enter
         app.handle_key(KeyEvent::from(KeyCode::Enter));
 
         assert!(matches!(app.modal, Modal::None));
-        assert!(!app.data.settings.sync_only_enabled_profiles);
+        assert!(!app.data.settings.sync_only_enabled_collections);
     }
 
     #[test]
-    fn test_vars_panel_title_shows_last_sync_only_for_phase_profiles() {
+    fn test_vars_panel_title_shows_last_sync_only_for_phase_collections() {
         let mut app = make_test_app();
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        // 1. Initially, selected profile is 'default' (Custom profile)
-        assert!(app.data.profiles[0].is_custom());
+        // 1. Initially, selected collection is 'default' (Custom collection)
+        assert!(app.data.collections[0].is_custom());
         terminal.draw(|f| app.draw(f)).unwrap();
         let buffer = terminal.backend().buffer();
         let content: String = (0..buffer.area.height)
@@ -4682,11 +4682,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(content.contains("1 variable in default profile"));
+        assert!(content.contains("1 variable in default collection"));
         assert!(!content.contains("Last sync"));
 
-        // 2. Add and select a Phase profile
-        let phase_prof = Profile::new_phase(
+        // 2. Add and select a Phase collection
+        let phase_coll = Collection::new_phase(
             "phase_prod".to_string(),
             PhaseBinding {
                 app_id: "app1".to_string(),
@@ -4696,9 +4696,9 @@ mod tests {
             },
             vec![("PHASE_KEY".to_string(), "val".to_string())],
         );
-        app.data.profiles.push(phase_prof);
-        app.selected_profile = 1;
-        assert!(app.data.profiles[1].is_phase());
+        app.data.collections.push(phase_coll);
+        app.selected_collection = 1;
+        assert!(app.data.collections[1].is_phase());
 
         terminal.draw(|f| app.draw(f)).unwrap();
         let buffer = terminal.backend().buffer();
@@ -4711,11 +4711,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(content2.contains("1 variable in phase_prod profile"));
+        assert!(content2.contains("1 variable in phase_prod collection"));
         assert!(content2.contains("Last sync: just now"));
 
-        // 3. Switch back to custom profile (index 0)
-        app.selected_profile = 0;
+        // 3. Switch back to custom collection (index 0)
+        app.selected_collection = 0;
         terminal.draw(|f| app.draw(f)).unwrap();
         let buffer = terminal.backend().buffer();
         let content3: String = (0..buffer.area.height)
@@ -4727,7 +4727,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(content3.contains("1 variable in default profile"));
+        assert!(content3.contains("1 variable in default collection"));
         assert!(!content3.contains("Last sync"));
     }
 
@@ -4748,14 +4748,14 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(content.contains("Profiles (Top Wins"));
-        assert!(!content.contains("1. Default & Profiles"));
-        assert!(!content.contains("Profiles (Top #1 Wins Priority)"));
+        assert!(content.contains("Collections (Top Wins"));
+        assert!(!content.contains("1. Default & Collections"));
+        assert!(!content.contains("Collections (Top #1 Wins Priority)"));
         assert!(content.contains("1 variable in default"));
-        assert!(!content.contains("Variables in Profile:"));
-        assert!(!content.contains("Variables in profile"));
+        assert!(!content.contains("Variables in Collection:"));
+        assert!(!content.contains("Variables in collection"));
         assert!(!content.contains("(1v)"));
-        assert!(!content.contains("Profile #1"));
+        assert!(!content.contains("Collection #1"));
         assert!(!content.contains("2. Variables in"));
         assert!(content.contains("Active System Environment"));
         assert!(!content.contains("3. Active System Environment"));
@@ -4766,10 +4766,10 @@ mod tests {
         assert!(content.contains("?"));
         assert!(content.contains("Shortcuts"));
         assert!(!content.contains("[K/J"));
-        assert!(content.contains("PROFILE"));
-        assert!(!content.contains("WINNING PROFILE"));
-        assert!(content.contains("PROFILE"));
-        assert!(!content.contains("WINNING PROFILE"));
+        assert!(content.contains("COLLECTION"));
+        assert!(!content.contains("WINNING COLLECTION"));
+        assert!(content.contains("COLLECTION"));
+        assert!(!content.contains("WINNING COLLECTION"));
         assert!(!content.contains("Ready"));
         assert!(content.contains("Environtment Variables Manager"));
         assert!(content.contains("[Settings]"));
@@ -4834,34 +4834,34 @@ mod tests {
     #[test]
     fn test_mouse_click_and_right_click_items_and_context_menu() {
         let mut app = make_test_app();
-        app.data.profiles[0].vars.push(EnvVar::new(
+        app.data.collections[0].vars.push(EnvVar::new(
             "SECOND_KEY".to_string(),
             "val-987654321".to_string(),
             VarSource::Custom,
         ));
-        app.data.profiles.push(Profile::new_custom("staging".to_string()));
+        app.data.collections.push(Collection::new_custom("staging".to_string()));
         app.last_area = Rect::new(0, 0, 120, 30);
 
-        let (profiles_rect, vars_rect, _) = compute_pane_areas(app.last_area);
+        let (collections_rect, vars_rect, _) = compute_pane_areas(app.last_area);
 
-        // 1. Left-click the second profile ("staging" at row profiles_rect.y + 3)
+        // 1. Left-click the second collection ("staging" at row collections_rect.y + 3)
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: profiles_rect.x + 8,
-            row: profiles_rect.y + 3,
+            column: collections_rect.x + 8,
+            row: collections_rect.y + 3,
             modifiers: KeyModifiers::empty(),
         });
-        assert_eq!(app.focus, FocusPane::Profiles);
-        assert_eq!(app.selected_profile, 1);
+        assert_eq!(app.focus, FocusPane::Collections);
+        assert_eq!(app.selected_collection, 1);
 
-        // 2. Left-click back on the first profile ("default" at row profiles_rect.y + 2)
+        // 2. Left-click back on the first collection ("default" at row collections_rect.y + 2)
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: profiles_rect.x + 8,
-            row: profiles_rect.y + 2,
+            column: collections_rect.x + 8,
+            row: collections_rect.y + 2,
             modifiers: KeyModifiers::empty(),
         });
-        assert_eq!(app.selected_profile, 0);
+        assert_eq!(app.selected_collection, 0);
 
         // 3. Left-click the second variable ("SECOND_KEY" at row vars_rect.y + 4)
         app.handle_mouse(MouseEvent {
@@ -4977,7 +4977,7 @@ mod tests {
     fn test_mouse_click_gains_focus_on_panes() {
         let mut app = make_test_app();
         app.last_area = Rect::new(0, 0, 100, 30);
-        let (profiles_rect, vars_rect, effective_rect) = compute_pane_areas(app.last_area);
+        let (collections_rect, vars_rect, effective_rect) = compute_pane_areas(app.last_area);
 
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -4997,11 +4997,11 @@ mod tests {
 
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: profiles_rect.x + 2,
-            row: profiles_rect.y + 2,
+            column: collections_rect.x + 2,
+            row: collections_rect.y + 2,
             modifiers: KeyModifiers::empty(),
         });
-        assert_eq!(app.focus, FocusPane::Profiles);
+        assert_eq!(app.focus, FocusPane::Collections);
 
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Right),
@@ -5012,7 +5012,7 @@ mod tests {
         assert_eq!(app.focus, FocusPane::Vars);
         assert!(app.context_menu.is_some());
         app.context_menu = None;
-        app.focus = FocusPane::Profiles;
+        app.focus = FocusPane::Collections;
 
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -5020,7 +5020,7 @@ mod tests {
             row: 1,
             modifiers: KeyModifiers::empty(),
         });
-        assert_eq!(app.focus, FocusPane::Profiles);
+        assert_eq!(app.focus, FocusPane::Collections);
 
         app.modal = Modal::ConfirmDeleteVar {
             var_idx: 0,
@@ -5032,32 +5032,32 @@ mod tests {
             row: vars_rect.y + 2,
             modifiers: KeyModifiers::empty(),
         });
-        assert_eq!(app.focus, FocusPane::Profiles);
+        assert_eq!(app.focus, FocusPane::Collections);
     }
 
     #[test]
     fn test_keyboard_navigation_between_panes() {
         let mut app = make_test_app();
-        assert_eq!(app.focus, FocusPane::Profiles);
+        assert_eq!(app.focus, FocusPane::Collections);
 
         app.handle_key(KeyEvent::from(KeyCode::Tab));
         assert_eq!(app.focus, FocusPane::Vars);
         app.handle_key(KeyEvent::from(KeyCode::Tab));
         assert_eq!(app.focus, FocusPane::Effective);
         app.handle_key(KeyEvent::from(KeyCode::Tab));
-        assert_eq!(app.focus, FocusPane::Profiles);
+        assert_eq!(app.focus, FocusPane::Collections);
 
         app.handle_key(KeyEvent::from(KeyCode::BackTab));
         assert_eq!(app.focus, FocusPane::Effective);
         app.handle_key(KeyEvent::from(KeyCode::BackTab));
         assert_eq!(app.focus, FocusPane::Vars);
         app.handle_key(KeyEvent::from(KeyCode::BackTab));
-        assert_eq!(app.focus, FocusPane::Profiles);
+        assert_eq!(app.focus, FocusPane::Collections);
 
         app.handle_key(KeyEvent::from(KeyCode::Char('l')));
         assert_eq!(app.focus, FocusPane::Vars);
         app.handle_key(KeyEvent::from(KeyCode::Char('h')));
-        assert_eq!(app.focus, FocusPane::Profiles);
+        assert_eq!(app.focus, FocusPane::Collections);
     }
 
     #[test]
@@ -5120,7 +5120,7 @@ mod tests {
         let mut app = make_test_app();
         app.data.phase.auth_method = PhaseAuthMethod::Token;
         app.data.phase.pat_token = "pss_user:mock_token".to_string();
-        app.data.profiles[0].phase_binding = Some(PhaseBinding {
+        app.data.collections[0].phase_binding = Some(PhaseBinding {
             app_id: "app-1".to_string(),
             app_name: "my-app".to_string(),
             env_id: "env-1".to_string(),
@@ -5162,7 +5162,7 @@ mod tests {
         assert!(!row_text.contains("Phase.dev sync in progress..."));
         assert!(screen_text.contains("Phase.dev sync in progress..."));
 
-        // 2. Perform pending sync (mock profile with non-existent secrets will return fail/mock)
+        // 2. Perform pending sync (mock collection with non-existent secrets will return fail/mock)
         app.perform_pending_sync();
         assert_eq!(app.pending_phase_sync, None);
         assert!(
@@ -5191,7 +5191,7 @@ mod tests {
         // 3. Test context menu sync action
         app.execute_context_action(ContextAction::PhaseSync);
         assert_eq!(app.status_message, "Phase.dev sync in progress...");
-        assert_eq!(app.pending_phase_sync, Some(PendingSyncTarget::Profile(0)));
+        assert_eq!(app.pending_phase_sync, Some(PendingSyncTarget::Collection(0)));
     }
 
     #[test]
@@ -5223,10 +5223,10 @@ mod tests {
     #[test]
     fn test_panel_widths_swapped() {
         let area = Rect::new(0, 0, 100, 30);
-        let (_, profiles, vars, _, _) = compute_layout_chunks(area);
+        let (_, collections, vars, _, _) = compute_layout_chunks(area);
 
         // Panel widths swapped: Left panel = 24%, Right panel = 76%
-        assert_eq!(profiles.width, 24);
+        assert_eq!(collections.width, 24);
         assert_eq!(vars.width, 76);
     }
 
@@ -5236,8 +5236,8 @@ mod tests {
         let area = Rect::new(0, 0, 120, 30);
         app.last_area = area;
 
-        // 1. Open New Profile modal
-        app.modal = Modal::NewProfile {
+        // 1. Open New Collection modal
+        app.modal = Modal::NewCollection {
             name: "new-prod".to_string(),
             pull_from_phase: false,
             active_field: 0,
@@ -5248,7 +5248,7 @@ mod tests {
         assert!(popup.width < area.width, "Popup must be compact and fitted");
         assert!(popup.height < area.height, "Popup must be compact and fitted");
 
-        // Click Cancel button in NewProfile popup
+        // Click Cancel button in NewCollection popup
         let btns = get_modal_buttons(&app.modal).expect("has buttons");
         let block_inner = Block::default()
             .borders(Borders::ALL)
@@ -5302,7 +5302,7 @@ mod tests {
             modifiers: KeyModifiers::empty(),
         });
         assert!(matches!(app.modal, Modal::None), "Clicking Save button must submit and close modal");
-        assert!(app.data.profiles[0].vars.iter().any(|v| v.key == "NEW_KEY"), "Variable must be created on Save click");
+        assert!(app.data.collections[0].vars.iter().any(|v| v.key == "NEW_KEY"), "Variable must be created on Save click");
     }
 
     #[test]
@@ -5335,7 +5335,7 @@ mod tests {
     #[test]
     fn test_text_input_cursor_navigation_left_right() {
         let mut app = make_test_app();
-        app.modal = Modal::NewProfile {
+        app.modal = Modal::NewCollection {
             name: "hello".to_string(),
             pull_from_phase: false,
             active_field: 0,
@@ -5353,8 +5353,8 @@ mod tests {
         app.handle_key(KeyEvent::from(KeyCode::Char('X')));
         assert_eq!(app.input_cursor, 4);
         match &app.modal {
-            Modal::NewProfile { name, .. } => assert_eq!(name, "helXlo"),
-            _ => panic!("Expected NewProfile modal"),
+            Modal::NewCollection { name, .. } => assert_eq!(name, "helXlo"),
+            _ => panic!("Expected NewCollection modal"),
         }
 
         // 3. Press Left arrow key once (cursor at 3, over 'X') and press Backspace (deletes 'l' at index 2)
@@ -5363,16 +5363,16 @@ mod tests {
         app.handle_key(KeyEvent::from(KeyCode::Backspace));
         assert_eq!(app.input_cursor, 2);
         match &app.modal {
-            Modal::NewProfile { name, .. } => assert_eq!(name, "heXlo"),
-            _ => panic!("Expected NewProfile modal"),
+            Modal::NewCollection { name, .. } => assert_eq!(name, "heXlo"),
+            _ => panic!("Expected NewCollection modal"),
         }
 
         // 4. Press Delete key (deletes 'X' at cursor 2) -> "helo"
         app.handle_key(KeyEvent::from(KeyCode::Delete));
         assert_eq!(app.input_cursor, 2);
         match &app.modal {
-            Modal::NewProfile { name, .. } => assert_eq!(name, "helo"),
-            _ => panic!("Expected NewProfile modal"),
+            Modal::NewCollection { name, .. } => assert_eq!(name, "helo"),
+            _ => panic!("Expected NewCollection modal"),
         }
 
         // 5. Press Right arrow key until end of string (index 4)
@@ -5386,9 +5386,9 @@ mod tests {
     }
 
     #[test]
-    fn test_new_profile_vertical_radios_and_no_source_note() {
+    fn test_new_collection_vertical_radios_and_no_source_note() {
         let mut app = make_test_app();
-        app.modal = Modal::NewProfile {
+        app.modal = Modal::NewCollection {
             name: String::new(),
             pull_from_phase: false,
             active_field: 1,
@@ -5427,7 +5427,7 @@ mod tests {
         assert_ne!(custom_row, phase_row, "Radio options must be on separate lines, not inline");
         assert_eq!(phase_row, custom_row + 1, "Radio options must be stacked vertically consecutive lines");
 
-        // 2. Note stating that each profile uses exclusively one source must NOT be present
+        // 2. Note stating that each collection uses exclusively one source must NOT be present
         assert!(!content.contains("exclusively one source"));
         assert!(!content.contains("sources cannot be mixed"));
     }
@@ -5435,7 +5435,7 @@ mod tests {
     #[test]
     fn test_effective_pane_source_column_not_truncated() {
         let mut app = make_test_app();
-        app.data.profiles.push(Profile::new_phase(
+        app.data.collections.push(Collection::new_phase(
             "staging".to_string(),
             PhaseBinding {
                 app_id: "app-1".to_string(),
@@ -5458,7 +5458,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(content.contains("PROFILE"));
+        assert!(content.contains("COLLECTION"));
         assert!(content.contains("Phase (my-app/production)"));
     }
 
@@ -5469,8 +5469,8 @@ mod tests {
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        // 1. Profiles pane context menu
-        app.open_context_menu_for_pane(FocusPane::Profiles, 10, 5);
+        // 1. Collections pane context menu
+        app.open_context_menu_for_pane(FocusPane::Collections, 10, 5);
         assert!(app.context_menu.is_some());
         let menu_rect = app.context_menu.as_ref().unwrap().rect(app.last_area);
         terminal.draw(|f| app.draw(f)).unwrap();
@@ -5485,9 +5485,9 @@ mod tests {
             .join("\n");
 
         // Header must be removed
-        assert!(!content.contains("Profile Actions"));
-        assert!(content.contains("Edit Profile"));
-        assert!(content.contains("Disable Profile"));
+        assert!(!content.contains("Collection Actions"));
+        assert!(content.contains("Edit Collection"));
+        assert!(content.contains("Disable Collection"));
 
         // Verify shortcuts are right-aligned: in every menu row, the closing bracket ']'
         // must be at the exact same column (menu_rect.x + menu_rect.width - 3)
@@ -5672,14 +5672,14 @@ mod tests {
         assert!(app.status_message.is_empty(), "Success popup must automatically close after ~5 seconds");
 
         // Success popup dismissed manually on Enter (OK button)
-        app.set_info("Created profile 'dev'");
-        assert_eq!(app.status_message, "Created profile 'dev'");
+        app.set_info("Created collection 'dev'");
+        assert_eq!(app.status_message, "Created collection 'dev'");
         app.handle_key(KeyEvent::from(KeyCode::Enter));
         assert!(app.status_message.is_empty(), "Enter key must dismiss success popup via OK button");
 
         // Success popup dismissed manually by clicking OK button
-        app.set_info("Created profile 'prod'");
-        assert_eq!(app.status_message, "Created profile 'prod'");
+        app.set_info("Created collection 'prod'");
+        assert_eq!(app.status_message, "Created collection 'prod'");
         let btn_rect = app.status_popup_ok_button_rect(app.last_area);
         // Clicking outside does not dismiss
         app.handle_mouse(MouseEvent {
@@ -5688,7 +5688,7 @@ mod tests {
             row: 5,
             modifiers: KeyModifiers::empty(),
         });
-        assert_eq!(app.status_message, "Created profile 'prod'");
+        assert_eq!(app.status_message, "Created collection 'prod'");
         // Clicking OK button dismisses
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -5704,7 +5704,7 @@ mod tests {
         let mut app = make_test_app();
         app.data.phase.auth_method = PhaseAuthMethod::Token;
         app.data.phase.pat_token = "pss_user:mock_token".to_string();
-        app.data.profiles[0].phase_binding = Some(PhaseBinding {
+        app.data.collections[0].phase_binding = Some(PhaseBinding {
             app_id: "app-1".to_string(),
             app_name: "my-app".to_string(),
             env_id: "env-1".to_string(),
@@ -5713,7 +5713,7 @@ mod tests {
 
         app.set_info("Phase.dev sync in progress...");
         app.sync_start_time = Some(Instant::now());
-        app.pending_phase_sync = Some(PendingSyncTarget::Profile(0));
+        app.pending_phase_sync = Some(PendingSyncTarget::Collection(0));
 
         let t0 = Instant::now();
         app.perform_pending_sync();
@@ -5744,11 +5744,11 @@ mod tests {
     }
 
     #[test]
-    fn test_phase_profile_vars_pane_hides_edit_button_and_copy_actions() {
+    fn test_phase_collection_vars_pane_hides_edit_button_and_copy_actions() {
         let mut app = make_test_app();
-        app.data.profiles.insert(
+        app.data.collections.insert(
             0,
-            Profile::new_phase(
+            Collection::new_phase(
                 "phase_prod".to_string(),
                 PhaseBinding {
                     app_id: "app1".to_string(),
@@ -5759,10 +5759,10 @@ mod tests {
                 vec![("SECRET_TOKEN".to_string(), "super_secret_val_123".to_string())],
             ),
         );
-        app.selected_profile = 0;
+        app.selected_collection = 0;
         app.last_area = Rect::new(0, 0, 120, 30);
 
-        // Open context menu for Vars pane of Phase profile
+        // Open context menu for Vars pane of Phase collection
         app.open_context_menu_for_pane(FocusPane::Vars, 30, 5);
         assert!(app.context_menu.is_some());
 
@@ -5771,7 +5771,7 @@ mod tests {
         terminal.draw(|f| app.draw(f)).unwrap();
 
         let buffer = terminal.backend().buffer();
-        let content: String = (0..buffer.area.height)
+        let screen: String = (0..buffer.area.height)
             .map(|y| {
                 (0..buffer.area.width)
                     .map(|x| buffer[(x, y)].symbol())
@@ -5780,19 +5780,19 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // 1. Edit Variable must be hidden for Phase profile
-        assert!(!content.contains("Edit Variable"), "Edit Variable must be hidden for Phase.dev profiles");
-        assert!(!content.contains("Delete Variable"), "Delete Variable must be hidden for Phase.dev profiles");
+        // 1. Edit Variable must be hidden for Phase collection
+        assert!(!screen.contains("Edit Variable"), "Edit Variable must be hidden for Phase.dev collections");
+        assert!(!screen.contains("Delete Variable"), "Delete Variable must be hidden for Phase.dev collections");
 
         // 2. Sync Phase.dev must be present
-        assert!(content.contains("Sync Phase.dev"));
+        assert!(screen.contains("Sync Phase.dev"));
 
         // 3. Mask Secret Values must be removed
-        assert!(!content.contains("Mask Secret Values"));
+        assert!(!screen.contains("Mask Secret Values"));
 
         // 4. Copy Key and Copy Value must be present
-        assert!(content.contains("Copy Key"));
-        assert!(content.contains("Copy Value"));
+        assert!(screen.contains("Copy Key"));
+        assert!(screen.contains("Copy Value"));
 
         // 5. Test Copy Key and Copy Value actions execute without errors
         app.focus = FocusPane::Vars;

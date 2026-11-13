@@ -4,7 +4,7 @@ mod shell;
 mod tui;
 
 use model::AppStateData;
-use phase::{detect_phase_cli, sync_phase_profiles};
+use phase::{detect_phase_cli, sync_phase_collections};
 use shell::{apply_state_to_system, generate_env_sh_content, reload_shell_environment};
 
 fn print_help() {
@@ -13,10 +13,10 @@ fn print_help() {
          USAGE:\n\
          \x20 envmgr            Launch the interactive Terminal UI (TUI)\n\
          \x20 envmgr export     Decrypt active variables and print shell export statements to stdout\n\
-         \x20 envmgr sync       Synchronize Phase.dev profiles using configured Auth (CLI or API Token)\n\
+         \x20 envmgr sync       Synchronize Phase.dev collections using configured Auth (CLI or API Token)\n\
          \x20 envmgr reload     Save encrypted state, ensure ~/.bashrc hook, and reload shell config\n\
          \x20 envmgr apply      Alias for `envmgr reload`\n\
-         \x20 envmgr status     Show active profiles, data sources, settings, and effective variables\n\
+         \x20 envmgr status     Show active collections, data sources, settings, and effective variables\n\
          \x20 envmgr --help     Show this help message"
     );
 }
@@ -37,15 +37,15 @@ fn main() {
             }
             "sync" => {
                 let mut state = AppStateData::load();
-                match sync_phase_profiles(&mut state, None) {
-                    Ok((prof_count, var_count)) => {
+                match sync_phase_collections(&mut state, None) {
+                    Ok((coll_count, var_count)) => {
                         if let Err(e) = apply_state_to_system(&state) {
                             eprintln!("Error saving synced state: {}", e);
                             std::process::exit(1);
                         }
                         println!(
-                            "Synchronized {} Phase.dev profile(s) ({} total variables) via {}.",
-                            prof_count,
+                            "Synchronized {} Phase.dev collection(s) ({} total variables) via {}.",
+                            coll_count,
                             var_count,
                             state.phase.auth_method.label()
                         );
@@ -121,15 +121,15 @@ fn main() {
                     );
                     println!("Last Phase Sync: {}", relative);
                 }
-                println!("Profiles ({})   :", state.profiles.len());
-                for p in &state.profiles {
-                    let st = if p.enabled { "ON " } else { "OFF" };
+                println!("Collections ({}) :", state.collections.len());
+                for c in &state.collections {
+                    let st = if c.enabled { "ON " } else { "OFF" };
                     println!(
                         "  [{}] {} ({} vars) [{}]",
                         st,
-                        p.name,
-                        p.vars.len(),
-                        p.source_label()
+                        c.name,
+                        c.vars.len(),
+                        c.source_label()
                     );
                 }
                 let eff = state.compute_effective_vars();

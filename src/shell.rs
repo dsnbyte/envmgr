@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn test_end_to_end_bashrc_inclusion_and_encrypted_state_priority() {
-        use crate::model::{AppSettings, EnvVar, PhaseConfig, Profile, VarSource};
+        use crate::model::{AppSettings, EnvVar, PhaseConfig, Collection, VarSource};
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let uniq = SystemTime::now()
@@ -271,25 +271,25 @@ mod tests {
 
         let mut state = AppStateData {
             phase: PhaseConfig::default(),
-            profiles: vec![
-                Profile {
-                    name: "profile_dua".to_string(),
+            collections: vec![
+                Collection {
+                    name: "collection_dua".to_string(),
                     enabled: true,
                     phase_binding: None,
                     last_sync_epoch: None,
                     vars: vec![
-                        EnvVar::new("A".to_string(), "val_profile_dua".to_string(), VarSource::Custom),
+                        EnvVar::new("A".to_string(), "val_collection_dua".to_string(), VarSource::Custom),
                         EnvVar::new("BASE_VAR".to_string(), "always_here".to_string(), VarSource::Custom),
                     ],
                 },
-                Profile {
-                    name: "profile_satu".to_string(),
+                Collection {
+                    name: "collection_satu".to_string(),
                     enabled: true,
                     phase_binding: None,
                     last_sync_epoch: None,
-                    vars: vec![EnvVar::new("A".to_string(), "val_profile_satu".to_string(), VarSource::Custom)],
+                    vars: vec![EnvVar::new("A".to_string(), "val_collection_satu".to_string(), VarSource::Custom)],
                 },
-                Profile {
+                Collection {
                     name: "default".to_string(),
                     enabled: true,
                     phase_binding: None,
@@ -311,8 +311,8 @@ mod tests {
 
         let bashrc_content = fs::read_to_string(&bashrc_file).unwrap();
         assert!(bashrc_content.contains("export EXISTING_VAR='kept'"));
-        assert!(!bashrc_content.contains("val_profile_dua"));
-        assert!(!bashrc_content.contains("val_profile_satu"));
+        assert!(!bashrc_content.contains("val_collection_dua"));
+        assert!(!bashrc_content.contains("val_collection_satu"));
         assert!(!bashrc_content.contains("val_default"));
         assert!(!bashrc_content.contains("always_here"));
         assert!(bashrc_content.contains("export 2>/dev/null"));
@@ -330,10 +330,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
-            "val_profile_dua|always_here|kept"
+            "val_collection_dua|always_here|kept"
         );
 
-        state.profiles[0].enabled = false;
+        state.collections[0].enabled = false;
         state.save_to_dir(&temp_dir).unwrap();
         let loaded2 = AppStateData::load_from_dir(&temp_dir);
         let script2 = generate_env_sh_content(&loaded2.compute_effective_vars());
@@ -343,9 +343,9 @@ mod tests {
             .arg(format!("{}\nprintf \"%s\" \"$A\"", script2))
             .output()
             .unwrap();
-        assert_eq!(String::from_utf8_lossy(&out2.stdout), "val_profile_satu");
+        assert_eq!(String::from_utf8_lossy(&out2.stdout), "val_collection_satu");
 
-        state.profiles[1].enabled = false;
+        state.collections[1].enabled = false;
         state.save_to_dir(&temp_dir).unwrap();
         let loaded3 = AppStateData::load_from_dir(&temp_dir);
         let script3 = generate_env_sh_content(&loaded3.compute_effective_vars());
