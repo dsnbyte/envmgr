@@ -21,6 +21,9 @@ use ratatui::{
     },
     Frame,
 };
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +103,8 @@ pub enum ContextAction {
     PhaseRebind,
     ToggleMask,
     ReloadShell,
+    CopyKey,
+    CopyValue,
 }
 
 #[derive(Debug, Clone)]
@@ -114,21 +119,22 @@ pub struct ContextMenuItem {
 pub struct ContextMenu {
     pub x: u16,
     pub y: u16,
-    pub title: String,
     pub items: Vec<ContextMenuItem>,
     pub selected: usize,
 }
 
 impl ContextMenu {
     pub fn rect(&self, area: Rect) -> Rect {
+        let min_gap = 4;
         let content_width = self
             .items
             .iter()
-            .map(|item| item.label.len() + item.shortcut.len() + 7)
+            .map(|item| {
+                2 + item.label.chars().count() + min_gap + item.shortcut.chars().count() + 2 + 1
+            })
             .max()
-            .unwrap_or(24)
-            .max(self.title.len() + 4) as u16;
-        let width = content_width.clamp(26, 40).min(area.width.saturating_sub(2));
+            .unwrap_or(18) as u16;
+        let width = (content_width + 2).min(area.width.saturating_sub(2));
         let height = (self.items.len() as u16 + 2).min(area.height.saturating_sub(1));
         let x = self.x.min(area.width.saturating_sub(width));
         let y = self.y.min(area.height.saturating_sub(height));
@@ -158,6 +164,7 @@ pub struct App {
     pub cached_apps: Vec<PhaseAppInfo>,
     pub last_area: Rect,
     pub pending_phase_sync: Option<PendingSyncTarget>,
+    pub sync_start_time: Option<Instant>,
     pub input_cursor: usize,
 }
 
@@ -192,6 +199,7 @@ impl App {
             cached_apps: Vec::new(),
             last_area: Rect::default(),
             pending_phase_sync: None,
+            sync_start_time: None,
             input_cursor: 0,
         };
 
@@ -354,6 +362,17 @@ impl App {
             return;
         }
 
+        if !self.status_message.is_empty() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.status_message.clear();
+                    self.status_message_time = None;
+                }
+                _ => {}
+            }
+            return;
+        }
+
         if self.context_menu.is_some() {
             self.handle_context_menu_key(key);
             return;
@@ -394,9 +413,7 @@ impl App {
                 }
             }
             KeyCode::Char('v') => {
-                self.show_values = !self.show_values;
-                let state = if self.show_values { "shown" } else { "masked" };
-                self.set_info(format!("Secret values are now {}.", state));
+                self.toggle_mask_values();
             }
             KeyCode::Char('c') => {
                 self.open_phase_connect_modal(None, None);
@@ -477,6 +494,7 @@ impl App {
                 return;
             }
             self.set_info("Phase.dev sync in progress...");
+            self.sync_start_time = Some(Instant::now());
             self.pending_phase_sync = Some(PendingSyncTarget::Profile(idx));
         } else {
             // Selected profile is a Custom profile: never mix Phase vars into it.
@@ -491,6 +509,7 @@ impl App {
                     return;
                 }
                 self.set_info("Phase.dev sync in progress...");
+                self.sync_start_time = Some(Instant::now());
                 self.pending_phase_sync = Some(PendingSyncTarget::All);
             } else {
                 let pname = prof.name.clone();
@@ -507,26 +526,44 @@ impl App {
             return false;
         };
 
-        match target {
+        let sync_start = self.sync_start_time.take();
+
+        let result = match target {
             PendingSyncTarget::Profile(idx) => {
                 if idx >= self.data.profiles.len() {
                     return true;
                 }
-                match sync_phase_profiles(&mut self.data, Some(idx)) {
-                    Ok((_, vars_count)) => {
-                        self.clamp_selections();
-                        let pname = self.data.profiles[idx].name.clone();
-                        self.sync_to_system(&format!(
-                            "Phase.dev sync succeeded for '{}' ({} vars)",
-                            pname, vars_count
-                        ));
-                    }
-                    Err(e) => {
-                        self.set_error(format!("Phase.dev sync failed: {}", e));
-                    }
-                }
+                let res = sync_phase_profiles(&mut self.data, Some(idx));
+                (target, res)
             }
             PendingSyncTarget::All => {
+                let res = sync_phase_profiles(&mut self.data, None);
+                (target, res)
+            }
+        };
+
+        // Ensure the sync status remains visible for at least one second
+        if let Some(start) = sync_start {
+            let min_duration = Duration::from_secs(1);
+            let elapsed = start.elapsed();
+            if elapsed < min_duration {
+                std::thread::sleep(min_duration - elapsed);
+            }
+        }
+
+        match result {
+            (PendingSyncTarget::Profile(idx), Ok((_, vars_count))) => {
+                self.clamp_selections();
+                let pname = self.data.profiles[idx].name.clone();
+                self.sync_to_system(&format!(
+                    "Phase.dev sync succeeded for '{}' ({} vars)",
+                    pname, vars_count
+                ));
+            }
+            (PendingSyncTarget::Profile(_), Err(e)) => {
+                self.set_error(format!("Phase.dev sync failed: {}", e));
+            }
+            (PendingSyncTarget::All, Ok((_, vars_count))) => {
                 let prof_names: Vec<String> = self
                     .data
                     .profiles
@@ -539,19 +576,14 @@ impl App {
                 } else {
                     format!("{} profiles", prof_names.len())
                 };
-
-                match sync_phase_profiles(&mut self.data, None) {
-                    Ok((_, vars_count)) => {
-                        self.clamp_selections();
-                        self.sync_to_system(&format!(
-                            "Phase.dev sync succeeded for {} ({} vars)",
-                            prof_desc, vars_count
-                        ));
-                    }
-                    Err(e) => {
-                        self.set_error(format!("Phase.dev sync failed: {}", e));
-                    }
-                }
+                self.clamp_selections();
+                self.sync_to_system(&format!(
+                    "Phase.dev sync succeeded for {} ({} vars)",
+                    prof_desc, vars_count
+                ));
+            }
+            (PendingSyncTarget::All, Err(e)) => {
+                self.set_error(format!("Phase.dev sync failed: {}", e));
             }
         }
         true
@@ -760,10 +792,60 @@ impl App {
         }
     }
 
+    pub fn sync_all_phase_profiles(&mut self) {
+        let has_any_phase = self.data.profiles.iter().any(|p| p.is_phase());
+        if !has_any_phase {
+            self.set_error("No Phase.dev profiles found to sync. Press [n] to create one.");
+            return;
+        }
+        if !self.data.phase.is_configured() {
+            self.open_phase_connect_modal(
+                None,
+                Some("Configure Phase.dev authentication to sync Phase profiles.".to_string()),
+            );
+            return;
+        }
+        self.set_info("Phase.dev sync in progress...");
+        self.sync_start_time = Some(Instant::now());
+        self.pending_phase_sync = Some(PendingSyncTarget::All);
+    }
+
+    fn copy_selected_key(&mut self) {
+        match self.focus {
+            FocusPane::Vars => {
+                if let Some(v) = self.current_vars().get(self.selected_var) {
+                    copy_to_clipboard(&v.key);
+                }
+            }
+            FocusPane::Effective => {
+                let eff = self.data.compute_effective_vars();
+                if let Some(ev) = eff.get(self.selected_effective) {
+                    copy_to_clipboard(&ev.key);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn copy_selected_value(&mut self) {
+        match self.focus {
+            FocusPane::Vars => {
+                if let Some(v) = self.current_vars().get(self.selected_var) {
+                    copy_to_clipboard(&v.value);
+                }
+            }
+            FocusPane::Effective => {
+                let eff = self.data.compute_effective_vars();
+                if let Some(ev) = eff.get(self.selected_effective) {
+                    copy_to_clipboard(&ev.value);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn toggle_mask_values(&mut self) {
         self.show_values = !self.show_values;
-        let state = if self.show_values { "shown" } else { "masked" };
-        self.set_info(format!("Secret values are now {}.", state));
     }
 
     pub fn execute_context_action(&mut self, action: ContextAction) {
@@ -779,12 +861,14 @@ impl App {
             ContextAction::PhaseRebind => self.handle_phase_sync_action(true),
             ContextAction::ToggleMask => self.toggle_mask_values(),
             ContextAction::ReloadShell => self.reload_shell(),
+            ContextAction::CopyKey => self.copy_selected_key(),
+            ContextAction::CopyValue => self.copy_selected_value(),
         }
     }
 
     pub fn open_context_menu_for_pane(&mut self, pane: FocusPane, x: u16, y: u16) {
         let mut items = Vec::new();
-        let title = match pane {
+        match pane {
             FocusPane::Profiles => {
                 if let Some(prof) = self.current_profile() {
                     let toggle_label = if prof.enabled {
@@ -857,7 +941,6 @@ impl App {
                         is_danger: false,
                     });
                 }
-                " Profile Actions ".to_string()
             }
             FocusPane::Vars => {
                 let has_vars = !self.current_vars().is_empty();
@@ -865,7 +948,7 @@ impl App {
                     .current_profile()
                     .map(|p| p.is_phase())
                     .unwrap_or(false);
-                if has_vars {
+                if has_vars && !is_phase {
                     items.push(ContextMenuItem {
                         label: "Edit Variable".to_string(),
                         shortcut: "e",
@@ -894,20 +977,24 @@ impl App {
                         is_danger: false,
                     });
                 }
-                items.push(ContextMenuItem {
-                    label: if self.show_values {
-                        "Mask Secret Values".to_string()
-                    } else {
-                        "Show Secret Values".to_string()
-                    },
-                    shortcut: "v",
-                    action: ContextAction::ToggleMask,
-                    is_danger: false,
-                });
-                " Variable Actions ".to_string()
+                if has_vars {
+                    items.push(ContextMenuItem {
+                        label: "Copy Key".to_string(),
+                        shortcut: "y",
+                        action: ContextAction::CopyKey,
+                        is_danger: false,
+                    });
+                    items.push(ContextMenuItem {
+                        label: "Copy Value".to_string(),
+                        shortcut: "Y",
+                        action: ContextAction::CopyValue,
+                        is_danger: false,
+                    });
+                }
             }
             FocusPane::Effective => {
-                if !self.data.compute_effective_vars().is_empty() {
+                let has_vars = !self.data.compute_effective_vars().is_empty();
+                if has_vars {
                     items.push(ContextMenuItem {
                         label: "Edit Variable".to_string(),
                         shortcut: "e",
@@ -920,24 +1007,25 @@ impl App {
                         action: ContextAction::Delete,
                         is_danger: true,
                     });
+                    items.push(ContextMenuItem {
+                        label: "Copy Key".to_string(),
+                        shortcut: "y",
+                        action: ContextAction::CopyKey,
+                        is_danger: false,
+                    });
+                    items.push(ContextMenuItem {
+                        label: "Copy Value".to_string(),
+                        shortcut: "Y",
+                        action: ContextAction::CopyValue,
+                        is_danger: false,
+                    });
                 }
-                items.push(ContextMenuItem {
-                    label: if self.show_values {
-                        "Mask Secret Values".to_string()
-                    } else {
-                        "Show Secret Values".to_string()
-                    },
-                    shortcut: "v",
-                    action: ContextAction::ToggleMask,
-                    is_danger: false,
-                });
                 items.push(ContextMenuItem {
                     label: "Reload Shell Env".to_string(),
                     shortcut: "r",
                     action: ContextAction::ReloadShell,
                     is_danger: false,
                 });
-                " Effective Env Actions ".to_string()
             }
         };
 
@@ -945,7 +1033,6 @@ impl App {
             self.context_menu = Some(ContextMenu {
                 x,
                 y,
-                title,
                 items,
                 selected: 0,
             });
@@ -987,6 +1074,12 @@ impl App {
             KeyCode::Char('P') => self.execute_context_action(ContextAction::PhaseRebind),
             KeyCode::Char('v') => self.execute_context_action(ContextAction::ToggleMask),
             KeyCode::Char('r') => self.execute_context_action(ContextAction::ReloadShell),
+            KeyCode::Char('y') | KeyCode::Char('c') => {
+                self.execute_context_action(ContextAction::CopyKey);
+            }
+            KeyCode::Char('Y') | KeyCode::Char('C') => {
+                self.execute_context_action(ContextAction::CopyValue);
+            }
             _ => {
                 self.context_menu = Some(menu);
             }
@@ -1072,6 +1165,12 @@ impl App {
             KeyCode::Enter => {
                 self.open_edit_var();
             }
+            KeyCode::Char('y') => {
+                self.copy_selected_key();
+            }
+            KeyCode::Char('Y') => {
+                self.copy_selected_value();
+            }
             _ => {}
         }
     }
@@ -1091,6 +1190,12 @@ impl App {
             }
             KeyCode::Enter => {
                 self.open_edit_effective_var();
+            }
+            KeyCode::Char('y') => {
+                self.copy_selected_key();
+            }
+            KeyCode::Char('Y') => {
+                self.copy_selected_value();
             }
             _ => {}
         }
@@ -1993,6 +2098,10 @@ impl App {
         if !matches!(self.modal, Modal::None) {
             self.draw_modal(frame, frame.area());
         }
+
+        if !self.status_message.is_empty() {
+            self.draw_status_popup(frame, frame.area());
+        }
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
@@ -2011,10 +2120,10 @@ impl App {
                 .add_modifier(Modifier::BOLD),
         );
 
-        if inner.width >= 86 {
+        if inner.width >= 90 {
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(34), Constraint::Length(52)])
+                .constraints([Constraint::Min(34), Constraint::Length(56)])
                 .split(inner);
 
             frame.render_widget(
@@ -2038,7 +2147,7 @@ impl App {
                 sep.clone(),
                 Span::styled(" [+Var] ", btn_style),
                 sep.clone(),
-                Span::styled(" [Sync] ", btn_style),
+                Span::styled(" [Sync All] ", btn_style),
                 sep.clone(),
                 Span::styled(mask_label, btn_style),
                 sep,
@@ -2302,18 +2411,18 @@ impl App {
         let phase_status = if self.data.phase.is_configured() {
             let auth_tag = self.data.phase.auth_method.label();
             let host = self.data.phase.effective_host();
-            if (self.status_message.is_empty() && area.width >= 110) || area.width >= 145 {
+            if area.width >= 110 {
                 Span::raw(format!("Connected ({}: {})", auth_tag, host))
             } else {
                 Span::raw(format!("Connected ({})", auth_tag))
             }
-        } else if (self.status_message.is_empty() && area.width >= 110) || area.width >= 145 {
+        } else if area.width >= 110 {
             Span::raw("Optional / Offline ([c] Connect)")
         } else {
             Span::raw("Offline ([c] Connect)")
         };
 
-        let mut spans = vec![
+        let spans = vec![
             Span::styled(
                 " Phase.dev: ",
                 Style::default()
@@ -2322,20 +2431,6 @@ impl App {
             ),
             phase_status,
         ];
-
-        if !self.status_message.is_empty() {
-            let msg_style = if self.is_error_status {
-                Style::default()
-                    .fg(Color::LightRed)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            };
-            spans.push(Span::raw(" | "));
-            spans.push(Span::styled(&self.status_message, msg_style));
-        }
 
         let status_line = Line::from(spans);
 
@@ -2387,9 +2482,12 @@ impl App {
             .map(|(idx, item)| {
                 let is_sel = idx == menu.selected;
                 let shortcut_str = format!("[{}]", item.shortcut);
-                let pad = inner_width
-                    .saturating_sub(item.label.len() + shortcut_str.len() + 3)
-                    .max(1);
+
+                let prefix = if is_sel { "▸ " } else { "  " };
+                let left_len = 2 + item.label.chars().count();
+                let right_len = shortcut_str.chars().count() + 1;
+
+                let pad = inner_width.saturating_sub(left_len + right_len);
                 let spaces = " ".repeat(pad);
 
                 let (fg_label, fg_key, row_bg) = if is_sel {
@@ -2404,7 +2502,6 @@ impl App {
                     (Color::White, Color::DarkGray, Color::Rgb(20, 26, 38))
                 };
 
-                let prefix = if is_sel { "▸ " } else { "  " };
                 let line = Line::from(vec![
                     Span::styled(
                         format!("{}{}", prefix, item.label),
@@ -2431,15 +2528,119 @@ impl App {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::Cyan))
+            .style(Style::default().bg(Color::Rgb(20, 26, 38)));
+
+        frame.render_widget(List::new(items).block(block), popup);
+    }
+
+    pub fn status_popup_rect(&self, area: Rect) -> Rect {
+        let msg_len = self.status_message.chars().count();
+        let w = ((msg_len + 12) as u16).clamp(38, 70).min(area.width.saturating_sub(4));
+        let inner_w = w.saturating_sub(4) as usize;
+        let text_lines = if inner_w > 0 {
+            (msg_len + inner_w - 1) / inner_w
+        } else {
+            1
+        };
+        let h = (text_lines as u16 + 5).clamp(7, 12).min(area.height.saturating_sub(2));
+        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let y = area.y + (area.height.saturating_sub(h)) / 2;
+        Rect::new(x, y, w, h)
+    }
+
+    pub fn status_popup_ok_button_rect(&self, area: Rect) -> Rect {
+        let popup = self.status_popup_rect(area);
+        let block_inner = Block::default()
+            .borders(Borders::ALL)
+            .padding(Padding::new(1, 1, 1, 0))
+            .inner(popup);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(block_inner);
+        let btn_chunk = chunks[1];
+        let btn_len = 6u16; // " [OK] "
+        let start_x = btn_chunk.x + (btn_chunk.width.saturating_sub(btn_len)) / 2;
+        Rect::new(start_x, btn_chunk.y, btn_len, 1)
+    }
+
+    pub fn is_status_ok_button_clicked(&self, area: Rect, col: u16, row: u16) -> bool {
+        let btn_rect = self.status_popup_ok_button_rect(area);
+        row == btn_rect.y && col >= btn_rect.x.saturating_sub(1) && col <= btn_rect.x + btn_rect.width
+    }
+
+    fn draw_status_popup(&self, frame: &mut Frame, area: Rect) {
+        if self.status_message.is_empty() {
+            return;
+        }
+
+        let popup = self.status_popup_rect(area);
+        frame.render_widget(Clear, popup);
+
+        let (title, border_color, is_danger) = if self.is_error_status {
+            (" Error ", Color::LightRed, true)
+        } else if self.status_message.contains("succeeded")
+            || self.status_message.contains("Created")
+            || self.status_message.contains("Updated")
+            || self.status_message.contains("Deleted")
+            || self.status_message.contains("Reloaded")
+        {
+            (" Success ", Color::Green, false)
+        } else if self.status_message.contains("in progress") {
+            (" Syncing ", Color::Cyan, false)
+        } else {
+            (" Notice ", Color::Cyan, false)
+        };
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border_color))
             .style(Style::default().bg(Color::Rgb(20, 26, 38)))
+            .padding(Padding::new(1, 1, 1, 0))
             .title(Span::styled(
-                &menu.title,
+                title,
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(border_color)
                     .add_modifier(Modifier::BOLD),
             ));
 
-        frame.render_widget(List::new(items).block(block), popup);
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(inner);
+
+        let text = Paragraph::new(Line::from(Span::styled(
+            &self.status_message,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .alignment(Alignment::Center)
+        .wrap(ratatui::widgets::Wrap { trim: true });
+
+        frame.render_widget(text, chunks[0]);
+
+        let btn_style = if is_danger {
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Rgb(140, 35, 45))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(border_color)
+                .bg(Color::Rgb(25, 38, 58))
+                .add_modifier(Modifier::BOLD)
+        };
+
+        let btn_line = Line::from(Span::styled(" [OK] ", btn_style));
+        frame.render_widget(
+            Paragraph::new(btn_line).alignment(Alignment::Center),
+            chunks[1],
+        );
     }
 
     fn draw_modal(&self, frame: &mut Frame, area: Rect) {
@@ -3286,7 +3487,18 @@ impl App {
             return;
         };
 
-        // 1. Handle active Context Menu interactions first
+        // 1. Handle active Status Popup interactions
+        if !self.status_message.is_empty() {
+            if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                if self.is_status_ok_button_clicked(area, mouse.column, mouse.row) {
+                    self.status_message.clear();
+                    self.status_message_time = None;
+                }
+            }
+            return;
+        }
+
+        // 2. Handle active Context Menu interactions
         if let Some(mut menu) = self.context_menu.take() {
             let popup = menu.rect(area);
             let inner_top = popup.y.saturating_add(1);
@@ -3375,20 +3587,20 @@ impl App {
                 // Header toolbar buttons click handling
                 if rect_contains(header_rect, mouse.column, mouse.row) {
                     let inner_w = header_rect.width.saturating_sub(2);
-                    if inner_w >= 86 && mouse.row == header_rect.y + 1 {
+                    if inner_w >= 90 && mouse.row == header_rect.y + 1 {
                         let right_edge = header_rect.x + header_rect.width - 1;
                         let offset_from_right = right_edge.saturating_sub(mouse.column);
                         // Toolbar layout from right edge:
-                        // " [+Profile]  [+Var]  [Sync]  [Show]  [Settings] " (total 52 chars)
+                        // " [+Profile]  [+Var]  [Sync All]  [Show]  [Settings] " (total 56 chars)
                         if offset_from_right < 13 {
                             self.open_settings_modal();
                         } else if offset_from_right < 22 {
                             self.toggle_mask_values();
-                        } else if offset_from_right < 31 {
-                            self.handle_phase_sync_action(false);
-                        } else if offset_from_right < 40 {
+                        } else if offset_from_right < 35 {
+                            self.sync_all_phase_profiles();
+                        } else if offset_from_right < 44 {
                             self.open_add_var_modal();
-                        } else if offset_from_right < 53 {
+                        } else if offset_from_right < 57 {
                             self.open_new_profile_modal();
                         }
                     }
@@ -3815,6 +4027,90 @@ pub fn get_modal_buttons(modal: &Modal) -> Option<ModalButtons> {
     }
 }
 
+pub fn copy_to_clipboard(text: &str) {
+    let b64 = BASE64_STANDARD.encode(text);
+    let osc52 = format!("\x1b]52;c;{}\x07", b64);
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(osc52.as_bytes());
+    let _ = stdout.flush();
+
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            if let Ok(mut child) = std::process::Command::new("wl-copy")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                let _ = child.wait();
+                return;
+            }
+        }
+        if std::env::var_os("DISPLAY").is_some() {
+            if let Ok(mut child) = std::process::Command::new("xclip")
+                .args(["-selection", "clipboard"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                let _ = child.wait();
+                return;
+            }
+            if let Ok(mut child) = std::process::Command::new("xsel")
+                .args(["--clipboard", "--input"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(text.as_bytes());
+                }
+                let _ = child.wait();
+                return;
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(mut child) = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(mut child) = std::process::Command::new("clip.exe")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+        }
+    }
+}
+
 pub fn render_modal_buttons(frame: &mut Frame, area: Rect, buttons: ModalButtons) {
     let btn_style = if buttons.is_danger {
         Style::default()
@@ -4192,6 +4488,7 @@ mod tests {
             cached_apps: Vec::new(),
             last_area: Rect::default(),
             pending_phase_sync: None,
+            sync_start_time: None,
             input_cursor: 0,
         }
     }
@@ -4205,10 +4502,12 @@ mod tests {
         // 1. Toggle OFF
         app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
         assert!(!app.data.profiles[0].enabled);
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
 
         // 2. Toggle ON
         app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
         assert!(app.data.profiles[0].enabled);
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
 
         // 3. Edit (Rename) via 'e'
         app.handle_key(KeyEvent::from(KeyCode::Char('e')));
@@ -4230,6 +4529,7 @@ mod tests {
         app.handle_key(KeyEvent::from(KeyCode::Enter));
         assert!(matches!(app.modal, Modal::None));
         assert_eq!(app.data.profiles[0].name, "staging");
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
 
         // 4. Delete via 'x'
         app.handle_key(KeyEvent::from(KeyCode::Char('x')));
@@ -4257,11 +4557,13 @@ mod tests {
         assert_eq!(app.data.profiles[0].name, "second_profile");
         assert_eq!(app.data.profiles[1].name, "default");
         assert_eq!(app.selected_profile, 0);
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
 
         app.handle_key(KeyEvent::from(KeyCode::Char('d')));
         assert_eq!(app.data.profiles[0].name, "default");
         assert_eq!(app.data.profiles[1].name, "second_profile");
         assert_eq!(app.selected_profile, 1);
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
 
         app.handle_key(KeyEvent::from(KeyCode::Char('K')));
         assert_eq!(app.data.profiles[1].name, "second_profile");
@@ -4642,7 +4944,7 @@ mod tests {
     }
 
     #[test]
-    fn test_status_message_rendered_in_status_bar() {
+    fn test_status_message_rendered_in_centered_popup() {
         let mut app = make_test_app();
         app.set_info("Secret values are now masked.");
         let backend = TestBackend::new(120, 30);
@@ -4662,6 +4964,13 @@ mod tests {
         assert!(content.contains("Secret values are now masked."));
         assert!(content.contains("Environtment Variables Manager"));
         assert!(content.contains("Phase.dev:"));
+
+        // Status bar line must NOT contain the message
+        let status_row = buffer.area.height - 1;
+        let row_text: String = (0..buffer.area.width)
+            .map(|x| buffer.get(x, status_row).symbol())
+            .collect();
+        assert!(!row_text.contains("Secret values are now masked."));
     }
 
     #[test]
@@ -4821,7 +5130,7 @@ mod tests {
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        // 1. Click header [Sync] button
+        // 1. Click header [Sync All] button
         terminal.draw(|f| app.draw(f)).unwrap();
         let (header_rect, _, _, _, _) = compute_layout_chunks(app.last_area);
         let sync_col = header_rect.x + header_rect.width - 26;
@@ -4833,16 +5142,25 @@ mod tests {
         });
 
         assert_eq!(app.status_message, "Phase.dev sync in progress...");
-        assert_eq!(app.pending_phase_sync, Some(PendingSyncTarget::Profile(0)));
+        assert_eq!(app.pending_phase_sync, Some(PendingSyncTarget::All));
 
-        // Verify status bar displays the in-progress message
+        // Verify centered popup displays the in-progress message (and status bar does not)
         terminal.draw(|f| app.draw(f)).unwrap();
         let buffer = terminal.backend().buffer();
         let status_row = buffer.area.height - 1;
         let row_text: String = (0..buffer.area.width)
             .map(|x| buffer.get(x, status_row).symbol())
             .collect();
-        assert!(row_text.contains("Phase.dev sync in progress..."));
+        let screen_text: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.get(x, y).symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!row_text.contains("Phase.dev sync in progress..."));
+        assert!(screen_text.contains("Phase.dev sync in progress..."));
 
         // 2. Perform pending sync (mock profile with non-existent secrets will return fail/mock)
         app.perform_pending_sync();
@@ -4853,13 +5171,22 @@ mod tests {
             app.status_message
         );
 
-        // Verify status bar displays updated status
+        // Verify centered popup displays completion status (and status bar does not)
         terminal.draw(|f| app.draw(f)).unwrap();
         let buffer = terminal.backend().buffer();
         let row_text_completed: String = (0..buffer.area.width)
             .map(|x| buffer.get(x, status_row).symbol())
             .collect();
-        assert!(row_text_completed.contains("Phase.dev sync"));
+        let screen_text_completed: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.get(x, y).symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!row_text_completed.contains("Phase.dev sync"));
+        assert!(screen_text_completed.contains("Phase.dev sync"));
 
         // 3. Test context menu sync action
         app.execute_context_action(ContextAction::PhaseSync);
@@ -5133,5 +5460,344 @@ mod tests {
 
         assert!(content.contains("PROFILE"));
         assert!(content.contains("Phase (my-app/production)"));
+    }
+
+    #[test]
+    fn test_context_menu_no_header_and_right_aligned_shortcuts_in_all_panels() {
+        let mut app = make_test_app();
+        app.last_area = Rect::new(0, 0, 120, 30);
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // 1. Profiles pane context menu
+        app.open_context_menu_for_pane(FocusPane::Profiles, 10, 5);
+        assert!(app.context_menu.is_some());
+        let menu_rect = app.context_menu.as_ref().unwrap().rect(app.last_area);
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let content: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Header must be removed
+        assert!(!content.contains("Profile Actions"));
+        assert!(content.contains("Edit Profile"));
+        assert!(content.contains("Disable Profile"));
+
+        // Verify shortcuts are right-aligned: in every menu row, the closing bracket ']'
+        // must be at the exact same column (menu_rect.x + menu_rect.width - 3)
+        let right_bracket_col = menu_rect.x + menu_rect.width - 3;
+        for row in (menu_rect.y + 1)..(menu_rect.y + menu_rect.height - 1) {
+            let ch = buffer[(right_bracket_col, row)].symbol();
+            assert_eq!(ch, "]", "Shortcut right bracket must be right-aligned at col {}", right_bracket_col);
+        }
+        app.context_menu = None;
+
+        // 2. Vars pane context menu
+        app.open_context_menu_for_pane(FocusPane::Vars, 40, 5);
+        assert!(app.context_menu.is_some());
+        let vars_menu_rect = app.context_menu.as_ref().unwrap().rect(app.last_area);
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let content_vars: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!content_vars.contains("Variable Actions"));
+        assert!(content_vars.contains("Edit Variable"));
+        assert!(!content_vars.contains("Mask Secret Values"));
+        assert!(content_vars.contains("Copy Key"));
+        assert!(content_vars.contains("Copy Value"));
+        let vars_bracket_col = vars_menu_rect.x + vars_menu_rect.width - 3;
+        for row in (vars_menu_rect.y + 1)..(vars_menu_rect.y + vars_menu_rect.height - 1) {
+            let ch = buffer[(vars_bracket_col, row)].symbol();
+            assert_eq!(ch, "]", "Vars shortcut right bracket must be right-aligned at col {}", vars_bracket_col);
+        }
+        app.context_menu = None;
+
+        // 3. Effective pane context menu
+        app.open_context_menu_for_pane(FocusPane::Effective, 50, 10);
+        assert!(app.context_menu.is_some());
+        let eff_menu_rect = app.context_menu.as_ref().unwrap().rect(app.last_area);
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let content_eff: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!content_eff.contains("Effective Env Actions"));
+        assert!(content_eff.contains("Reload Shell Env"));
+        assert!(!content_eff.contains("Mask Secret Values"));
+        assert!(content_eff.contains("Copy Key"));
+        assert!(content_eff.contains("Copy Value"));
+        let eff_bracket_col = eff_menu_rect.x + eff_menu_rect.width - 3;
+        for row in (eff_menu_rect.y + 1)..(eff_menu_rect.y + eff_menu_rect.height - 1) {
+            let ch = buffer[(eff_bracket_col, row)].symbol();
+            assert_eq!(ch, "]", "Effective shortcut right bracket must be right-aligned at col {}", eff_bracket_col);
+        }
+    }
+
+    #[test]
+    fn test_error_status_popup_requires_manual_dismissal() {
+        let mut app = make_test_app();
+        app.last_area = Rect::new(0, 0, 120, 30);
+        app.set_error("Phase.dev sync failed: 401 Unauthorized");
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Centered popup contains error elements without icons
+        assert!(screen.contains("Error"));
+        assert!(screen.contains("[OK]"));
+        assert!(!screen.contains('✖'));
+        assert!(!screen.contains('✔'));
+        assert!(!screen.contains('ℹ'));
+        assert!(screen.contains("Phase.dev sync failed: 401 Unauthorized"));
+
+        // Status bar line must NOT contain the error
+        let status_row = buffer.area.height - 1;
+        let row_text: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, status_row)].symbol())
+            .collect();
+        assert!(!row_text.contains("Phase.dev sync failed"));
+
+        // Error must NOT auto-close even after simulated 10 seconds
+        app.status_message_time = Some(Instant::now() - Duration::from_secs(10));
+        app.clear_expired_status();
+        assert_eq!(app.status_message, "Phase.dev sync failed: 401 Unauthorized");
+
+        // Arbitrary keys (e.g. Tab, 'x', 'j') must NOT dismiss the error
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.status_message, "Phase.dev sync failed: 401 Unauthorized");
+        app.handle_key(KeyEvent::from(KeyCode::Char('x')));
+        assert_eq!(app.status_message, "Phase.dev sync failed: 401 Unauthorized");
+
+        // Esc key dismisses the error
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.status_message.is_empty(), "Esc key must manually dismiss error popup");
+
+        // Mouse click on OK button dismisses error as well
+        app.set_error("Another error occurred");
+        assert!(!app.status_message.is_empty());
+        let btn_rect = app.status_popup_ok_button_rect(app.last_area);
+        // Click outside the OK button does NOT dismiss
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert!(!app.status_message.is_empty(), "Clicking outside OK button must NOT dismiss the popup");
+        // Click directly on the OK button dismisses
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: btn_rect.x + 2,
+            row: btn_rect.y,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert!(app.status_message.is_empty(), "Left mouse click on OK button must manually dismiss error popup");
+    }
+
+    #[test]
+    fn test_success_status_popup_auto_closes_and_can_be_dismissed() {
+        let mut app = make_test_app();
+        app.last_area = Rect::new(0, 0, 120, 30);
+        app.set_info("Phase.dev sync succeeded for 'default' (5 vars)");
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen.contains("Success"));
+        assert!(screen.contains("[OK]"));
+        assert!(!screen.contains('✖'));
+        assert!(!screen.contains('✔'));
+        assert!(!screen.contains('ℹ'));
+        assert!(screen.contains("Phase.dev sync succeeded for 'default' (5 vars)"));
+
+        // Status bar line must NOT contain the message
+        let status_row = buffer.area.height - 1;
+        let row_text: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, status_row)].symbol())
+            .collect();
+        assert!(!row_text.contains("Phase.dev sync succeeded"));
+
+        // Message stays within 5 seconds
+        app.clear_expired_status();
+        assert_eq!(app.status_message, "Phase.dev sync succeeded for 'default' (5 vars)");
+
+        // Arbitrary keys do NOT dismiss success popup
+        app.handle_key(KeyEvent::from(KeyCode::Char('x')));
+        assert_eq!(app.status_message, "Phase.dev sync succeeded for 'default' (5 vars)");
+
+        // Message automatically expires after ~5 seconds
+        app.status_message_time = Some(Instant::now() - Duration::from_millis(5100));
+        app.clear_expired_status();
+        assert!(app.status_message.is_empty(), "Success popup must automatically close after ~5 seconds");
+
+        // Success popup dismissed manually on Enter (OK button)
+        app.set_info("Created profile 'dev'");
+        assert_eq!(app.status_message, "Created profile 'dev'");
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.status_message.is_empty(), "Enter key must dismiss success popup via OK button");
+
+        // Success popup dismissed manually by clicking OK button
+        app.set_info("Created profile 'prod'");
+        assert_eq!(app.status_message, "Created profile 'prod'");
+        let btn_rect = app.status_popup_ok_button_rect(app.last_area);
+        // Clicking outside does not dismiss
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.status_message, "Created profile 'prod'");
+        // Clicking OK button dismisses
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: btn_rect.x + 2,
+            row: btn_rect.y,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert!(app.status_message.is_empty(), "Clicking OK button must dismiss success popup");
+    }
+
+    #[test]
+    fn test_sync_status_remains_visible_at_least_one_second() {
+        let mut app = make_test_app();
+        app.data.phase.auth_method = PhaseAuthMethod::Token;
+        app.data.phase.pat_token = "pss_user:mock_token".to_string();
+        app.data.profiles[0].phase_binding = Some(PhaseBinding {
+            app_id: "app-1".to_string(),
+            app_name: "my-app".to_string(),
+            env_id: "env-1".to_string(),
+            env_name: "prod".to_string(),
+        });
+
+        app.set_info("Phase.dev sync in progress...");
+        app.sync_start_time = Some(Instant::now());
+        app.pending_phase_sync = Some(PendingSyncTarget::Profile(0));
+
+        let t0 = Instant::now();
+        app.perform_pending_sync();
+        let elapsed = t0.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(990),
+            "Sync status must remain visible for at least one second, elapsed was: {:?}",
+            elapsed
+        );
+        assert!(app.status_message.contains("Phase.dev sync"));
+    }
+
+    #[test]
+    fn test_toggle_mask_no_prompt() {
+        let mut app = make_test_app();
+        assert!(!app.show_values);
+
+        // Press 'v' to show values
+        app.handle_key(KeyEvent::from(KeyCode::Char('v')));
+        assert!(app.show_values);
+        assert!(app.status_message.is_empty(), "Toggling mask must NOT set an informational prompt");
+
+        // Toggle mask directly
+        app.toggle_mask_values();
+        assert!(!app.show_values);
+        assert!(app.status_message.is_empty(), "Toggling mask directly must NOT set an informational prompt");
+    }
+
+    #[test]
+    fn test_phase_profile_vars_pane_hides_edit_button_and_copy_actions() {
+        let mut app = make_test_app();
+        app.data.profiles.insert(
+            0,
+            Profile::new_phase(
+                "phase_prod".to_string(),
+                PhaseBinding {
+                    app_id: "app1".to_string(),
+                    app_name: "MyService".to_string(),
+                    env_id: "env1".to_string(),
+                    env_name: "Production".to_string(),
+                },
+                vec![("SECRET_TOKEN".to_string(), "super_secret_val_123".to_string())],
+            ),
+        );
+        app.selected_profile = 0;
+        app.last_area = Rect::new(0, 0, 120, 30);
+
+        // Open context menu for Vars pane of Phase profile
+        app.open_context_menu_for_pane(FocusPane::Vars, 30, 5);
+        assert!(app.context_menu.is_some());
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // 1. Edit Variable must be hidden for Phase profile
+        assert!(!content.contains("Edit Variable"), "Edit Variable must be hidden for Phase.dev profiles");
+        assert!(!content.contains("Delete Variable"), "Delete Variable must be hidden for Phase.dev profiles");
+
+        // 2. Sync Phase.dev must be present
+        assert!(content.contains("Sync Phase.dev"));
+
+        // 3. Mask Secret Values must be removed
+        assert!(!content.contains("Mask Secret Values"));
+
+        // 4. Copy Key and Copy Value must be present
+        assert!(content.contains("Copy Key"));
+        assert!(content.contains("Copy Value"));
+
+        // 5. Test Copy Key and Copy Value actions execute without errors
+        app.focus = FocusPane::Vars;
+        app.selected_var = 0;
+        app.execute_context_action(ContextAction::CopyKey);
+        app.execute_context_action(ContextAction::CopyValue);
     }
 }
