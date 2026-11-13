@@ -276,6 +276,7 @@ mod tests {
                     name: "profile_dua".to_string(),
                     enabled: true,
                     phase_binding: None,
+                    last_sync_epoch: None,
                     vars: vec![
                         EnvVar::new("A".to_string(), "val_profile_dua".to_string(), VarSource::Custom),
                         EnvVar::new("BASE_VAR".to_string(), "always_here".to_string(), VarSource::Custom),
@@ -285,12 +286,14 @@ mod tests {
                     name: "profile_satu".to_string(),
                     enabled: true,
                     phase_binding: None,
+                    last_sync_epoch: None,
                     vars: vec![EnvVar::new("A".to_string(), "val_profile_satu".to_string(), VarSource::Custom)],
                 },
                 Profile {
                     name: "default".to_string(),
                     enabled: true,
                     phase_binding: None,
+                    last_sync_epoch: None,
                     vars: vec![
                         EnvVar::new("A".to_string(), "val_default".to_string(), VarSource::Custom),
                         EnvVar::new("BASE_VAR".to_string(), "always_here".to_string(), VarSource::Custom),

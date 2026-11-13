@@ -1,6 +1,6 @@
 use crate::model::{
     is_valid_env_key, AppSettings, AppStateData, EnvVar, HostMode, PhaseAuthMethod, PhaseBinding,
-    PhaseConfig, Profile, MIN_AUTO_SYNC_INTERVAL_MINS, PHASE_CLOUD_HOST,
+    PhaseConfig, Profile, PHASE_CLOUD_HOST,
 };
 use crate::phase::{
     detect_phase_cli_detailed, fetch_apps_and_envs, fetch_secrets_for_env, sync_phase_profiles,
@@ -81,8 +81,7 @@ pub enum Modal {
     },
     Settings {
         draft: AppSettings,
-        interval_input: String,
-        active_field: usize, // 0..7
+        active_field: usize, // 0..5
         error: Option<String>,
     },
     Help,
@@ -158,14 +157,12 @@ pub struct App {
     pub should_quit: bool,
     pub cached_apps: Vec<PhaseAppInfo>,
     pub last_area: Rect,
-    pub last_auto_sync_attempt: Option<Instant>,
     pub pending_phase_sync: Option<PendingSyncTarget>,
     pub input_cursor: usize,
 }
 
 impl App {
     pub fn new(mut data: AppStateData) -> Self {
-        data.settings.normalize();
         data.phase.auto_detect_cli();
 
         if !data.phase.is_configured() {
@@ -194,7 +191,6 @@ impl App {
             should_quit: false,
             cached_apps: Vec::new(),
             last_area: Rect::default(),
-            last_auto_sync_attempt: None,
             pending_phase_sync: None,
             input_cursor: 0,
         };
@@ -270,43 +266,6 @@ impl App {
         }
     }
 
-    /// Checks if automatic Phase.dev sync is due and performs it if needed.
-    pub fn check_auto_sync(&mut self) {
-        if !matches!(self.modal, Modal::None) {
-            return;
-        }
-        if let Some(last_try) = self.last_auto_sync_attempt {
-            let backoff = Duration::from_secs(
-                (self.data.settings.effective_interval_mins() * 60).min(60),
-            );
-            if last_try.elapsed() < backoff {
-                return;
-            }
-        }
-
-        let now_epoch = AppStateData::current_epoch_secs();
-        if !self.data.is_auto_sync_due(now_epoch) {
-            return;
-        }
-
-        self.last_auto_sync_attempt = Some(Instant::now());
-        match sync_phase_profiles(&mut self.data, None) {
-            Ok((prof_count, var_count)) if prof_count > 0 => {
-                self.clamp_selections();
-                self.sync_to_system(&format!(
-                    "Auto-synced {} Phase.dev profile(s) ({} vars)",
-                    prof_count, var_count
-                ));
-            }
-            Ok(_) => {
-                self.data.last_phase_sync_epoch = now_epoch;
-            }
-            Err(e) => {
-                self.set_error(format!("Phase.dev auto-sync failed: {}", e));
-            }
-        }
-    }
-
     pub fn current_profile(&self) -> Option<&Profile> {
         self.data.profiles.get(self.selected_profile)
     }
@@ -378,11 +337,8 @@ impl App {
 
     pub fn open_settings_modal(&mut self) {
         let draft = self.data.settings.clone();
-        let interval_input = draft.effective_interval_mins().to_string();
-        self.input_cursor = interval_input.chars().count();
         self.modal = Modal::Settings {
             draft,
-            interval_input,
             active_field: 0,
             error: None,
         };
@@ -1945,156 +1901,53 @@ impl App {
 
             Modal::Settings {
                 mut draft,
-                mut interval_input,
                 mut active_field,
                 mut error,
             } => {
-                const TOTAL_SETTINGS_FIELDS: usize = 7;
-
-                // Sync parsed interval input into draft before navigation/actions
-                let sync_interval_from_str = |input: &str, d: &mut AppSettings| {
-                    if let Ok(parsed) = input.trim().parse::<u64>() {
-                        d.set_interval_mins(parsed.max(MIN_AUTO_SYNC_INTERVAL_MINS));
-                    } else if input.trim().is_empty() {
-                        d.set_interval_mins(MIN_AUTO_SYNC_INTERVAL_MINS);
-                    }
-                };
+                const TOTAL_SETTINGS_FIELDS: usize = 5;
 
                 match key.code {
                     KeyCode::Esc => {
                         return;
                     }
                     KeyCode::Tab | KeyCode::Down => {
-                        sync_interval_from_str(&interval_input, &mut draft);
-                        interval_input = draft.effective_interval_mins().to_string();
                         active_field = (active_field + 1) % TOTAL_SETTINGS_FIELDS;
                         error = None;
                     }
                     KeyCode::BackTab | KeyCode::Up => {
-                        sync_interval_from_str(&interval_input, &mut draft);
-                        interval_input = draft.effective_interval_mins().to_string();
                         active_field =
                             (active_field + TOTAL_SETTINGS_FIELDS - 1) % TOTAL_SETTINGS_FIELDS;
                         error = None;
                     }
                     KeyCode::Char(' ')
                     | KeyCode::Left
-                    | KeyCode::Right
-                    | KeyCode::Char('-')
-                    | KeyCode::Char('+')
-                    | KeyCode::Char('=')
-                    | KeyCode::Char('[')
-                    | KeyCode::Char(']') => {
+                    | KeyCode::Right => {
                         error = None;
                         match active_field {
                             0 => {
-                                draft.auto_sync_enabled = !draft.auto_sync_enabled;
-                            }
-                            1 => {
-                                sync_interval_from_str(&interval_input, &mut draft);
-                                let cur = draft.effective_interval_mins();
-                                let next = match key.code {
-                                    KeyCode::Left | KeyCode::Char('-') => {
-                                        cur.saturating_sub(1).max(MIN_AUTO_SYNC_INTERVAL_MINS)
-                                    }
-                                    KeyCode::Right
-                                    | KeyCode::Char('+')
-                                    | KeyCode::Char('=')
-                                    | KeyCode::Char(' ') => (cur + 1).min(1440),
-                                    KeyCode::Char('[') => {
-                                        cur.saturating_sub(5).max(MIN_AUTO_SYNC_INTERVAL_MINS)
-                                    }
-                                    KeyCode::Char(']') => (cur + 5).min(1440),
-                                    _ => cur,
-                                };
-                                draft.set_interval_mins(next);
-                                interval_input = draft.effective_interval_mins().to_string();
-                            }
-                            2 => {
                                 draft.sync_only_enabled_profiles =
                                     !draft.sync_only_enabled_profiles;
                             }
-                            3 => {
+                            1 => {
                                 draft.phase_export_all_paths = !draft.phase_export_all_paths;
                             }
-                            4 => {
+                            2 => {
                                 draft.mask_secrets_by_default = !draft.mask_secrets_by_default;
                             }
-                            5 => {
+                            3 => {
                                 draft.insert_new_profile_at_top =
                                     !draft.insert_new_profile_at_top;
                             }
-                            6 => {
+                            4 => {
                                 draft.shell_prompt_hook = !draft.shell_prompt_hook;
                             }
                             _ => {}
                         }
                     }
-                    KeyCode::Backspace if active_field == 1 => {
-                        interval_input.pop();
-                        error = None;
-                    }
-                    KeyCode::Char(c) if active_field == 1 && c.is_ascii_digit() => {
-                        if interval_input.len() < 4 {
-                            interval_input.push(c);
-                            if let Ok(v) = interval_input.parse::<u64>() {
-                                if v >= MIN_AUTO_SYNC_INTERVAL_MINS {
-                                    draft.set_interval_mins(v);
-                                }
-                            }
-                            error = None;
-                        }
-                    }
                     KeyCode::Enter => {
-                        if active_field == 1 {
-                            match interval_input.trim().parse::<u64>() {
-                                Ok(v) if v >= MIN_AUTO_SYNC_INTERVAL_MINS => {
-                                    draft.set_interval_mins(v);
-                                }
-                                Ok(_) => {
-                                    draft.set_interval_mins(MIN_AUTO_SYNC_INTERVAL_MINS);
-                                    interval_input = MIN_AUTO_SYNC_INTERVAL_MINS.to_string();
-                                    error = Some(
-                                        "Minimum auto-sync interval is 1 minute (clamped to 1m)."
-                                            .to_string(),
-                                    );
-                                    self.modal = Modal::Settings {
-                                        draft,
-                                        interval_input,
-                                        active_field,
-                                        error,
-                                    };
-                                    return;
-                                }
-                                Err(_) => {
-                                    error = Some(
-                                        "Please enter a valid interval in minutes (minimum 1)."
-                                            .to_string(),
-                                    );
-                                    self.modal = Modal::Settings {
-                                        draft,
-                                        interval_input,
-                                        active_field,
-                                        error,
-                                    };
-                                    return;
-                                }
-                            }
-                        } else {
-                            sync_interval_from_str(&interval_input, &mut draft);
-                        }
-
-                        draft.normalize();
-                        self.data.settings = draft.clone();
-                        let sync_desc = if draft.auto_sync_enabled {
-                            format!("ON ({}m)", draft.effective_interval_mins())
-                        } else {
-                            "OFF".to_string()
-                        };
-                        self.sync_to_system(&format!(
-                            "Saved Settings (Phase Auto-Sync: {})",
-                            sync_desc
-                        ));
+                        self.data.settings = draft;
+                        self.sync_to_system("Saved application Settings");
+                        self.modal = Modal::None;
                         return;
                     }
                     _ => {}
@@ -2102,7 +1955,6 @@ impl App {
 
                 self.modal = Modal::Settings {
                     draft,
-                    interval_input,
                     active_field,
                     error,
                 };
@@ -2303,7 +2155,27 @@ impl App {
         let title = if let Some(prof) = self.current_profile() {
             let count = vars.len();
             let var_word = if count == 1 { "variable" } else { "variables" };
-            format!(" {} {} in {} profile ", count, var_word, prof.name)
+            if prof.is_phase() {
+                let now = AppStateData::current_epoch_secs();
+                let sync_epoch = prof
+                    .last_sync_epoch
+                    .filter(|&e| e > 0)
+                    .or_else(|| (self.data.last_phase_sync_epoch > 0).then_some(self.data.last_phase_sync_epoch));
+                let compact = area.width < 55;
+                let sync_time = crate::model::format_relative_sync_time(sync_epoch, now, compact);
+                if area.width >= 55 {
+                    format!(
+                        " {} {} in {} profile • Last sync: {} ",
+                        count, var_word, prof.name, sync_time
+                    )
+                } else if area.width >= 40 {
+                    format!(" {} {} in {} • Last sync: {} ", count, var_word, prof.name, sync_time)
+                } else {
+                    format!(" {} vars • Sync: {} ", count, sync_time)
+                }
+            } else {
+                format!(" {} {} in {} profile ", count, var_word, prof.name)
+            }
         } else {
             " 0 variables in profile ".to_string()
         };
@@ -2441,15 +2313,6 @@ impl App {
             Span::raw("Offline ([c] Connect)")
         };
 
-        let auto_sync_badge = if self.data.settings.auto_sync_enabled {
-            Span::styled(
-                format!("ON ({}m)", self.data.settings.effective_interval_mins()),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::styled("OFF", Style::default().fg(Color::DarkGray))
-        };
-
         let mut spans = vec![
             Span::styled(
                 " Phase.dev: ",
@@ -2470,15 +2333,8 @@ impl App {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
             };
-            if area.width >= 135 {
-                spans.push(Span::raw(" | Auto-Sync: "));
-                spans.push(auto_sync_badge);
-            }
             spans.push(Span::raw(" | "));
             spans.push(Span::styled(&self.status_message, msg_style));
-        } else {
-            spans.push(Span::raw(" | Auto-Sync: "));
-            spans.push(auto_sync_badge);
         }
 
         let status_line = Line::from(spans);
@@ -3109,7 +2965,6 @@ impl App {
 
             Modal::Settings {
                 draft,
-                interval_input,
                 active_field,
                 error,
             } => {
@@ -3151,59 +3006,44 @@ impl App {
                 let (pfx2, s2) = make_pfx(2);
                 let (pfx3, s3) = make_pfx(3);
                 let (pfx4, s4) = make_pfx(4);
-                let (pfx5, s5) = make_pfx(5);
-                let (pfx6, s6) = make_pfx(6);
 
                 let mut lines = vec![
                     Line::from(Span::styled(
-                        "Application & Phase.dev Synchronization Settings",
+                        "Application & Synchronization Settings",
                         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                     )),
                     Line::from(""),
                     Line::from(vec![
                         Span::styled(pfx0, s0),
-                        Span::styled("1. Auto-Sync with Phase.dev      : ", s0),
-                        Span::styled(if draft.auto_sync_enabled { " [● ON ] " } else { " [○ ON ] " }, if draft.auto_sync_enabled { active_pill } else { inactive_pill }),
-                        Span::raw(" "),
-                        Span::styled(if !draft.auto_sync_enabled { " [● OFF] " } else { " [○ OFF] " }, if !draft.auto_sync_enabled { active_pill } else { inactive_pill }),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(pfx1, s1),
-                        Span::styled("2. Sync Interval (min 1m)        : ", s1),
-                        Span::styled(format!(" [ {} min█ ] ", interval_input), if *active_field == 1 { Style::default().fg(Color::White).bg(Color::Rgb(22, 34, 52)).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White).bg(Color::Rgb(18, 22, 30)) }),
-                        Span::styled(" (type digits or [/] ±5m)", Style::default().fg(Color::DarkGray)),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(pfx2, s2),
-                        Span::styled("3. Auto-Sync Profile Scope       : ", s2),
+                        Span::styled("1. Phase Sync Profile Scope       : ", s0),
                         Span::styled(if draft.sync_only_enabled_profiles { " [● Enabled Only] " } else { " [○ Enabled Only] " }, if draft.sync_only_enabled_profiles { active_pill } else { inactive_pill }),
                         Span::raw(" "),
                         Span::styled(if !draft.sync_only_enabled_profiles { " [● All Phase] " } else { " [○ All Phase] " }, if !draft.sync_only_enabled_profiles { active_pill } else { inactive_pill }),
                     ]),
                     Line::from(vec![
-                        Span::styled(pfx3, s3),
-                        Span::styled("4. Phase Secret Path Scope       : ", s3),
+                        Span::styled(pfx1, s1),
+                        Span::styled("2. Phase Secret Path Scope       : ", s1),
                         Span::styled(if draft.phase_export_all_paths { " [● All Paths] " } else { " [○ All Paths] " }, if draft.phase_export_all_paths { active_pill } else { inactive_pill }),
                         Span::raw(" "),
                         Span::styled(if !draft.phase_export_all_paths { " [● Root (/) Only] " } else { " [○ Root (/) Only] " }, if !draft.phase_export_all_paths { active_pill } else { inactive_pill }),
                     ]),
                     Line::from(vec![
-                        Span::styled(pfx4, s4),
-                        Span::styled("5. Mask Secret Values on Startup : ", s4),
+                        Span::styled(pfx2, s2),
+                        Span::styled("3. Mask Secret Values on Startup : ", s2),
                         Span::styled(if draft.mask_secrets_by_default { " [● ON ] " } else { " [○ ON ] " }, if draft.mask_secrets_by_default { active_pill } else { inactive_pill }),
                         Span::raw(" "),
                         Span::styled(if !draft.mask_secrets_by_default { " [● OFF] " } else { " [○ OFF] " }, if !draft.mask_secrets_by_default { active_pill } else { inactive_pill }),
                     ]),
                     Line::from(vec![
-                        Span::styled(pfx5, s5),
-                        Span::styled("6. New Profile Default Placement : ", s5),
+                        Span::styled(pfx3, s3),
+                        Span::styled("4. New Profile Default Placement : ", s3),
                         Span::styled(if draft.insert_new_profile_at_top { " [● Top Priority #1] " } else { " [○ Top Priority #1] " }, if draft.insert_new_profile_at_top { active_pill } else { inactive_pill }),
                         Span::raw(" "),
                         Span::styled(if !draft.insert_new_profile_at_top { " [● Bottom of List] " } else { " [○ Bottom of List] " }, if !draft.insert_new_profile_at_top { active_pill } else { inactive_pill }),
                     ]),
                     Line::from(vec![
-                        Span::styled(pfx6, s6),
-                        Span::styled("7. Shell Prompt Auto-Reload Hook : ", s6),
+                        Span::styled(pfx4, s4),
+                        Span::styled("5. Shell Prompt Auto-Reload Hook : ", s4),
                         Span::styled(if draft.shell_prompt_hook { " [● ON ] " } else { " [○ ON ] " }, if draft.shell_prompt_hook { active_pill } else { inactive_pill }),
                         Span::raw(" "),
                         Span::styled(if !draft.shell_prompt_hook { " [● OFF] " } else { " [○ OFF] " }, if !draft.shell_prompt_hook { active_pill } else { inactive_pill }),
@@ -3311,7 +3151,7 @@ impl App {
                     ]),
                     Line::from(vec![
                         Span::styled("  [s]                ", key_style),
-                        Span::styled("Open application & auto-sync Settings", desc_style),
+                        Span::styled("Open application Settings", desc_style),
                     ]),
                     Line::from(vec![
                         Span::styled("  [r]                ", key_style),
@@ -3715,23 +3555,7 @@ impl App {
                 }
                 *error = None;
             }
-            Modal::Settings {
-                draft,
-                interval_input,
-                active_field,
-                error,
-            } => {
-                if *active_field == 1 {
-                    let digits: String = clean.chars().filter(|c| c.is_ascii_digit()).collect();
-                    if !digits.is_empty() {
-                        *interval_input = digits;
-                        if let Ok(v) = interval_input.parse::<u64>() {
-                            draft.set_interval_mins(v.max(MIN_AUTO_SYNC_INTERVAL_MINS));
-                        }
-                        *error = None;
-                    }
-                }
-            }
+            Modal::Settings { .. } => {}
             _ => {}
         }
     }
@@ -3829,23 +3653,22 @@ impl App {
                 ..
             } => {
                 let start_row = block_inner.y + 2;
-                if row >= start_row && row < start_row + 7 {
+                if row >= start_row && row < start_row + 5 {
                     let idx = (row - start_row) as usize;
                     *active_field = idx;
                     if col >= block_inner.x + 36 {
                         match idx {
-                            0 => draft.auto_sync_enabled = !draft.auto_sync_enabled,
-                            2 => {
+                            0 => {
                                 draft.sync_only_enabled_profiles =
                                     !draft.sync_only_enabled_profiles
                             }
-                            3 => draft.phase_export_all_paths = !draft.phase_export_all_paths,
-                            4 => draft.mask_secrets_by_default = !draft.mask_secrets_by_default,
-                            5 => {
+                            1 => draft.phase_export_all_paths = !draft.phase_export_all_paths,
+                            2 => draft.mask_secrets_by_default = !draft.mask_secrets_by_default,
+                            3 => {
                                 draft.insert_new_profile_at_top =
                                     !draft.insert_new_profile_at_top
                             }
-                            6 => draft.shell_prompt_hook = !draft.shell_prompt_hook,
+                            4 => draft.shell_prompt_hook = !draft.shell_prompt_hook,
                             _ => {}
                         }
                     }
@@ -3932,7 +3755,7 @@ pub fn get_modal_rect(modal: &Modal, area: Rect) -> Rect {
         Modal::EditProfile { .. } => compact_modal_rect(58, 12, area),
         Modal::NewProfile { .. } => compact_modal_rect(64, 14, area),
         Modal::VarEditor { .. } => compact_modal_rect(64, 14, area),
-        Modal::Settings { .. } => compact_modal_rect(70, 22, area),
+        Modal::Settings { .. } => compact_modal_rect(70, 16, area),
         Modal::PhaseConnect { .. } => compact_modal_rect(70, 20, area),
         Modal::PhasePicker { .. } => compact_modal_rect(70, 18, area),
         Modal::Help => compact_modal_rect(74, 24, area),
@@ -4296,7 +4119,6 @@ pub fn run_tui() -> Result<(), String> {
 
     let res = (|| -> Result<(), String> {
         loop {
-            app.check_auto_sync();
             app.clear_expired_status();
 
             terminal
@@ -4369,7 +4191,6 @@ mod tests {
             should_quit: false,
             cached_apps: Vec::new(),
             last_area: Rect::default(),
-            last_auto_sync_attempt: None,
             pending_phase_sync: None,
             input_cursor: 0,
         }
@@ -4424,6 +4245,7 @@ mod tests {
             name: "second_profile".to_string(),
             enabled: true,
             phase_binding: None,
+            last_sync_epoch: None,
             vars: Vec::new(),
         });
         assert_eq!(app.data.profiles[0].name, "default");
@@ -4522,30 +4344,89 @@ mod tests {
     }
 
     #[test]
-    fn test_settings_modal_toggle_and_interval_configuration() {
+    fn test_settings_modal_toggle_options() {
         let mut app = make_test_app();
-        assert!(app.data.settings.auto_sync_enabled);
-        assert_eq!(app.data.settings.auto_sync_interval_mins, 30);
+        assert!(app.data.settings.sync_only_enabled_profiles);
 
         // Open settings with 's'
         app.handle_key(KeyEvent::from(KeyCode::Char('s')));
         assert!(matches!(app.modal, Modal::Settings { .. }));
 
-        // Field 0: toggle auto_sync_enabled OFF with Space
+        // Field 0: toggle sync_only_enabled_profiles with Space
         app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
-        // Move to Field 1 (interval) with Tab
-        app.handle_key(KeyEvent::from(KeyCode::Tab));
-        // Clear interval digits and type "15"
-        app.handle_key(KeyEvent::from(KeyCode::Backspace));
-        app.handle_key(KeyEvent::from(KeyCode::Backspace));
-        app.handle_key(KeyEvent::from(KeyCode::Char('1')));
-        app.handle_key(KeyEvent::from(KeyCode::Char('5')));
         // Save with Enter
         app.handle_key(KeyEvent::from(KeyCode::Enter));
 
         assert!(matches!(app.modal, Modal::None));
-        assert!(!app.data.settings.auto_sync_enabled);
-        assert_eq!(app.data.settings.auto_sync_interval_mins, 15);
+        assert!(!app.data.settings.sync_only_enabled_profiles);
+    }
+
+    #[test]
+    fn test_vars_panel_title_shows_last_sync_only_for_phase_profiles() {
+        let mut app = make_test_app();
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // 1. Initially, selected profile is 'default' (Custom profile)
+        assert!(app.data.profiles[0].is_custom());
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let content: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.get(x, y).symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(content.contains("1 variable in default profile"));
+        assert!(!content.contains("Last sync"));
+
+        // 2. Add and select a Phase profile
+        let phase_prof = Profile::new_phase(
+            "phase_prod".to_string(),
+            PhaseBinding {
+                app_id: "app1".to_string(),
+                app_name: "MyService".to_string(),
+                env_id: "env1".to_string(),
+                env_name: "Production".to_string(),
+            },
+            vec![("PHASE_KEY".to_string(), "val".to_string())],
+        );
+        app.data.profiles.push(phase_prof);
+        app.selected_profile = 1;
+        assert!(app.data.profiles[1].is_phase());
+
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let content2: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.get(x, y).symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(content2.contains("1 variable in phase_prod profile"));
+        assert!(content2.contains("Last sync: just now"));
+
+        // 3. Switch back to custom profile (index 0)
+        app.selected_profile = 0;
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let content3: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.get(x, y).symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(content3.contains("1 variable in default profile"));
+        assert!(!content3.contains("Last sync"));
     }
 
     #[test]

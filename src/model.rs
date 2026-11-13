@@ -11,8 +11,6 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const PHASE_CLOUD_HOST: &str = "https://console.phase.dev";
-pub const MIN_AUTO_SYNC_INTERVAL_MINS: u64 = 1;
-pub const DEFAULT_AUTO_SYNC_INTERVAL_MINS: u64 = 30;
 
 /// Hardcoded master key phrase compiled directly into the binary.
 /// Changing this key requires modifying the source code and rebuilding the program.
@@ -183,19 +181,9 @@ fn default_true() -> bool {
     true
 }
 
-fn default_sync_interval_mins() -> u64 {
-    DEFAULT_AUTO_SYNC_INTERVAL_MINS
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppSettings {
-    /// Automatically synchronize Phase.dev profiles at a configurable interval (default: true).
-    #[serde(default = "default_true")]
-    pub auto_sync_enabled: bool,
-    /// Interval in minutes for automatic Phase.dev sync (default: 30, minimum: 1).
-    #[serde(default = "default_sync_interval_mins")]
-    pub auto_sync_interval_mins: u64,
-    /// When auto-syncing, only sync enabled Phase.dev profiles (default: true).
+    /// When syncing Phase.dev profiles, only sync enabled profiles (default: true).
     #[serde(default = "default_true")]
     pub sync_only_enabled_profiles: bool,
     /// Export secrets across all Phase paths (`--path ""`) instead of root `/` only (default: true).
@@ -215,32 +203,12 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            auto_sync_enabled: true,
-            auto_sync_interval_mins: DEFAULT_AUTO_SYNC_INTERVAL_MINS,
             sync_only_enabled_profiles: true,
             phase_export_all_paths: true,
             mask_secrets_by_default: true,
             insert_new_profile_at_top: true,
             shell_prompt_hook: true,
         }
-    }
-}
-
-impl AppSettings {
-    pub fn clamp_interval(mins: u64) -> u64 {
-        mins.clamp(MIN_AUTO_SYNC_INTERVAL_MINS, 1440)
-    }
-
-    pub fn effective_interval_mins(&self) -> u64 {
-        Self::clamp_interval(self.auto_sync_interval_mins)
-    }
-
-    pub fn set_interval_mins(&mut self, mins: u64) {
-        self.auto_sync_interval_mins = Self::clamp_interval(mins);
-    }
-
-    pub fn normalize(&mut self) {
-        self.auto_sync_interval_mins = Self::clamp_interval(self.auto_sync_interval_mins);
     }
 }
 
@@ -321,6 +289,8 @@ pub struct Profile {
     pub name: String,
     pub enabled: bool,
     pub phase_binding: Option<PhaseBinding>,
+    #[serde(default)]
+    pub last_sync_epoch: Option<u64>,
     pub vars: Vec<EnvVar>,
 }
 
@@ -330,6 +300,7 @@ impl Profile {
             name,
             enabled: true,
             phase_binding: None,
+            last_sync_epoch: None,
             vars: Vec::new(),
         }
     }
@@ -339,6 +310,7 @@ impl Profile {
             name,
             enabled: true,
             phase_binding: Some(binding.clone()),
+            last_sync_epoch: Some(AppStateData::current_epoch_secs()),
             vars: Vec::new(),
         };
         prof.set_phase_vars(binding, fetched);
@@ -365,6 +337,7 @@ impl Profile {
         let app_name = binding.app_name.clone();
         let env_name = binding.env_name.clone();
         self.phase_binding = Some(binding);
+        self.last_sync_epoch = Some(AppStateData::current_epoch_secs());
         self.vars.clear();
         for (k, v) in fetched {
             self.vars.push(EnvVar::new(
@@ -504,7 +477,6 @@ impl AppStateData {
             return Self::default();
         };
         let mut state: Self = serde_json::from_slice(&decrypted).unwrap_or_default();
-        state.settings.normalize();
         state.phase.auto_detect_cli();
         for prof in &mut state.profiles {
             prof.sanitize_single_source();
@@ -588,20 +560,49 @@ impl AppStateData {
             target.push(EnvVar::new(key, value, VarSource::Custom));
         }
     }
+}
 
-    /// Checks whether automatic Phase.dev sync is due at `now_epoch` (seconds).
-    pub fn is_auto_sync_due(&self, now_epoch: u64) -> bool {
-        if !self.settings.auto_sync_enabled || !self.phase.is_configured() {
-            return false;
+/// Formats the elapsed time since a given sync epoch into a human-friendly string.
+/// Returns "never" if epoch is None or 0.
+pub fn format_relative_sync_time(sync_epoch: Option<u64>, now_epoch: u64, compact: bool) -> String {
+    let Some(epoch) = sync_epoch.filter(|&e| e > 0) else {
+        return "never".to_string();
+    };
+
+    if now_epoch <= epoch {
+        return "just now".to_string();
+    }
+
+    let diff = now_epoch - epoch;
+    if diff < 60 {
+        "just now".to_string()
+    } else if diff < 3600 {
+        let mins = (diff / 60).max(1);
+        if compact {
+            format!("{}m ago", mins)
+        } else if mins == 1 {
+            "1 minute ago".to_string()
+        } else {
+            format!("{} minutes ago", mins)
         }
-        let has_eligible_profile = self.profiles.iter().any(|p| {
-            p.is_phase() && (!self.settings.sync_only_enabled_profiles || p.enabled)
-        });
-        if !has_eligible_profile {
-            return false;
+    } else if diff < 86400 {
+        let hours = (diff / 3600).max(1);
+        if compact {
+            format!("{}h ago", hours)
+        } else if hours == 1 {
+            "1 hour ago".to_string()
+        } else {
+            format!("{} hours ago", hours)
         }
-        let interval_secs = self.settings.effective_interval_mins().saturating_mul(60);
-        now_epoch.saturating_sub(self.last_phase_sync_epoch) >= interval_secs
+    } else {
+        let days = (diff / 86400).max(1);
+        if compact {
+            format!("{}d ago", days)
+        } else if days == 1 {
+            "1 day ago".to_string()
+        } else {
+            format!("{} days ago", days)
+        }
     }
 }
 
@@ -676,6 +677,7 @@ mod tests {
                     name: "default".to_string(),
                     enabled: true,
                     phase_binding: None,
+                    last_sync_epoch: None,
                     vars: vec![EnvVar::new(
                         plaintext_key.to_string(),
                         plaintext_secret_1.to_string(),
@@ -691,6 +693,7 @@ mod tests {
                         env_id: "env-1".to_string(),
                         env_name: "production".to_string(),
                     }),
+                    last_sync_epoch: None,
                     vars: vec![EnvVar::new(
                         "API_TOKEN".to_string(),
                         plaintext_secret_2.to_string(),
@@ -794,17 +797,29 @@ mod tests {
     }
 
     #[test]
-    fn test_settings_defaults_and_interval_clamping() {
-        let mut settings = AppSettings::default();
-        assert!(settings.auto_sync_enabled);
-        assert_eq!(settings.auto_sync_interval_mins, 30);
+    fn test_settings_defaults_and_relative_sync_time() {
+        let settings = AppSettings::default();
+        assert!(settings.sync_only_enabled_profiles);
+        assert!(settings.phase_export_all_paths);
+        assert!(settings.mask_secrets_by_default);
 
-        settings.set_interval_mins(0);
-        assert_eq!(settings.auto_sync_interval_mins, 1);
-        assert_eq!(settings.effective_interval_mins(), 1);
-
-        settings.set_interval_mins(15);
-        assert_eq!(settings.auto_sync_interval_mins, 15);
+        let now = 1_000_000;
+        assert_eq!(format_relative_sync_time(None, now, false), "never");
+        assert_eq!(format_relative_sync_time(Some(0), now, false), "never");
+        assert_eq!(format_relative_sync_time(Some(now), now, false), "just now");
+        assert_eq!(format_relative_sync_time(Some(now - 30), now, false), "just now"); // 30s ago
+        assert_eq!(format_relative_sync_time(Some(now - 60), now, false), "1 minute ago"); // 60s ago
+        assert_eq!(format_relative_sync_time(Some(now - 60), now, true), "1m ago");
+        assert_eq!(format_relative_sync_time(Some(now - 300), now, false), "5 minutes ago"); // 300s ago
+        assert_eq!(format_relative_sync_time(Some(now - 300), now, true), "5m ago");
+        assert_eq!(format_relative_sync_time(Some(now - 3600), now, false), "1 hour ago");
+        assert_eq!(format_relative_sync_time(Some(now - 3600), now, true), "1h ago");
+        assert_eq!(format_relative_sync_time(Some(now - 7200), now, false), "2 hours ago");
+        assert_eq!(format_relative_sync_time(Some(now - 7200), now, true), "2h ago");
+        assert_eq!(format_relative_sync_time(Some(now - 86400), now, false), "1 day ago");
+        assert_eq!(format_relative_sync_time(Some(now - 86400), now, true), "1d ago");
+        assert_eq!(format_relative_sync_time(Some(now - 172800), now, false), "2 days ago");
+        assert_eq!(format_relative_sync_time(Some(now - 172800), now, true), "2d ago");
     }
 
     #[test]
@@ -816,6 +831,7 @@ mod tests {
                     name: "profile_satu".to_string(),
                     enabled: true,
                     phase_binding: None,
+                    last_sync_epoch: None,
                     vars: vec![
                         EnvVar::new("A".to_string(), "from_profile_satu".to_string(), VarSource::Custom),
                         EnvVar::new("B".to_string(), "b_from_satu".to_string(), VarSource::Custom),
@@ -825,6 +841,7 @@ mod tests {
                     name: "profile_dua".to_string(),
                     enabled: true,
                     phase_binding: None,
+                    last_sync_epoch: None,
                     vars: vec![
                         EnvVar::new("A".to_string(), "from_profile_dua".to_string(), VarSource::Custom),
                         EnvVar::new("C".to_string(), "c_from_dua".to_string(), VarSource::Custom),
@@ -856,12 +873,14 @@ mod tests {
                     name: "profile_satu".to_string(),
                     enabled: false,
                     phase_binding: None,
+                    last_sync_epoch: None,
                     vars: vec![EnvVar::new("A".to_string(), "from_profile_satu".to_string(), VarSource::Custom)],
                 },
                 Profile {
                     name: "profile_dua".to_string(),
                     enabled: true,
                     phase_binding: None,
+                    last_sync_epoch: None,
                     vars: vec![EnvVar::new("A".to_string(), "from_profile_dua".to_string(), VarSource::Custom)],
                 },
             ],

@@ -30,13 +30,7 @@ fn main() {
                 return;
             }
             "export" => {
-                let mut state = AppStateData::load();
-                let now = AppStateData::current_epoch_secs();
-                if state.is_auto_sync_due(now) {
-                    if sync_phase_profiles(&mut state, None).is_ok() {
-                        let _ = state.save();
-                    }
-                }
+                let state = AppStateData::load();
                 let effective = state.compute_effective_vars();
                 print!("{}", generate_env_sh_content(&effective));
                 return;
@@ -118,17 +112,15 @@ fn main() {
                     }
                 );
                 println!("Phase CLI      : {}", cli_status.summary_badge());
-                println!(
-                    "Auto-Sync      : {}",
-                    if state.settings.auto_sync_enabled {
-                        format!(
-                            "Enabled (every {} min, min 1 min)",
-                            state.settings.effective_interval_mins()
-                        )
-                    } else {
-                        "Disabled".to_string()
-                    }
-                );
+                if state.last_phase_sync_epoch > 0 {
+                    let now = AppStateData::current_epoch_secs();
+                    let relative = model::format_relative_sync_time(
+                        Some(state.last_phase_sync_epoch),
+                        now,
+                        false,
+                    );
+                    println!("Last Phase Sync: {}", relative);
+                }
                 println!("Profiles ({})   :", state.profiles.len());
                 for p in &state.profiles {
                     let st = if p.enabled { "ON " } else { "OFF" };
