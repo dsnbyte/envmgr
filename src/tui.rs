@@ -2227,8 +2227,8 @@ impl App {
                 vec![
                     Constraint::Percentage(28),
                     Constraint::Percentage(30),
-                    Constraint::Percentage(24),
-                    Constraint::Percentage(18),
+                    Constraint::Percentage(10),
+                    Constraint::Percentage(32),
                 ],
                 effective
                     .iter()
@@ -5103,5 +5103,35 @@ mod tests {
         // 2. Note stating that each profile uses exclusively one source must NOT be present
         assert!(!content.contains("exclusively one source"));
         assert!(!content.contains("sources cannot be mixed"));
+    }
+
+    #[test]
+    fn test_effective_pane_source_column_not_truncated() {
+        let mut app = make_test_app();
+        app.data.profiles.push(Profile::new_phase(
+            "staging".to_string(),
+            PhaseBinding {
+                app_id: "app-1".to_string(),
+                app_name: "my-app".to_string(),
+                env_id: "env-1".to_string(),
+                env_name: "production".to_string(),
+            },
+            vec![("DATABASE_URL".to_string(), "postgres://...".to_string())],
+        ));
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let content: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(content.contains("PROFILE"));
+        assert!(content.contains("Phase (my-app/production)"));
     }
 }
