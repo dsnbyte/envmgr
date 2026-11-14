@@ -204,6 +204,56 @@ impl Default for AppSettings {
     }
 }
 
+pub fn normalize_secret_path(path: &str) -> String {
+    let segments: Vec<&str> = path
+        .trim()
+        .split('/')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if segments.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", segments.join("/"))
+    }
+}
+
+fn default_root_path() -> String {
+    "/".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhaseVarRef {
+    pub app_id: String,
+    pub app_name: String,
+    pub env_id: String,
+    pub env_name: String,
+    #[serde(default = "default_root_path")]
+    pub path: String,
+    pub secret_key: String,
+}
+
+impl PhaseVarRef {
+    pub fn normalized_path(&self) -> String {
+        normalize_secret_path(&self.path)
+    }
+
+    pub fn reference_syntax(&self) -> String {
+        let path = self.normalized_path();
+        if path == "/" {
+            format!(
+                "${{{}::{}.{}}}",
+                self.app_name, self.env_name, self.secret_key
+            )
+        } else {
+            format!(
+                "${{{}::{}.{}/{}}}",
+                self.app_name, self.env_name, path, self.secret_key
+            )
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum VarSource {
@@ -225,6 +275,8 @@ pub struct EnvVar {
     #[serde(default)]
     pub suffix: String,
     pub source: VarSource,
+    #[serde(default)]
+    pub phase_ref: Option<PhaseVarRef>,
 }
 
 pub fn compute_prefix_suffix(value: &str) -> (String, String) {
@@ -253,7 +305,30 @@ impl EnvVar {
             prefix,
             suffix,
             source,
+            phase_ref: None,
         }
+    }
+
+    pub fn with_phase_ref(
+        key: String,
+        value: String,
+        comment: String,
+        phase_ref: Option<PhaseVarRef>,
+    ) -> Self {
+        let (prefix, suffix) = compute_prefix_suffix(&value);
+        Self {
+            key,
+            value,
+            comment,
+            prefix,
+            suffix,
+            source: VarSource::Custom,
+            phase_ref,
+        }
+    }
+
+    pub fn is_phase_synced(&self) -> bool {
+        matches!(self.source, VarSource::Phase { .. }) || self.phase_ref.is_some()
     }
 
     pub fn set_value(&mut self, new_val: String) {
@@ -350,6 +425,10 @@ impl Collection {
         self.phase_binding.is_none()
     }
 
+    pub fn has_phase_vars(&self) -> bool {
+        self.vars.iter().any(|v| v.phase_ref.is_some())
+    }
+
     pub fn source_label(&self) -> String {
         match &self.phase_binding {
             Some(b) => format!("Phase ({}/{})", b.app_name, b.env_name),
@@ -381,13 +460,14 @@ impl Collection {
         }
     }
 
-    /// Upserts a custom variable if and only if this collection is a Custom collection.
+    /// Upserts a custom variable with an optional Phase.dev reference if and only if this collection is a Custom collection.
     /// Returns an error if the collection is bound to Phase.dev.
-    pub fn upsert_custom_var(
+    pub fn upsert_custom_var_with_phase_ref(
         &mut self,
         key: String,
         value: String,
         comment: String,
+        phase_ref: Option<PhaseVarRef>,
     ) -> Result<(), String> {
         if self.is_phase() {
             return Err(format!(
@@ -395,7 +475,7 @@ impl Collection {
                 self.name
             ));
         }
-        AppStateData::upsert_custom_var(&mut self.vars, key, value, comment);
+        AppStateData::upsert_custom_var_with_ref(&mut self.vars, key, value, comment, phase_ref);
         Ok(())
     }
 
@@ -566,6 +646,16 @@ impl AppStateData {
                 if !map.contains_key(&var.key) {
                     order.push(var.key.clone());
                 }
+                let source_label = if let Some(pref) = &var.phase_ref {
+                    let p = pref.normalized_path();
+                    if p == "/" {
+                        format!("Phase ({}/{})", pref.app_name, pref.env_name)
+                    } else {
+                        format!("Phase ({}/{}{})", pref.app_name, pref.env_name, p)
+                    }
+                } else {
+                    coll_source.clone()
+                };
                 map.insert(
                     var.key.clone(),
                     EffectiveVar {
@@ -574,7 +664,7 @@ impl AppStateData {
                         prefix: var.prefix.clone(),
                         suffix: var.suffix.clone(),
                         winning_owner: owner.clone(),
-                        source_label: coll_source.clone(),
+                        source_label,
                     },
                 );
             }
@@ -586,11 +676,12 @@ impl AppStateData {
             .collect()
     }
 
-    pub fn upsert_custom_var(
+    pub fn upsert_custom_var_with_ref(
         target: &mut Vec<EnvVar>,
         key: String,
         value: String,
         comment: String,
+        phase_ref: Option<PhaseVarRef>,
     ) {
         target.retain(|v| matches!(v.source, VarSource::Custom));
         let comment = if comment.chars().count() > 100 {
@@ -602,8 +693,9 @@ impl AppStateData {
             existing.set_value(value);
             existing.comment = comment;
             existing.source = VarSource::Custom;
+            existing.phase_ref = phase_ref;
         } else {
-            target.push(EnvVar::with_comment(key, value, comment, VarSource::Custom));
+            target.push(EnvVar::with_phase_ref(key, value, comment, phase_ref));
         }
     }
 }
@@ -813,7 +905,12 @@ mod tests {
         assert!(!phase_coll.is_custom());
         assert_eq!(phase_coll.vars[0].comment, "Prod DB connection");
         assert!(phase_coll
-            .upsert_custom_var("CUSTOM_KEY".to_string(), "123".to_string(), "comment".to_string())
+            .upsert_custom_var_with_phase_ref(
+                "CUSTOM_KEY".to_string(),
+                "123".to_string(),
+                "comment".to_string(),
+                None
+            )
             .is_err());
         assert_eq!(phase_coll.vars.len(), 1);
 
@@ -830,7 +927,12 @@ mod tests {
         // Custom collection strips any Phase vars on sanitize
         let mut custom_coll = Collection::new_custom("local_dev".to_string());
         custom_coll
-            .upsert_custom_var("LOCAL_PORT".to_string(), "8080".to_string(), "Local listening port".to_string())
+            .upsert_custom_var_with_phase_ref(
+                "LOCAL_PORT".to_string(),
+                "8080".to_string(),
+                "Local listening port".to_string(),
+                None,
+            )
             .unwrap();
         assert_eq!(custom_coll.vars[0].comment, "Local listening port");
         custom_coll.vars.push(EnvVar::new(
@@ -850,8 +952,13 @@ mod tests {
     fn test_custom_var_comment_100_char_limit() {
         let mut coll = Collection::new_custom("dev".to_string());
         let long_comment = "x".repeat(150);
-        coll.upsert_custom_var("MY_KEY".to_string(), "my_val".to_string(), long_comment)
-            .unwrap();
+        coll.upsert_custom_var_with_phase_ref(
+            "MY_KEY".to_string(),
+            "my_val".to_string(),
+            long_comment,
+            None,
+        )
+        .unwrap();
         assert_eq!(coll.vars.len(), 1);
         assert_eq!(coll.vars[0].comment.chars().count(), 100);
         assert_eq!(coll.vars[0].comment, "x".repeat(100));
@@ -956,5 +1063,99 @@ mod tests {
         state.collections[1].enabled = false;
         let effective2 = state.compute_effective_vars();
         assert!(effective2.is_empty());
+    }
+
+    #[test]
+    fn test_phase_var_ref_paths_and_reference_syntax() {
+        assert_eq!(normalize_secret_path(""), "/");
+        assert_eq!(normalize_secret_path("  /  "), "/");
+        assert_eq!(normalize_secret_path("backend/payments/"), "/backend/payments");
+        assert_eq!(normalize_secret_path("/backend//payments/"), "/backend/payments");
+
+        let root_ref = PhaseVarRef {
+            app_id: "app1".to_string(),
+            app_name: "backend_api".to_string(),
+            env_id: "env1".to_string(),
+            env_name: "production".to_string(),
+            path: "/".to_string(),
+            secret_key: "SECRET_KEY".to_string(),
+        };
+        assert_eq!(root_ref.normalized_path(), "/");
+        assert_eq!(root_ref.reference_syntax(), "${backend_api::production.SECRET_KEY}");
+
+        let folder_ref = PhaseVarRef {
+            app_id: "app1".to_string(),
+            app_name: "backend_api".to_string(),
+            env_id: "env1".to_string(),
+            env_name: "production".to_string(),
+            path: "backend/payments/".to_string(),
+            secret_key: "STRIPE_KEY".to_string(),
+        };
+        assert_eq!(folder_ref.normalized_path(), "/backend/payments");
+        assert_eq!(
+            folder_ref.reference_syntax(),
+            "${backend_api::production./backend/payments/STRIPE_KEY}"
+        );
+
+        let manual_var = EnvVar::new(
+            "LOCAL_VAR".to_string(),
+            "val".to_string(),
+            VarSource::Custom,
+        );
+        assert!(!manual_var.is_phase_synced());
+
+        let phase_var = EnvVar::with_phase_ref(
+            "MY_STRIPE".to_string(),
+            "sk_live_abc".to_string(),
+            "Stripe comment".to_string(),
+            Some(folder_ref),
+        );
+        assert!(phase_var.is_phase_synced());
+        assert_eq!(phase_var.comment, "Stripe comment");
+    }
+
+    #[test]
+    fn test_effective_vars_source_label_for_phase_ref_custom_var() {
+        let mut state = AppStateData::default();
+        state.collections[0].vars.push(EnvVar::new(
+            "MANUAL_KEY".to_string(),
+            "123".to_string(),
+            VarSource::Custom,
+        ));
+        state.collections[0].vars.push(EnvVar::with_phase_ref(
+            "ROOT_REF".to_string(),
+            "abc".to_string(),
+            "Root secret".to_string(),
+            Some(PhaseVarRef {
+                app_id: "app1".to_string(),
+                app_name: "backend_api".to_string(),
+                env_id: "env1".to_string(),
+                env_name: "production".to_string(),
+                path: "/".to_string(),
+                secret_key: "ROOT_KEY".to_string(),
+            }),
+        ));
+        state.collections[0].vars.push(EnvVar::with_phase_ref(
+            "FOLDER_REF".to_string(),
+            "xyz".to_string(),
+            "Folder secret".to_string(),
+            Some(PhaseVarRef {
+                app_id: "app1".to_string(),
+                app_name: "backend_api".to_string(),
+                env_id: "env1".to_string(),
+                env_name: "production".to_string(),
+                path: "/backend/payments".to_string(),
+                secret_key: "STRIPE_KEY".to_string(),
+            }),
+        ));
+
+        let effective = state.compute_effective_vars();
+        let manual = effective.iter().find(|v| v.key == "MANUAL_KEY").unwrap();
+        let root_ref = effective.iter().find(|v| v.key == "ROOT_REF").unwrap();
+        let folder_ref = effective.iter().find(|v| v.key == "FOLDER_REF").unwrap();
+
+        assert_eq!(manual.source_label, "Custom");
+        assert_eq!(root_ref.source_label, "Phase (backend_api/production)");
+        assert_eq!(folder_ref.source_label, "Phase (backend_api/production/backend/payments)");
     }
 }

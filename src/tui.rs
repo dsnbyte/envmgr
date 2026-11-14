@@ -1,10 +1,11 @@
 use crate::model::{
-    is_valid_env_key, AppSettings, AppStateData, EnvVar, HostMode, PhaseAuthMethod, PhaseBinding,
-    PhaseConfig, Collection, PHASE_CLOUD_HOST,
+    is_valid_env_key, normalize_secret_path, AppSettings, AppStateData, Collection, EnvVar,
+    HostMode, PhaseAuthMethod, PhaseBinding, PhaseConfig, PhaseVarRef, PHASE_CLOUD_HOST,
 };
 use crate::phase::{
-    detect_phase_cli_detailed, fetch_apps_and_envs, fetch_secrets_for_env, sync_phase_collections,
-    try_detect_local_phase_cli_host, PhaseAppInfo, PhaseCliStatus,
+    detect_phase_cli_detailed, fetch_apps_and_envs, fetch_detailed_secrets_for_env,
+    fetch_secrets_for_env, sync_phase_collections, try_detect_local_phase_cli_host, PhaseAppInfo,
+    PhaseCliStatus, PhaseSecretItem,
 };
 use crate::shell::{apply_state_to_system, reload_shell_environment};
 use crossterm::event::{
@@ -16,8 +17,8 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Row,
-        Table, TableState, Wrap,
+        Block, BorderType, Borders, Cell, Clear, List, ListItem, ListState, Padding, Paragraph,
+        Row, Table, TableState, Wrap,
     },
     Frame,
 };
@@ -62,9 +63,29 @@ pub enum Modal {
         is_edit: bool,
         original_index: Option<usize>,
         var_key: String,
+        is_phase_source: bool,
+        phase_ref: Option<PhaseVarRef>,
         var_value: String,
         var_comment: String,
-        active_field: usize, // 0 = key, 1 = value, 2 = comment
+        active_field: usize, // 0 = key, 1 = source, 2 = value/ref, 3 = comment
+        error: Option<String>,
+    },
+    PhaseVarPicker {
+        is_edit: bool,
+        original_index: Option<usize>,
+        var_key: String,
+        prev_value: String,
+        prev_comment: String,
+        existing_phase_ref: Option<PhaseVarRef>,
+        apps: Vec<PhaseAppInfo>,
+        selected_app: usize,
+        selected_env: usize,
+        loaded_env: Option<(String, String)>,
+        env_secrets: Vec<PhaseSecretItem>,
+        folders: Vec<String>,
+        selected_folder: usize,
+        selected_secret: usize,
+        picker_step: usize, // 0 = app, 1 = env, 2 = folder, 3 = secret
         error: Option<String>,
     },
     ConfirmDeleteCollection {
@@ -407,27 +428,7 @@ impl App {
                     return;
                 }
                 KeyCode::Char('a') | KeyCode::Char('A') => {
-                    let Some(coll) = self.current_collection() else {
-                        self.set_error("No collection available. Create a collection first with [Ctrl+N].");
-                        return;
-                    };
-                    if coll.is_phase() {
-                        let cname = coll.name.clone();
-                        self.set_error(format!(
-                            "Collection '{}' uses Phase.dev synchronization. Sources cannot be mixed (create a Custom collection with [Ctrl+N]).",
-                            cname
-                        ));
-                    } else {
-                        self.modal = Modal::VarEditor {
-                            is_edit: false,
-                            original_index: None,
-                            var_key: String::new(),
-                            var_value: String::new(),
-                            var_comment: String::new(),
-                            active_field: 0,
-                            error: None,
-                        };
-                    }
+                    self.open_add_var_modal();
                     return;
                 }
                 KeyCode::Char('e') | KeyCode::Char('E') => {
@@ -524,12 +525,17 @@ impl App {
             return;
         };
 
-        if !coll.is_phase() {
+        let is_phase_coll = coll.is_phase();
+        let has_phase_vars = coll.has_phase_vars();
+        if !is_phase_coll && !has_phase_vars {
             return;
         }
 
         let idx = self.selected_collection;
         if force_rebind_picker {
+            if !is_phase_coll {
+                return;
+            }
             self.open_phase_picker(Some(idx), None);
             return;
         }
@@ -592,7 +598,7 @@ impl App {
                     .data
                     .collections
                     .iter()
-                    .filter(|c| c.is_phase())
+                    .filter(|c| c.is_phase() || c.has_phase_vars())
                     .map(|c| c.name.clone())
                     .collect();
                 let coll_desc = if coll_names.len() == 1 {
@@ -655,14 +661,21 @@ impl App {
             return;
         }
         if let Some(var) = self.current_vars().get(self.selected_var).cloned() {
-            self.input_cursor = var.value.chars().count();
+            let is_phase_source = var.phase_ref.is_some();
+            self.input_cursor = if is_phase_source {
+                0
+            } else {
+                var.value.chars().count()
+            };
             self.modal = Modal::VarEditor {
                 is_edit: true,
                 original_index: Some(self.selected_var),
                 var_key: var.key,
+                is_phase_source,
+                phase_ref: var.phase_ref,
                 var_value: var.value,
                 var_comment: var.comment,
-                active_field: 1,
+                active_field: 2,
                 error: None,
             };
         } else {
@@ -693,14 +706,22 @@ impl App {
                     let key = coll.vars[v_idx].key.clone();
                     let val = coll.vars[v_idx].value.clone();
                     let comment = coll.vars[v_idx].comment.clone();
-                    self.input_cursor = val.chars().count();
+                    let phase_ref = coll.vars[v_idx].phase_ref.clone();
+                    let is_phase_source = phase_ref.is_some();
+                    self.input_cursor = if is_phase_source {
+                        0
+                    } else {
+                        val.chars().count()
+                    };
                     self.modal = Modal::VarEditor {
                         is_edit: true,
                         original_index: Some(v_idx),
                         var_key: key,
+                        is_phase_source,
+                        phase_ref,
                         var_value: val,
                         var_comment: comment,
-                        active_field: 1,
+                        active_field: 2,
                         error: None,
                     };
                     return;
@@ -803,6 +824,8 @@ impl App {
                 is_edit: false,
                 original_index: None,
                 var_key: String::new(),
+                is_phase_source: false,
+                phase_ref: None,
                 var_value: String::new(),
                 var_comment: String::new(),
                 active_field: 0,
@@ -819,7 +842,11 @@ impl App {
     }
 
     pub fn sync_all_phase_collections(&mut self) {
-        let has_any_phase = self.data.collections.iter().any(|c| c.is_phase());
+        let has_any_phase = self
+            .data
+            .collections
+            .iter()
+            .any(|c| c.is_phase() || c.has_phase_vars());
         if !has_any_phase {
             self.set_error("No Phase.dev collections found to sync. Press [Ctrl+N] to create one.");
             return;
@@ -946,6 +973,14 @@ impl App {
                             action: ContextAction::AddVar,
                             is_danger: false,
                         });
+                        if coll.has_phase_vars() {
+                            items.push(ContextMenuItem {
+                                label: "Sync Phase Variables".to_string(),
+                                shortcut: "Ctrl+B",
+                                action: ContextAction::PhaseSync,
+                                is_danger: false,
+                            });
+                        }
                     }
                     items.push(ContextMenuItem {
                         label: "New Collection".to_string(),
@@ -970,10 +1005,10 @@ impl App {
             }
             FocusPane::Vars => {
                 let has_vars = !self.current_vars().is_empty();
-                let is_phase = self
+                let (is_phase, has_phase_vars) = self
                     .current_collection()
-                    .map(|p| p.is_phase())
-                    .unwrap_or(false);
+                    .map(|p| (p.is_phase(), p.has_phase_vars()))
+                    .unwrap_or((false, false));
                 if has_vars && !is_phase {
                     items.push(ContextMenuItem {
                         label: "Edit Variable".to_string(),
@@ -1002,6 +1037,14 @@ impl App {
                         action: ContextAction::AddVar,
                         is_danger: false,
                     });
+                    if has_phase_vars {
+                        items.push(ContextMenuItem {
+                            label: "Sync Phase Variables".to_string(),
+                            shortcut: "Ctrl+B",
+                            action: ContextAction::PhaseSync,
+                            is_danger: false,
+                        });
+                    }
                 }
                 if has_vars {
                     items.push(ContextMenuItem {
@@ -1287,6 +1330,124 @@ impl App {
             Err(e) => {
                 self.set_error(format!("Phase.dev error: {}", e));
                 self.open_phase_connect_modal(new_collection_name, Some(e));
+            }
+        }
+    }
+
+    fn open_phase_var_picker_from_editor(
+        &mut self,
+        is_edit: bool,
+        original_index: Option<usize>,
+        var_key: String,
+        prev_value: String,
+        prev_comment: String,
+        existing_phase_ref: Option<PhaseVarRef>,
+        active_field: usize,
+    ) {
+        if !self.data.phase.is_configured() {
+            self.modal = Modal::VarEditor {
+                is_edit,
+                original_index,
+                var_key,
+                is_phase_source: true,
+                phase_ref: existing_phase_ref,
+                var_value: prev_value,
+                var_comment: prev_comment,
+                active_field,
+                error: Some(
+                    "Phase.dev authentication is not configured. Configure it in Settings [Ctrl+P]."
+                        .to_string(),
+                ),
+            };
+            return;
+        }
+
+        match fetch_apps_and_envs(&self.data.phase) {
+            Ok(mut apps) => {
+                if apps.is_empty() {
+                    self.modal = Modal::VarEditor {
+                        is_edit,
+                        original_index,
+                        var_key,
+                        is_phase_source: true,
+                        phase_ref: existing_phase_ref,
+                        var_value: prev_value,
+                        var_comment: prev_comment,
+                        active_field,
+                        error: Some("Connected to Phase.dev, but no Apps were found.".to_string()),
+                    };
+                    return;
+                }
+                self.cached_apps = apps.clone();
+                let mut selected_app = 0;
+                let mut selected_env = 0;
+                if let Some(pref) = &existing_phase_ref {
+                    if let Some(app_idx) = apps
+                        .iter()
+                        .position(|a| a.id == pref.app_id || a.name == pref.app_name)
+                    {
+                        selected_app = app_idx;
+                        if let Some(env_idx) = apps[app_idx]
+                            .environments
+                            .iter()
+                            .position(|e| e.id == pref.env_id || e.name == pref.env_name)
+                        {
+                            selected_env = env_idx;
+                        }
+                    }
+                }
+                let mut loaded_env = None;
+                let mut env_secrets = Vec::new();
+                let mut folders = Vec::new();
+                let mut selected_folder = 0;
+                let mut selected_secret = 0;
+                let mut error = None;
+                if existing_phase_ref.is_some() {
+                    ensure_phase_var_picker_env_loaded(
+                        &self.data.phase,
+                        &mut apps,
+                        selected_app,
+                        selected_env,
+                        existing_phase_ref.as_ref(),
+                        &mut loaded_env,
+                        &mut env_secrets,
+                        &mut folders,
+                        &mut selected_folder,
+                        &mut selected_secret,
+                        &mut error,
+                    );
+                }
+                self.modal = Modal::PhaseVarPicker {
+                    is_edit,
+                    original_index,
+                    var_key,
+                    prev_value,
+                    prev_comment,
+                    existing_phase_ref,
+                    apps,
+                    selected_app,
+                    selected_env,
+                    loaded_env,
+                    env_secrets,
+                    folders,
+                    selected_folder,
+                    selected_secret,
+                    picker_step: 0,
+                    error,
+                };
+            }
+            Err(e) => {
+                self.modal = Modal::VarEditor {
+                    is_edit,
+                    original_index,
+                    var_key,
+                    is_phase_source: true,
+                    phase_ref: existing_phase_ref,
+                    var_value: prev_value,
+                    var_comment: prev_comment,
+                    active_field,
+                    error: Some(format!("Phase.dev error: {}", e)),
+                };
             }
         }
     }
@@ -1595,44 +1756,65 @@ impl App {
                 is_edit,
                 original_index,
                 mut var_key,
+                mut is_phase_source,
+                phase_ref,
                 mut var_value,
                 mut var_comment,
                 mut active_field,
                 mut error,
             } => {
+                let field_count = if is_phase_source { 3 } else { 4 };
                 match key.code {
                     KeyCode::Esc => {
                         return;
                     }
                     KeyCode::Tab | KeyCode::Down => {
-                        active_field = (active_field + 1) % 3;
+                        active_field = (active_field + 1) % field_count;
                         self.input_cursor = match active_field {
                             0 => var_key.chars().count(),
-                            1 => var_value.chars().count(),
-                            _ => var_comment.chars().count(),
+                            2 if !is_phase_source => var_value.chars().count(),
+                            3 if !is_phase_source => var_comment.chars().count(),
+                            _ => 0,
                         };
                         error = None;
                     }
                     KeyCode::Up | KeyCode::BackTab => {
-                        active_field = if active_field == 0 { 2 } else { active_field - 1 };
+                        active_field = if active_field == 0 {
+                            field_count - 1
+                        } else {
+                            active_field - 1
+                        };
                         self.input_cursor = match active_field {
                             0 => var_key.chars().count(),
-                            1 => var_value.chars().count(),
-                            _ => var_comment.chars().count(),
+                            2 if !is_phase_source => var_value.chars().count(),
+                            3 if !is_phase_source => var_comment.chars().count(),
+                            _ => 0,
                         };
                         error = None;
                     }
                     KeyCode::Left => {
-                        self.input_cursor = self.input_cursor.saturating_sub(1);
+                        if active_field == 1 {
+                            is_phase_source = !is_phase_source;
+                        } else if active_field == 0
+                            || (!is_phase_source && (active_field == 2 || active_field == 3))
+                        {
+                            self.input_cursor = self.input_cursor.saturating_sub(1);
+                        }
                         error = None;
                     }
                     KeyCode::Right => {
-                        let len = match active_field {
-                            0 => var_key.chars().count(),
-                            1 => var_value.chars().count(),
-                            _ => var_comment.chars().count(),
-                        };
-                        self.input_cursor = (self.input_cursor + 1).min(len);
+                        if active_field == 1 {
+                            is_phase_source = !is_phase_source;
+                        } else if active_field == 0
+                            || (!is_phase_source && (active_field == 2 || active_field == 3))
+                        {
+                            let len = match active_field {
+                                0 => var_key.chars().count(),
+                                2 => var_value.chars().count(),
+                                _ => var_comment.chars().count(),
+                            };
+                            self.input_cursor = (self.input_cursor + 1).min(len);
+                        }
                         error = None;
                     }
                     KeyCode::Home | KeyCode::Char('a')
@@ -1645,59 +1827,122 @@ impl App {
                     {
                         let len = match active_field {
                             0 => var_key.chars().count(),
-                            1 => var_value.chars().count(),
-                            _ => var_comment.chars().count(),
+                            2 if !is_phase_source => var_value.chars().count(),
+                            3 if !is_phase_source => var_comment.chars().count(),
+                            _ => 0,
                         };
                         self.input_cursor = len;
                     }
+                    KeyCode::Char(' ') if active_field == 1 => {
+                        is_phase_source = !is_phase_source;
+                        error = None;
+                    }
+                    KeyCode::Char(' ') if active_field == 2 && is_phase_source => {
+                        self.open_phase_var_picker_from_editor(
+                            is_edit,
+                            original_index,
+                            var_key,
+                            var_value,
+                            var_comment,
+                            phase_ref,
+                            active_field,
+                        );
+                        return;
+                    }
+                    KeyCode::Char('p')
+                        if is_phase_source && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        self.open_phase_var_picker_from_editor(
+                            is_edit,
+                            original_index,
+                            var_key,
+                            var_value,
+                            var_comment,
+                            phase_ref,
+                            active_field,
+                        );
+                        return;
+                    }
                     KeyCode::Backspace => {
-                        if self.input_cursor > 0 {
+                        let editable = active_field == 0
+                            || (!is_phase_source && (active_field == 2 || active_field == 3));
+                        if editable && self.input_cursor > 0 {
                             match active_field {
                                 0 => remove_char_at(&mut var_key, self.input_cursor - 1),
-                                1 => remove_char_at(&mut var_value, self.input_cursor - 1),
-                                _ => remove_char_at(&mut var_comment, self.input_cursor - 1),
+                                2 => remove_char_at(&mut var_value, self.input_cursor - 1),
+                                3 => remove_char_at(&mut var_comment, self.input_cursor - 1),
+                                _ => false,
                             };
                             self.input_cursor -= 1;
                             error = None;
                         }
                     }
                     KeyCode::Delete => {
-                        match active_field {
-                            0 => remove_char_at(&mut var_key, self.input_cursor),
-                            1 => remove_char_at(&mut var_value, self.input_cursor),
-                            _ => remove_char_at(&mut var_comment, self.input_cursor),
-                        };
-                        error = None;
+                        let editable = active_field == 0
+                            || (!is_phase_source && (active_field == 2 || active_field == 3));
+                        if editable {
+                            match active_field {
+                                0 => remove_char_at(&mut var_key, self.input_cursor),
+                                2 => remove_char_at(&mut var_value, self.input_cursor),
+                                3 => remove_char_at(&mut var_comment, self.input_cursor),
+                                _ => false,
+                            };
+                            error = None;
+                        }
                     }
                     KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        match active_field {
-                            0 => var_key.clear(),
-                            1 => var_value.clear(),
-                            _ => var_comment.clear(),
-                        };
-                        self.input_cursor = 0;
-                        error = None;
+                        let editable = active_field == 0
+                            || (!is_phase_source && (active_field == 2 || active_field == 3));
+                        if editable {
+                            match active_field {
+                                0 => var_key.clear(),
+                                2 => var_value.clear(),
+                                3 => var_comment.clear(),
+                                _ => {}
+                            };
+                            self.input_cursor = 0;
+                            error = None;
+                        }
                     }
                     KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                         if active_field == 0 {
                             insert_char_at(&mut var_key, self.input_cursor, c);
                             self.input_cursor += 1;
-                        } else if active_field == 1 {
+                            error = None;
+                        } else if !is_phase_source && active_field == 2 {
                             insert_char_at(&mut var_value, self.input_cursor, c);
                             self.input_cursor += 1;
-                        } else if active_field == 2 {
+                            error = None;
+                        } else if !is_phase_source && active_field == 3 {
                             if var_comment.chars().count() < 100 {
                                 insert_char_at(&mut var_comment, self.input_cursor, c);
                                 self.input_cursor += 1;
                             }
+                            error = None;
                         }
-                        error = None;
                     }
                     KeyCode::Enter => {
+                        if active_field == 2 && is_phase_source && phase_ref.is_none() {
+                            self.open_phase_var_picker_from_editor(
+                                is_edit,
+                                original_index,
+                                var_key,
+                                var_value,
+                                var_comment,
+                                phase_ref,
+                                active_field,
+                            );
+                            return;
+                        }
                         let k = var_key.trim().to_string();
                         if !is_valid_env_key(&k) {
                             error = Some(
                                 "Invalid variable name. Use letters, digits, '_' (cannot start with digit)."
+                                    .to_string(),
+                            );
+                        } else if is_phase_source && phase_ref.is_none() {
+                            error = Some(
+                                "Please select a Phase.dev variable first (press Space on field 3)."
                                     .to_string(),
                             );
                         } else if let Some(coll) = self.current_collection_mut() {
@@ -1707,17 +1952,35 @@ impl App {
                                         .to_string(),
                                 );
                             } else {
-                                let trimmed_comment: String = var_comment.trim().chars().take(100).collect();
+                                let final_ref = if is_phase_source {
+                                    phase_ref.clone()
+                                } else {
+                                    None
+                                };
+                                let final_comment: String = if is_phase_source {
+                                    var_comment.chars().take(100).collect()
+                                } else {
+                                    var_comment.trim().chars().take(100).collect()
+                                };
                                 if is_edit {
                                     if let Some(idx) = original_index {
                                         if let Some(v) = coll.vars.get_mut(idx) {
                                             v.key = k.clone();
                                             v.set_value(var_value.clone());
-                                            v.comment = trimmed_comment;
+                                            v.comment = final_comment;
+                                            v.phase_ref = final_ref.clone();
                                         }
                                     }
                                 } else {
-                                    let _ = coll.upsert_custom_var(k.clone(), var_value.clone(), trimmed_comment);
+                                    let _ = coll.upsert_custom_var_with_phase_ref(
+                                        k.clone(),
+                                        var_value.clone(),
+                                        final_comment,
+                                        final_ref.clone(),
+                                    );
+                                }
+                                if final_ref.is_some() {
+                                    coll.last_sync_epoch = Some(AppStateData::current_epoch_secs());
                                 }
                                 self.clamp_selections();
                                 self.sync_to_system_silent();
@@ -1732,9 +1995,343 @@ impl App {
                     is_edit,
                     original_index,
                     var_key,
+                    is_phase_source,
+                    phase_ref,
                     var_value,
                     var_comment,
                     active_field,
+                    error,
+                };
+            }
+
+            Modal::PhaseVarPicker {
+                is_edit,
+                original_index,
+                mut var_key,
+                prev_value,
+                prev_comment,
+                existing_phase_ref,
+                mut apps,
+                mut selected_app,
+                mut selected_env,
+                mut loaded_env,
+                mut env_secrets,
+                mut folders,
+                mut selected_folder,
+                mut selected_secret,
+                mut picker_step,
+                mut error,
+            } => {
+                let env_count = apps
+                    .get(selected_app)
+                    .map(|a| a.environments.len())
+                    .unwrap_or(0);
+
+                match key.code {
+                    KeyCode::Esc => {
+                        if picker_step > 0 {
+                            picker_step -= 1;
+                            error = None;
+                        } else {
+                            self.modal = Modal::VarEditor {
+                                is_edit,
+                                original_index,
+                                var_key,
+                                is_phase_source: true,
+                                phase_ref: existing_phase_ref,
+                                var_value: prev_value,
+                                var_comment: prev_comment,
+                                active_field: 2,
+                                error: None,
+                            };
+                            return;
+                        }
+                    }
+                    KeyCode::BackTab => {
+                        if picker_step > 0 {
+                            picker_step -= 1;
+                            error = None;
+                        }
+                    }
+                    KeyCode::Left => {
+                        if picker_step > 0 {
+                            picker_step -= 1;
+                            error = None;
+                        }
+                    }
+                    KeyCode::Right | KeyCode::Tab => {
+                        let next_step = if key.code == KeyCode::Tab {
+                            (picker_step + 1) % 4
+                        } else {
+                            (picker_step + 1).min(3)
+                        };
+                        if picker_step == 0 && env_count == 0 {
+                            error = Some("Selected App has no environments.".to_string());
+                        } else if next_step == 1 {
+                            picker_step = 1;
+                            ensure_phase_var_picker_env_loaded(
+                                &self.data.phase,
+                                &mut apps,
+                                selected_app,
+                                selected_env,
+                                existing_phase_ref.as_ref(),
+                                &mut loaded_env,
+                                &mut env_secrets,
+                                &mut folders,
+                                &mut selected_folder,
+                                &mut selected_secret,
+                                &mut error,
+                            );
+                        } else if next_step >= 2 {
+                            if ensure_phase_var_picker_env_loaded(
+                                &self.data.phase,
+                                &mut apps,
+                                selected_app,
+                                selected_env,
+                                existing_phase_ref.as_ref(),
+                                &mut loaded_env,
+                                &mut env_secrets,
+                                &mut folders,
+                                &mut selected_folder,
+                                &mut selected_secret,
+                                &mut error,
+                            ) {
+                                picker_step = next_step;
+                            }
+                        } else {
+                            picker_step = next_step;
+                            error = None;
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        error = None;
+                        match picker_step {
+                            0 => {
+                                if selected_app > 0 {
+                                    selected_app -= 1;
+                                    selected_env = 0;
+                                    loaded_env = None;
+                                    env_secrets.clear();
+                                    folders.clear();
+                                    selected_folder = 0;
+                                    selected_secret = 0;
+                                }
+                            }
+                            1 => {
+                                if selected_env > 0 {
+                                    selected_env -= 1;
+                                    loaded_env = None;
+                                    env_secrets.clear();
+                                    folders.clear();
+                                    selected_folder = 0;
+                                    selected_secret = 0;
+                                    ensure_phase_var_picker_env_loaded(
+                                        &self.data.phase,
+                                        &mut apps,
+                                        selected_app,
+                                        selected_env,
+                                        existing_phase_ref.as_ref(),
+                                        &mut loaded_env,
+                                        &mut env_secrets,
+                                        &mut folders,
+                                        &mut selected_folder,
+                                        &mut selected_secret,
+                                        &mut error,
+                                    );
+                                }
+                            }
+                            2 => {
+                                if selected_folder > 0 {
+                                    selected_folder -= 1;
+                                    selected_secret = 0;
+                                }
+                            }
+                            3 => {
+                                if selected_secret > 0 {
+                                    selected_secret -= 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        error = None;
+                        match picker_step {
+                            0 => {
+                                if selected_app + 1 < apps.len() {
+                                    selected_app += 1;
+                                    selected_env = 0;
+                                    loaded_env = None;
+                                    env_secrets.clear();
+                                    folders.clear();
+                                    selected_folder = 0;
+                                    selected_secret = 0;
+                                }
+                            }
+                            1 => {
+                                if selected_env + 1 < env_count {
+                                    selected_env += 1;
+                                    loaded_env = None;
+                                    env_secrets.clear();
+                                    folders.clear();
+                                    selected_folder = 0;
+                                    selected_secret = 0;
+                                    ensure_phase_var_picker_env_loaded(
+                                        &self.data.phase,
+                                        &mut apps,
+                                        selected_app,
+                                        selected_env,
+                                        existing_phase_ref.as_ref(),
+                                        &mut loaded_env,
+                                        &mut env_secrets,
+                                        &mut folders,
+                                        &mut selected_folder,
+                                        &mut selected_secret,
+                                        &mut error,
+                                    );
+                                }
+                            }
+                            2 => {
+                                if selected_folder + 1 < folders.len() {
+                                    selected_folder += 1;
+                                    selected_secret = 0;
+                                }
+                            }
+                            3 => {
+                                let sec_len = phase_var_picker_folder_secrets(
+                                    &env_secrets,
+                                    &folders,
+                                    selected_folder,
+                                )
+                                .len();
+                                if selected_secret + 1 < sec_len {
+                                    selected_secret += 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    KeyCode::Enter => match picker_step {
+                        0 => {
+                            if env_count == 0 {
+                                error = Some("Selected App has no environments.".to_string());
+                            } else {
+                                picker_step = 1;
+                                ensure_phase_var_picker_env_loaded(
+                                    &self.data.phase,
+                                    &mut apps,
+                                    selected_app,
+                                    selected_env,
+                                    existing_phase_ref.as_ref(),
+                                    &mut loaded_env,
+                                    &mut env_secrets,
+                                    &mut folders,
+                                    &mut selected_folder,
+                                    &mut selected_secret,
+                                    &mut error,
+                                );
+                            }
+                        }
+                        1 => {
+                            if ensure_phase_var_picker_env_loaded(
+                                &self.data.phase,
+                                &mut apps,
+                                selected_app,
+                                selected_env,
+                                existing_phase_ref.as_ref(),
+                                &mut loaded_env,
+                                &mut env_secrets,
+                                &mut folders,
+                                &mut selected_folder,
+                                &mut selected_secret,
+                                &mut error,
+                            ) {
+                                if folders.is_empty() {
+                                    error = Some("No variables found in this environment.".to_string());
+                                } else {
+                                    picker_step = 2;
+                                    error = None;
+                                }
+                            }
+                        }
+                        2 => {
+                            let folder_secrets = phase_var_picker_folder_secrets(
+                                &env_secrets,
+                                &folders,
+                                selected_folder,
+                            );
+                            if folder_secrets.is_empty() {
+                                error = Some("No variables found in this folder.".to_string());
+                            } else {
+                                if selected_secret >= folder_secrets.len() {
+                                    selected_secret = 0;
+                                }
+                                picker_step = 3;
+                                error = None;
+                            }
+                        }
+                        3 => {
+                            let folder_secrets = phase_var_picker_folder_secrets(
+                                &env_secrets,
+                                &folders,
+                                selected_folder,
+                            );
+                            if let (Some(app), Some(env), Some(folder), Some(secret)) = (
+                                apps.get(selected_app),
+                                apps.get(selected_app)
+                                    .and_then(|a| a.environments.get(selected_env)),
+                                folders.get(selected_folder),
+                                folder_secrets.get(selected_secret),
+                            ) {
+                                if var_key.trim().is_empty() {
+                                    var_key = secret.key.clone();
+                                }
+                                let pref = PhaseVarRef {
+                                    app_id: app.id.clone(),
+                                    app_name: app.name.clone(),
+                                    env_id: env.id.clone(),
+                                    env_name: env.name.clone(),
+                                    path: folder.clone(),
+                                    secret_key: secret.key.clone(),
+                                };
+                                self.input_cursor = 0;
+                                self.modal = Modal::VarEditor {
+                                    is_edit,
+                                    original_index,
+                                    var_key,
+                                    is_phase_source: true,
+                                    phase_ref: Some(pref),
+                                    var_value: secret.value.clone(),
+                                    var_comment: secret.comment.chars().take(100).collect(),
+                                    active_field: 2,
+                                    error: None,
+                                };
+                                return;
+                            } else {
+                                error = Some("Please select a variable.".to_string());
+                            }
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+
+                self.modal = Modal::PhaseVarPicker {
+                    is_edit,
+                    original_index,
+                    var_key,
+                    prev_value,
+                    prev_comment,
+                    existing_phase_ref,
+                    apps,
+                    selected_app,
+                    selected_env,
+                    loaded_env,
+                    env_secrets,
+                    folders,
+                    selected_folder,
+                    selected_secret,
+                    picker_step,
                     error,
                 };
             }
@@ -2444,7 +3041,30 @@ impl App {
             .iter()
             .map(|v| {
                 let val_display = v.masked_display(self.show_values);
-                Row::new(vec![v.key.clone(), val_display, v.comment.clone()])
+                let (badge_text, badge_style) = if v.is_phase_synced() {
+                    (
+                        "[Phase] ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    (
+                        "[Manual] ",
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                };
+                let value_cell = Line::from(vec![
+                    Span::styled(badge_text, badge_style),
+                    Span::raw(val_display),
+                ]);
+                Row::new(vec![
+                    Cell::from(v.key.clone()),
+                    Cell::from(value_cell),
+                    Cell::from(v.comment.clone()),
+                ])
             })
             .collect();
 
@@ -2457,7 +3077,7 @@ impl App {
         let title = if let Some(coll) = self.current_collection() {
             let count = vars.len();
             let var_word = if count == 1 { "variable" } else { "variables" };
-            if coll.is_phase() {
+            if coll.is_phase() || coll.has_phase_vars() {
                 let now = AppStateData::current_epoch_secs();
                 let sync_epoch = coll
                     .last_sync_epoch
@@ -3052,6 +3672,8 @@ impl App {
             Modal::VarEditor {
                 is_edit,
                 var_key,
+                is_phase_source,
+                phase_ref,
                 var_value,
                 var_comment,
                 active_field,
@@ -3081,6 +3703,8 @@ impl App {
                     .constraints([Constraint::Min(1), Constraint::Length(1)])
                     .split(inner);
 
+                let box_width = (inner.width as usize).saturating_sub(8).max(20);
+
                 let mut lines = vec![
                     Line::from(Span::styled(
                         format!("Target: {}", self.current_target_title()),
@@ -3094,27 +3718,110 @@ impl App {
                     var_key,
                     "e.g. API_KEY, DATABASE_URL",
                     *active_field == 0,
-                    36,
+                    box_width,
                     self.input_cursor,
                 ));
                 lines.push(Line::from(""));
-                lines.extend(modern_input_lines(
-                    "2. Variable Value (VALUE):",
-                    var_value,
-                    "enter secret or value...",
-                    *active_field == 1,
-                    36,
-                    self.input_cursor,
-                ));
+
+                let (src_label_style, src_prefix, src_pfx_style) = if *active_field == 1 {
+                    (
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        "▸ ",
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    (
+                        Style::default().fg(Color::Yellow),
+                        "  ",
+                        Style::default().fg(Color::DarkGray),
+                    )
+                };
+                let active_pill = Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD);
+                let inactive_pill = Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Rgb(35, 45, 60));
+
+                lines.push(Line::from(vec![
+                    Span::styled(src_prefix, src_pfx_style),
+                    Span::styled("2. Value Source:", src_label_style),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(
+                        if !*is_phase_source {
+                            "[● Manual Input]"
+                        } else {
+                            "[○ Manual Input]"
+                        },
+                        if !*is_phase_source {
+                            active_pill
+                        } else {
+                            inactive_pill
+                        },
+                    ),
+                    Span::raw("   "),
+                    Span::styled(
+                        if *is_phase_source {
+                            "[● Phase.dev Sync]"
+                        } else {
+                            "[○ Phase.dev Sync]"
+                        },
+                        if *is_phase_source {
+                            active_pill
+                        } else {
+                            inactive_pill
+                        },
+                    ),
+                ]));
                 lines.push(Line::from(""));
-                lines.extend(modern_input_lines(
-                    "3. Comment (optional, max 100 chars):",
-                    var_comment,
-                    "enter comment...",
-                    *active_field == 2,
-                    36,
-                    self.input_cursor,
-                ));
+
+                if *is_phase_source {
+                    let ref_display = phase_ref
+                        .as_ref()
+                        .map(|r| r.reference_syntax())
+                        .unwrap_or_default();
+                    lines.extend(modern_input_lines(
+                        "3. Phase.dev Variable Reference ([Space / Enter] Pick):",
+                        &ref_display,
+                        "Press [Space] or [Enter] to select App -> Env -> Folder -> Key",
+                        *active_field == 2,
+                        box_width,
+                        ref_display.chars().count(),
+                    ));
+                    lines.push(Line::from(""));
+                    let (ro_comment, ro_ph) = if phase_ref.is_some() {
+                        (var_comment.as_str(), "<no comment in Phase.dev>")
+                    } else {
+                        ("", "<loaded from Phase.dev once variable is selected>")
+                    };
+                    lines.extend(modern_readonly_lines(
+                        "4. Comment (synced from Phase.dev - read-only):",
+                        ro_comment,
+                        ro_ph,
+                        box_width,
+                    ));
+                } else {
+                    lines.extend(modern_input_lines(
+                        "3. Variable Value (VALUE):",
+                        var_value,
+                        "enter secret or value...",
+                        *active_field == 2,
+                        box_width,
+                        self.input_cursor,
+                    ));
+                    lines.push(Line::from(""));
+                    lines.extend(modern_input_lines(
+                        "4. Comment (optional, max 100 chars):",
+                        var_comment,
+                        "enter comment...",
+                        *active_field == 3,
+                        box_width,
+                        self.input_cursor,
+                    ));
+                }
 
                 if let Some(err) = error {
                     lines.push(Line::from(""));
@@ -3127,6 +3834,249 @@ impl App {
                 frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), chunks[0]);
                 if let Some(btns) = get_modal_buttons(&self.modal) {
                     render_modal_buttons(frame, chunks[1], btns);
+                }
+            }
+
+            Modal::PhaseVarPicker {
+                apps,
+                selected_app,
+                selected_env,
+                loaded_env,
+                env_secrets,
+                folders,
+                selected_folder,
+                selected_secret,
+                picker_step,
+                error,
+                ..
+            } => {
+                let popup = get_modal_rect(&self.modal, area);
+                frame.render_widget(Clear, popup);
+
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .padding(Padding::new(1, 1, 1, 0))
+                    .title(" Sync Variable from Phase.dev ");
+                let inner = block.inner(popup);
+                frame.render_widget(block, popup);
+
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(10),
+                        Constraint::Length(4),
+                        Constraint::Length(1),
+                    ])
+                    .split(inner);
+
+                let rows = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+                    .split(chunks[0]);
+                let top_cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(rows[0]);
+                let bot_cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+                    .split(rows[1]);
+
+                let active_border = Style::default().fg(Color::Cyan);
+                let inactive_border = Style::default().fg(Color::DarkGray);
+                let hl_style = Style::default()
+                    .bg(Color::Rgb(35, 55, 85))
+                    .add_modifier(Modifier::BOLD);
+
+                let app_items: Vec<ListItem> =
+                    apps.iter().map(|a| ListItem::new(a.name.clone())).collect();
+                let app_list = List::new(app_items)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(if *picker_step == 0 {
+                                active_border
+                            } else {
+                                inactive_border
+                            })
+                            .title(" 1. Select App "),
+                    )
+                    .highlight_style(hl_style)
+                    .highlight_symbol("▶ ");
+                let mut app_state = ListState::default();
+                if !apps.is_empty() {
+                    app_state.select(Some(*selected_app));
+                }
+                frame.render_stateful_widget(app_list, top_cols[0], &mut app_state);
+
+                let env_items: Vec<ListItem> = apps
+                    .get(*selected_app)
+                    .map(|a| {
+                        a.environments
+                            .iter()
+                            .map(|e| ListItem::new(e.name.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let env_list = List::new(env_items)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(if *picker_step == 1 {
+                                active_border
+                            } else {
+                                inactive_border
+                            })
+                            .title(" 2. Select Environment "),
+                    )
+                    .highlight_style(hl_style)
+                    .highlight_symbol("▶ ");
+                let mut env_state = ListState::default();
+                if apps
+                    .get(*selected_app)
+                    .map(|a| !a.environments.is_empty())
+                    .unwrap_or(false)
+                {
+                    env_state.select(Some(*selected_env));
+                }
+                frame.render_stateful_widget(env_list, top_cols[1], &mut env_state);
+
+                let current_env_pair = apps.get(*selected_app).and_then(|a| {
+                    a.environments
+                        .get(*selected_env)
+                        .map(|e| (a.id.clone(), e.id.clone()))
+                });
+                let is_loaded = current_env_pair.is_some() && *loaded_env == current_env_pair;
+
+                let folder_items: Vec<ListItem> = if !is_loaded {
+                    vec![ListItem::new(Span::styled(
+                        "Select an environment to view folders",
+                        Style::default().fg(Color::DarkGray),
+                    ))]
+                } else {
+                    folders
+                        .iter()
+                        .map(|f| ListItem::new(f.clone()))
+                        .collect()
+                };
+                let folder_list = List::new(folder_items)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(if *picker_step == 2 {
+                                active_border
+                            } else {
+                                inactive_border
+                            })
+                            .title(" 3. Select Folder (Path) "),
+                    )
+                    .highlight_style(hl_style)
+                    .highlight_symbol("▶ ");
+                let mut folder_state = ListState::default();
+                if is_loaded && !folders.is_empty() {
+                    folder_state.select(Some(*selected_folder));
+                }
+                frame.render_stateful_widget(folder_list, bot_cols[0], &mut folder_state);
+
+                let folder_secrets = if is_loaded {
+                    phase_var_picker_folder_secrets(env_secrets, folders, *selected_folder)
+                } else {
+                    Vec::new()
+                };
+                let secret_items: Vec<ListItem> = if !is_loaded {
+                    vec![ListItem::new(Span::styled(
+                        "Select a folder first",
+                        Style::default().fg(Color::DarkGray),
+                    ))]
+                } else {
+                    folder_secrets
+                        .iter()
+                        .map(|s| ListItem::new(s.key.clone()))
+                        .collect()
+                };
+                let secret_list = List::new(secret_items)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(if *picker_step == 3 {
+                                active_border
+                            } else {
+                                inactive_border
+                            })
+                            .title(" 4. Select Variable "),
+                    )
+                    .highlight_style(hl_style)
+                    .highlight_symbol("▶ ");
+                let mut secret_state = ListState::default();
+                if is_loaded && !folder_secrets.is_empty() {
+                    secret_state.select(Some(*selected_secret));
+                }
+                frame.render_stateful_widget(secret_list, bot_cols[1], &mut secret_state);
+
+                let preview_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(inactive_border)
+                    .title(" Reference Preview ");
+                let preview_lines = if let Some(err) = error {
+                    vec![Line::from(Span::styled(
+                        format!("⚠ Error: {}", err),
+                        Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD),
+                    ))]
+                } else if let (Some(app), Some(env), Some(folder), Some(sec)) = (
+                    apps.get(*selected_app),
+                    apps.get(*selected_app)
+                        .and_then(|a| a.environments.get(*selected_env)),
+                    folders.get(*selected_folder),
+                    folder_secrets.get(*selected_secret),
+                ) {
+                    let pref = PhaseVarRef {
+                        app_id: app.id.clone(),
+                        app_name: app.name.clone(),
+                        env_id: env.id.clone(),
+                        env_name: env.name.clone(),
+                        path: folder.clone(),
+                        secret_key: sec.key.clone(),
+                    };
+                    let comment_txt = if sec.comment.is_empty() {
+                        "<no comment>"
+                    } else {
+                        sec.comment.as_str()
+                    };
+                    vec![
+                        Line::from(vec![
+                            Span::styled(" Ref     : ", Style::default().fg(Color::DarkGray)),
+                            Span::styled(
+                                pref.reference_syntax(),
+                                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                            ),
+                        ]),
+                        Line::from(vec![
+                            Span::styled(" Comment : ", Style::default().fg(Color::DarkGray)),
+                            Span::styled(comment_txt.to_string(), Style::default().fg(Color::Gray)),
+                        ]),
+                    ]
+                } else {
+                    vec![
+                        Line::from(Span::styled(
+                            " Select App -> Environment -> Folder -> Variable",
+                            Style::default().fg(Color::DarkGray),
+                        )),
+                    ]
+                };
+                frame.render_widget(
+                    Paragraph::new(preview_lines).block(preview_block),
+                    chunks[1],
+                );
+
+                if let Some(btns) = get_modal_buttons(&self.modal) {
+                    render_modal_buttons(frame, chunks[2], btns);
                 }
             }
 
@@ -3948,31 +4898,38 @@ impl App {
             }
             Modal::VarEditor {
                 var_key,
+                is_phase_source,
                 var_value,
                 var_comment,
                 active_field,
                 error,
                 ..
             } => {
+                let single_line: String = clean
+                    .chars()
+                    .map(|c| if c == '\r' || c == '\n' { ' ' } else { c })
+                    .collect();
                 if *active_field == 0 {
-                    for c in clean.chars() {
+                    for c in single_line.chars() {
                         insert_char_at(var_key, self.input_cursor, c);
                         self.input_cursor += 1;
                     }
-                } else if *active_field == 1 {
-                    for c in clean.chars() {
+                    *error = None;
+                } else if !*is_phase_source && *active_field == 2 {
+                    for c in single_line.chars() {
                         insert_char_at(var_value, self.input_cursor, c);
                         self.input_cursor += 1;
                     }
-                } else if *active_field == 2 {
-                    for c in clean.chars() {
+                    *error = None;
+                } else if !*is_phase_source && *active_field == 3 {
+                    for c in single_line.chars() {
                         if var_comment.chars().count() < 100 {
                             insert_char_at(var_comment, self.input_cursor, c);
                             self.input_cursor += 1;
                         }
                     }
+                    *error = None;
                 }
-                *error = None;
             }
             Modal::EditCollection { name, error, .. } => {
                 for c in clean.chars() {
@@ -4056,27 +5013,86 @@ impl App {
                     *pull_from_phase = true;
                 }
             }
-            Modal::VarEditor { active_field, var_key, var_value, var_comment, .. } => {
+            Modal::VarEditor {
+                active_field,
+                var_key,
+                is_phase_source,
+                var_value,
+                var_comment,
+                ..
+            } => {
+                let mut open_picker = false;
                 if row >= block_inner.y + 2 && row <= block_inner.y + 3 {
                     *active_field = 0;
                     if col >= block_inner.x + 6 {
-                        self.input_cursor = ((col - (block_inner.x + 6)) as usize).min(var_key.chars().count());
+                        self.input_cursor =
+                            ((col - (block_inner.x + 6)) as usize).min(var_key.chars().count());
                     } else {
                         self.input_cursor = var_key.chars().count();
                     }
                 } else if row >= block_inner.y + 5 && row <= block_inner.y + 6 {
                     *active_field = 1;
-                    if col >= block_inner.x + 6 {
-                        self.input_cursor = ((col - (block_inner.x + 6)) as usize).min(var_value.chars().count());
-                    } else {
-                        self.input_cursor = var_value.chars().count();
+                    self.input_cursor = 0;
+                    if row == block_inner.y + 6 {
+                        let manual_start = block_inner.x + 4;
+                        let manual_end = manual_start + 16;
+                        let phase_start = manual_end + 3;
+                        let phase_end = phase_start + 18;
+                        if col >= phase_start && col < phase_end {
+                            *is_phase_source = true;
+                        } else if col >= manual_start && col < manual_end {
+                            *is_phase_source = false;
+                        } else {
+                            *is_phase_source = !*is_phase_source;
+                        }
                     }
                 } else if row >= block_inner.y + 8 && row <= block_inner.y + 9 {
                     *active_field = 2;
+                    if *is_phase_source {
+                        self.input_cursor = 0;
+                        if row == block_inner.y + 9 && col >= block_inner.x + 4 {
+                            open_picker = true;
+                        }
+                    } else if col >= block_inner.x + 6 {
+                        self.input_cursor =
+                            ((col - (block_inner.x + 6)) as usize).min(var_value.chars().count());
+                    } else {
+                        self.input_cursor = var_value.chars().count();
+                    }
+                } else if !*is_phase_source
+                    && row >= block_inner.y + 11
+                    && row <= block_inner.y + 12
+                {
+                    *active_field = 3;
                     if col >= block_inner.x + 6 {
-                        self.input_cursor = ((col - (block_inner.x + 6)) as usize).min(var_comment.chars().count());
+                        self.input_cursor =
+                            ((col - (block_inner.x + 6)) as usize).min(var_comment.chars().count());
                     } else {
                         self.input_cursor = var_comment.chars().count();
+                    }
+                }
+
+                if open_picker {
+                    if let Modal::VarEditor {
+                        is_edit,
+                        original_index,
+                        var_key,
+                        phase_ref,
+                        var_value,
+                        var_comment,
+                        active_field,
+                        ..
+                    } = std::mem::replace(&mut self.modal, Modal::None)
+                    {
+                        self.open_phase_var_picker_from_editor(
+                            is_edit,
+                            original_index,
+                            var_key,
+                            var_value,
+                            var_comment,
+                            phase_ref,
+                            active_field,
+                        );
                     }
                 }
             }
@@ -4248,6 +5264,144 @@ impl App {
                     }
                 }
             }
+            Modal::PhaseVarPicker {
+                existing_phase_ref,
+                apps,
+                selected_app,
+                selected_env,
+                loaded_env,
+                env_secrets,
+                folders,
+                selected_folder,
+                selected_secret,
+                picker_step,
+                error,
+                ..
+            } => {
+                let picker_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(10),
+                        Constraint::Length(4),
+                        Constraint::Length(1),
+                    ])
+                    .split(block_inner);
+                let grid_rows = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+                    .split(picker_chunks[0]);
+                let top_cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(grid_rows[0]);
+                let bot_cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+                    .split(grid_rows[1]);
+
+                if rect_contains(top_cols[0], col, row) {
+                    *picker_step = 0;
+                    *error = None;
+                    if let Some(idx) =
+                        list_index_at_row(top_cols[0], row, *selected_app, apps.len())
+                    {
+                        if *selected_app != idx {
+                            *selected_app = idx;
+                            *selected_env = 0;
+                            *loaded_env = None;
+                            env_secrets.clear();
+                            folders.clear();
+                            *selected_folder = 0;
+                            *selected_secret = 0;
+                        }
+                    }
+                } else if rect_contains(top_cols[1], col, row) {
+                    *picker_step = 1;
+                    *error = None;
+                    let env_len = apps
+                        .get(*selected_app)
+                        .map(|a| a.environments.len())
+                        .unwrap_or(0);
+                    if let Some(idx) = list_index_at_row(top_cols[1], row, *selected_env, env_len) {
+                        if *selected_env != idx {
+                            *selected_env = idx;
+                            *loaded_env = None;
+                            env_secrets.clear();
+                            folders.clear();
+                            *selected_folder = 0;
+                            *selected_secret = 0;
+                        }
+                    }
+                    ensure_phase_var_picker_env_loaded(
+                        &self.data.phase,
+                        apps,
+                        *selected_app,
+                        *selected_env,
+                        existing_phase_ref.as_ref(),
+                        loaded_env,
+                        env_secrets,
+                        folders,
+                        selected_folder,
+                        selected_secret,
+                        error,
+                    );
+                } else if rect_contains(bot_cols[0], col, row) {
+                    if !ensure_phase_var_picker_env_loaded(
+                        &self.data.phase,
+                        apps,
+                        *selected_app,
+                        *selected_env,
+                        existing_phase_ref.as_ref(),
+                        loaded_env,
+                        env_secrets,
+                        folders,
+                        selected_folder,
+                        selected_secret,
+                        error,
+                    ) {
+                        return;
+                    }
+                    *picker_step = 2;
+                    *error = None;
+                    if let Some(idx) =
+                        list_index_at_row(bot_cols[0], row, *selected_folder, folders.len())
+                    {
+                        if *selected_folder != idx {
+                            *selected_folder = idx;
+                            *selected_secret = 0;
+                        }
+                    }
+                } else if rect_contains(bot_cols[1], col, row) {
+                    if !ensure_phase_var_picker_env_loaded(
+                        &self.data.phase,
+                        apps,
+                        *selected_app,
+                        *selected_env,
+                        existing_phase_ref.as_ref(),
+                        loaded_env,
+                        env_secrets,
+                        folders,
+                        selected_folder,
+                        selected_secret,
+                        error,
+                    ) {
+                        return;
+                    }
+                    *picker_step = 3;
+                    *error = None;
+                    let sec_len = phase_var_picker_folder_secrets(
+                        env_secrets,
+                        folders,
+                        *selected_folder,
+                    )
+                    .len();
+                    if let Some(idx) =
+                        list_index_at_row(bot_cols[1], row, *selected_secret, sec_len)
+                    {
+                        *selected_secret = idx;
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -4269,7 +5423,8 @@ pub fn get_modal_rect(modal: &Modal, area: Rect) -> Rect {
         }
         Modal::EditCollection { .. } => compact_modal_rect(58, 12, area),
         Modal::NewCollection { .. } => compact_modal_rect(64, 14, area),
-        Modal::VarEditor { .. } => compact_modal_rect(64, 18, area),
+        Modal::VarEditor { .. } => compact_modal_rect(80, 21, area),
+        Modal::PhaseVarPicker { .. } => compact_modal_rect(84, 22, area),
         Modal::Settings { .. } => compact_modal_rect(82, 23, area),
         Modal::PhasePicker { .. } => compact_modal_rect(76, 20, area),
         Modal::Help => compact_modal_rect(76, 20, area),
@@ -4296,6 +5451,25 @@ pub fn get_modal_buttons(modal: &Modal) -> Option<ModalButtons> {
             cancel: " [Cancel] ",
             is_danger: false,
         }),
+        Modal::PhaseVarPicker { picker_step, .. } => {
+            if *picker_step < 3 {
+                Some(ModalButtons {
+                    primary: " [Next ▶] ",
+                    cancel: if *picker_step == 0 {
+                        " [Cancel] "
+                    } else {
+                        " [Back] "
+                    },
+                    is_danger: false,
+                })
+            } else {
+                Some(ModalButtons {
+                    primary: " [Select Variable] ",
+                    cancel: " [Back] ",
+                    is_danger: false,
+                })
+            }
+        }
         Modal::EditCollection { .. } => Some(ModalButtons {
             primary: " [Save] ",
             cancel: " [Cancel] ",
@@ -4473,6 +5647,166 @@ fn remove_char_at(s: &mut String, idx: usize) -> bool {
     }
 }
 
+fn phase_var_picker_folder_secrets<'a>(
+    env_secrets: &'a [PhaseSecretItem],
+    folders: &[String],
+    selected_folder: usize,
+) -> Vec<&'a PhaseSecretItem> {
+    let Some(folder) = folders.get(selected_folder) else {
+        return Vec::new();
+    };
+    env_secrets
+        .iter()
+        .filter(|s| normalize_secret_path(&s.path) == *folder)
+        .collect()
+}
+
+fn load_phase_var_picker_env_with_cfg(
+    config: &PhaseConfig,
+    apps: &mut [PhaseAppInfo],
+    selected_app: usize,
+    selected_env: usize,
+    existing_ref: Option<&PhaseVarRef>,
+) -> Result<((String, String), Vec<PhaseSecretItem>, Vec<String>, usize, usize), String> {
+    let app = apps
+        .get_mut(selected_app)
+        .ok_or_else(|| "Selected App does not exist.".to_string())?;
+    let app_id = app.id.clone();
+    let app_name = app.name.clone();
+    let env = app
+        .environments
+        .get_mut(selected_env)
+        .ok_or_else(|| "Selected App has no environments.".to_string())?;
+
+    let secrets = if !env.cached_secrets.is_empty() {
+        env.cached_secrets.clone()
+    } else {
+        let fetched =
+            fetch_detailed_secrets_for_env(config, &app_id, &env.id, Some(&env.name), true)?;
+        env.cached_secrets = fetched.clone();
+        fetched
+    };
+
+    let mut folder_set = std::collections::BTreeSet::new();
+    for s in &secrets {
+        folder_set.insert(normalize_secret_path(&s.path));
+    }
+    let folders: Vec<String> = folder_set.into_iter().collect();
+    if folders.is_empty() {
+        return Err("No variables found in this environment.".to_string());
+    }
+
+    let mut selected_folder = 0;
+    let mut selected_secret = 0;
+    if let Some(pref) = existing_ref {
+        if (pref.app_id == app_id || pref.app_name == app_name)
+            && (pref.env_id == env.id || pref.env_name == env.name)
+        {
+            let target_path = pref.normalized_path();
+            if let Some(f_idx) = folders.iter().position(|f| f == &target_path) {
+                selected_folder = f_idx;
+                let folder_secrets =
+                    phase_var_picker_folder_secrets(&secrets, &folders, selected_folder);
+                if let Some(s_idx) = folder_secrets.iter().position(|s| s.key == pref.secret_key) {
+                    selected_secret = s_idx;
+                }
+            }
+        }
+    }
+
+    Ok((
+        (app_id, env.id.clone()),
+        secrets,
+        folders,
+        selected_folder,
+        selected_secret,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ensure_phase_var_picker_env_loaded(
+    phase_cfg: &PhaseConfig,
+    apps: &mut [PhaseAppInfo],
+    selected_app: usize,
+    selected_env: usize,
+    existing_ref: Option<&PhaseVarRef>,
+    loaded_env: &mut Option<(String, String)>,
+    env_secrets: &mut Vec<PhaseSecretItem>,
+    folders: &mut Vec<String>,
+    selected_folder: &mut usize,
+    selected_secret: &mut usize,
+    error: &mut Option<String>,
+) -> bool {
+    let current_env_pair = apps.get(selected_app).and_then(|a| {
+        a.environments
+            .get(selected_env)
+            .map(|e| (a.id.clone(), e.id.clone()))
+    });
+    if current_env_pair.is_some() && *loaded_env == current_env_pair {
+        return true;
+    }
+
+    match load_phase_var_picker_env_with_cfg(
+        phase_cfg,
+        apps,
+        selected_app,
+        selected_env,
+        existing_ref,
+    ) {
+        Ok((pair, secrets, flds, sel_f, sel_s)) => {
+            *loaded_env = Some(pair);
+            *env_secrets = secrets;
+            *folders = flds;
+            *selected_folder = sel_f;
+            *selected_secret = sel_s;
+            *error = None;
+            true
+        }
+        Err(e) => {
+            *loaded_env = None;
+            env_secrets.clear();
+            folders.clear();
+            *selected_folder = 0;
+            *selected_secret = 0;
+            *error = Some(e);
+            false
+        }
+    }
+}
+
+fn list_index_at_row(rect: Rect, row: u16, selected: usize, len: usize) -> Option<usize> {
+    let start_y = rect.y.saturating_add(1);
+    let end_y = rect.y.saturating_add(rect.height.saturating_sub(1));
+    if row < start_y || row >= end_y || len == 0 {
+        return None;
+    }
+    let visible_rows = (end_y - start_y) as usize;
+    let offset = if visible_rows > 0 && selected >= visible_rows {
+        selected + 1 - visible_rows
+    } else {
+        0
+    };
+    let idx = offset + (row - start_y) as usize;
+    (idx < len).then_some(idx)
+}
+
+fn compute_input_window(chars_len: usize, cursor: usize, box_width: usize) -> (usize, usize) {
+    if box_width == 0 || chars_len == 0 {
+        return (0, 0);
+    }
+    if cursor >= chars_len {
+        let max_text = box_width.saturating_sub(1);
+        let start = chars_len.saturating_sub(max_text);
+        (start, chars_len)
+    } else if chars_len <= box_width {
+        (0, chars_len)
+    } else {
+        let end = (cursor + 1).max(box_width).min(chars_len);
+        let start = end.saturating_sub(box_width);
+        (start, end)
+    }
+}
+
 fn modern_input_lines(
     label: &str,
     value: &str,
@@ -4508,23 +5842,21 @@ fn modern_input_lines(
     let cursor = cursor_pos.min(chars.len());
 
     if chars.is_empty() {
+        let ph_chars: Vec<char> = placeholder.chars().collect();
         if is_active {
             content_spans.push(Span::styled(
                 "█",
                 Style::default().fg(Color::Cyan).bg(bg).add_modifier(Modifier::BOLD),
             ));
             let pad_len = box_width.saturating_sub(1);
-            if !placeholder.is_empty() && pad_len > 1 {
-                let shown_ph = if placeholder.len() > pad_len - 1 {
-                    &placeholder[..pad_len - 1]
-                } else {
-                    placeholder
-                };
+            if !ph_chars.is_empty() && pad_len > 1 {
+                let take_len = ph_chars.len().min(pad_len - 1);
+                let shown_ph: String = ph_chars[..take_len].iter().collect();
                 content_spans.push(Span::styled(
-                    shown_ph.to_string(),
+                    shown_ph,
                     Style::default().fg(Color::DarkGray).bg(bg),
                 ));
-                let rem = pad_len.saturating_sub(shown_ph.len());
+                let rem = pad_len.saturating_sub(take_len);
                 if rem > 0 {
                     content_spans.push(Span::styled(" ".repeat(rem), Style::default().bg(bg)));
                 }
@@ -4532,23 +5864,21 @@ fn modern_input_lines(
                 content_spans.push(Span::styled(" ".repeat(pad_len), Style::default().bg(bg)));
             }
         } else {
-            let shown_ph = if placeholder.len() > box_width {
-                &placeholder[..box_width]
-            } else {
-                placeholder
-            };
+            let take_len = ph_chars.len().min(box_width);
+            let shown_ph: String = ph_chars[..take_len].iter().collect();
             content_spans.push(Span::styled(
-                shown_ph.to_string(),
+                shown_ph,
                 Style::default().fg(Color::DarkGray).bg(bg),
             ));
-            let rem = box_width.saturating_sub(shown_ph.len());
+            let rem = box_width.saturating_sub(take_len);
             if rem > 0 {
                 content_spans.push(Span::styled(" ".repeat(rem), Style::default().bg(bg)));
             }
         }
     } else if is_active {
+        let (start, end) = compute_input_window(chars.len(), cursor, box_width);
         if cursor < chars.len() {
-            let before: String = chars[..cursor].iter().collect();
+            let before: String = chars[start..cursor].iter().collect();
             if !before.is_empty() {
                 content_spans.push(Span::styled(
                     before,
@@ -4560,37 +5890,52 @@ fn modern_input_lines(
                 cursor_char.to_string(),
                 Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
             ));
-            let after: String = chars[cursor + 1..].iter().collect();
+            let after: String = chars[cursor + 1..end].iter().collect();
             if !after.is_empty() {
                 content_spans.push(Span::styled(
                     after,
                     Style::default().fg(Color::White).bg(bg).add_modifier(Modifier::BOLD),
                 ));
             }
-            let rem = box_width.saturating_sub(chars.len());
+            let shown_len = end.saturating_sub(start);
+            let rem = box_width.saturating_sub(shown_len);
             if rem > 0 {
                 content_spans.push(Span::styled(" ".repeat(rem), Style::default().bg(bg)));
             }
         } else {
-            content_spans.push(Span::styled(
-                value.to_string(),
-                Style::default().fg(Color::White).bg(bg).add_modifier(Modifier::BOLD),
-            ));
+            let visible: String = chars[start..end].iter().collect();
+            let shown_len = end.saturating_sub(start);
+            if !visible.is_empty() {
+                content_spans.push(Span::styled(
+                    visible,
+                    Style::default().fg(Color::White).bg(bg).add_modifier(Modifier::BOLD),
+                ));
+            }
             content_spans.push(Span::styled(
                 "█",
                 Style::default().fg(Color::Cyan).bg(bg).add_modifier(Modifier::BOLD),
             ));
-            let rem = box_width.saturating_sub(chars.len() + 1);
+            let rem = box_width.saturating_sub(shown_len + 1);
             if rem > 0 {
                 content_spans.push(Span::styled(" ".repeat(rem), Style::default().bg(bg)));
             }
         }
     } else {
+        let (shown_text, shown_len) = if chars.len() <= box_width {
+            (value.to_string(), chars.len())
+        } else if box_width > 1 {
+            let mut s: String = chars[..box_width - 1].iter().collect();
+            s.push('…');
+            (s, box_width)
+        } else {
+            let s: String = chars[..box_width].iter().collect();
+            (s, box_width)
+        };
         content_spans.push(Span::styled(
-            value.to_string(),
+            shown_text,
             Style::default().fg(Color::White).bg(bg),
         ));
-        let rem = box_width.saturating_sub(chars.len());
+        let rem = box_width.saturating_sub(shown_len);
         if rem > 0 {
             content_spans.push(Span::styled(" ".repeat(rem), Style::default().bg(bg)));
         }
@@ -4606,6 +5951,66 @@ fn modern_input_lines(
     vec![
         Line::from(vec![
             Span::styled(prefix, prefix_style),
+            Span::styled(label.to_string(), label_style),
+        ]),
+        Line::from(line2_spans),
+    ]
+}
+
+fn modern_readonly_lines(
+    label: &str,
+    value: &str,
+    placeholder: &str,
+    box_width: usize,
+) -> Vec<Line<'static>> {
+    let bg = Color::Rgb(16, 20, 26);
+    let bracket_style = Style::default().fg(Color::DarkGray);
+    let label_style = Style::default().fg(Color::DarkGray);
+
+    let chars: Vec<char> = value.chars().collect();
+    let content_span = if chars.is_empty() {
+        let ph_chars: Vec<char> = placeholder.chars().collect();
+        let take_len = ph_chars.len().min(box_width);
+        let shown: String = ph_chars[..take_len].iter().collect();
+        let rem = box_width.saturating_sub(take_len);
+        (
+            Span::styled(shown, Style::default().fg(Color::DarkGray).bg(bg)),
+            rem,
+        )
+    } else {
+        let (shown, take_len) = if chars.len() <= box_width {
+            (value.to_string(), chars.len())
+        } else if box_width > 1 {
+            let mut s: String = chars[..box_width - 1].iter().collect();
+            s.push('…');
+            (s, box_width)
+        } else {
+            let s: String = chars[..box_width].iter().collect();
+            (s, box_width)
+        };
+        let rem = box_width.saturating_sub(take_len);
+        (
+            Span::styled(shown, Style::default().fg(Color::Gray).bg(bg)),
+            rem,
+        )
+    };
+
+    let mut line2_spans = vec![
+        Span::raw("    "),
+        Span::styled("[ ", bracket_style),
+        content_span.0,
+    ];
+    if content_span.1 > 0 {
+        line2_spans.push(Span::styled(
+            " ".repeat(content_span.1),
+            Style::default().bg(bg),
+        ));
+    }
+    line2_spans.push(Span::styled(" ]", bracket_style));
+
+    vec![
+        Line::from(vec![
+            Span::styled("  ", Style::default().fg(Color::DarkGray)),
             Span::styled(label.to_string(), label_style),
         ]),
         Line::from(line2_spans),
@@ -5613,6 +7018,8 @@ mod tests {
             is_edit: false,
             original_index: None,
             var_key: "NEW_KEY".to_string(),
+            is_phase_source: false,
+            phase_ref: None,
             var_value: "new_value".to_string(),
             var_comment: String::new(),
             active_field: 0,
@@ -6271,6 +7678,7 @@ mod tests {
                     identity_key: String::new(),
                     wrapped_seed: String::new(),
                     wrapped_salt: String::new(),
+                    cached_secrets: Vec::new(),
                 },
             ],
         }];
@@ -6705,6 +8113,7 @@ mod tests {
                         identity_key: String::new(),
                         wrapped_seed: String::new(),
                         wrapped_salt: String::new(),
+                        cached_secrets: Vec::new(),
                     },
                     crate::phase::PhaseEnvInfo {
                         id: "env-1".to_string(),
@@ -6712,6 +8121,7 @@ mod tests {
                         identity_key: String::new(),
                         wrapped_seed: String::new(),
                         wrapped_salt: String::new(),
+                        cached_secrets: Vec::new(),
                     },
                     crate::phase::PhaseEnvInfo {
                         id: "env-2".to_string(),
@@ -6719,6 +8129,7 @@ mod tests {
                         identity_key: String::new(),
                         wrapped_seed: String::new(),
                         wrapped_salt: String::new(),
+                        cached_secrets: Vec::new(),
                     },
                 ],
             },
@@ -6732,6 +8143,7 @@ mod tests {
                         identity_key: String::new(),
                         wrapped_seed: String::new(),
                         wrapped_salt: String::new(),
+                        cached_secrets: Vec::new(),
                     },
                 ],
             },
@@ -6939,6 +8351,8 @@ mod tests {
             is_edit: false,
             original_index: None,
             var_key: "DATABASE_TIMEOUT".to_string(),
+            is_phase_source: false,
+            phase_ref: None,
             var_value: "30s".to_string(),
             var_comment: "Timeout for client database queries".to_string(),
             active_field: 0,
@@ -6959,8 +8373,9 @@ mod tests {
         let var = default_coll.vars.iter().find(|v| v.key == "DATABASE_TIMEOUT").expect("variable exists");
         assert_eq!(var.value, "30s");
         assert_eq!(var.comment, "Timeout for client database queries");
+        assert!(!var.is_phase_synced());
 
-        // 4. Render and verify COMMENT column in upper-right panel (vars_pane)
+        // 4. Render and verify COMMENT column and [Manual] badge in upper-right panel (vars_pane)
         let backend = TestBackend::new(120, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
@@ -6977,6 +8392,7 @@ mod tests {
         assert!(screen_text.contains("KEY"));
         assert!(screen_text.contains("VALUE"));
         assert!(screen_text.contains("COMMENT"));
+        assert!(screen_text.contains("[Manual]"));
         assert!(screen_text.contains("Timeout for client database"));
     }
 
@@ -6989,11 +8405,13 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
         assert!(matches!(app.modal, Modal::VarEditor { active_field: 0, .. }));
 
-        // Tab to field 1 (VALUE), then Tab to field 2 (COMMENT)
+        // Tab to field 1 (VALUE SOURCE), field 2 (VALUE), then field 3 (COMMENT)
         app.handle_key(KeyEvent::from(KeyCode::Tab));
         assert!(matches!(app.modal, Modal::VarEditor { active_field: 1, .. }));
         app.handle_key(KeyEvent::from(KeyCode::Tab));
         assert!(matches!(app.modal, Modal::VarEditor { active_field: 2, .. }));
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert!(matches!(app.modal, Modal::VarEditor { active_field: 3, .. }));
 
         // Typing characters up to 105 characters in COMMENT field
         for _ in 0..105 {
@@ -7006,17 +8424,18 @@ mod tests {
             _ => panic!("Expected VarEditor"),
         }
 
-        // Up arrow navigates back to field 1
+        // Up arrow navigates back through fields 2 -> 1 -> 0 and wraps to 3
+        app.handle_key(KeyEvent::from(KeyCode::Up));
+        assert!(matches!(app.modal, Modal::VarEditor { active_field: 2, .. }));
+
         app.handle_key(KeyEvent::from(KeyCode::Up));
         assert!(matches!(app.modal, Modal::VarEditor { active_field: 1, .. }));
 
-        // Up arrow navigates back to field 0
         app.handle_key(KeyEvent::from(KeyCode::Up));
         assert!(matches!(app.modal, Modal::VarEditor { active_field: 0, .. }));
 
-        // Up arrow wraps to field 2
         app.handle_key(KeyEvent::from(KeyCode::Up));
-        assert!(matches!(app.modal, Modal::VarEditor { active_field: 2, .. }));
+        assert!(matches!(app.modal, Modal::VarEditor { active_field: 3, .. }));
     }
 
     #[test]
@@ -7052,6 +8471,400 @@ mod tests {
             .join("\n");
 
         assert!(screen_text.contains("API_URL"));
+        assert!(screen_text.contains("[Phase]"));
         assert!(screen_text.contains("Main Phase API endpoint"));
+    }
+
+    #[test]
+    fn test_var_editor_wide_single_line_value_no_multiline_wrapping() {
+        let long_val = format!("prefix_{}_tail_marker", "x".repeat(220));
+        let lines = modern_input_lines("VALUE", &long_val, "val", true, 64, long_val.chars().count());
+        assert_eq!(lines.len(), 2, "Input box must stay strictly single-line (header + 1 input row)");
+
+        let mut app = make_test_app();
+        let area = Rect::new(0, 0, 120, 30);
+        app.last_area = area;
+        app.input_cursor = long_val.chars().count();
+        app.modal = Modal::VarEditor {
+            is_edit: true,
+            original_index: Some(0),
+            var_key: "LONG_SECRET".to_string(),
+            is_phase_source: false,
+            phase_ref: None,
+            var_value: long_val.clone(),
+            var_comment: String::new(),
+            active_field: 2,
+            error: None,
+        };
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+
+        let value_header_idx = rows
+            .iter()
+            .position(|r| r.contains("3. Variable Value (VALUE):"))
+            .expect("VALUE header rendered");
+        let input_row = &rows[value_header_idx + 1];
+        let next_row = &rows[value_header_idx + 2];
+
+        // Bracket [ ... ] must span nearly the full width of the 80-col popup and keep value on 1 row
+        let open_pos = input_row.find("[ ").expect("opening bracket");
+        let close_pos = input_row.rfind(" ]").expect("closing bracket on the exact same line");
+        let inner_width = input_row[open_pos..close_pos].chars().count();
+        assert!(inner_width >= 60, "Expected widened input box >= 60 chars, got {}", inner_width);
+        assert!(input_row.contains("_tail_marker"), "Horizontal window should scroll to cursor tail");
+        assert!(!next_row.contains('x'), "Long value must never wrap onto the next line");
+    }
+
+    #[test]
+    fn test_var_editor_phase_source_locks_comment_readonly() {
+        let mut app = make_test_app();
+        let area = Rect::new(0, 0, 120, 30);
+        app.last_area = area;
+
+        let pref = PhaseVarRef {
+            app_id: "app1".to_string(),
+            app_name: "backend_api".to_string(),
+            env_id: "env1".to_string(),
+            env_name: "production".to_string(),
+            path: "/backend/payments".to_string(),
+            secret_key: "STRIPE_KEY".to_string(),
+        };
+        app.modal = Modal::VarEditor {
+            is_edit: false,
+            original_index: None,
+            var_key: "MY_STRIPE".to_string(),
+            is_phase_source: true,
+            phase_ref: Some(pref),
+            var_value: "sk_live_secret".to_string(),
+            var_comment: "Synced Stripe API key".to_string(),
+            active_field: 0,
+            error: None,
+        };
+
+        // Tab must cycle 0 -> 1 -> 2 -> 0 and skip field 3 (COMMENT) when Phase.dev source is active
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert!(matches!(app.modal, Modal::VarEditor { active_field: 1, .. }));
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert!(matches!(app.modal, Modal::VarEditor { active_field: 2, .. }));
+        app.handle_key(KeyEvent::from(KeyCode::Char('Z')));
+        app.handle_key(KeyEvent::from(KeyCode::Backspace));
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert!(matches!(app.modal, Modal::VarEditor { active_field: 0, .. }));
+
+        match &app.modal {
+            Modal::VarEditor { var_value, var_comment, .. } => {
+                assert_eq!(var_value, "sk_live_secret");
+                assert_eq!(var_comment, "Synced Stripe API key");
+            }
+            _ => panic!("Expected VarEditor"),
+        }
+
+        // Render modal and confirm read-only comment + Phase reference syntax are visible
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen_text: String = (0..buffer.area.height)
+            .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen_text.contains("read-only"));
+        assert!(screen_text.contains("Synced Stripe API key"));
+        assert!(screen_text.contains("${backend_api::production./backend/payments/STRIPE_KEY}"));
+
+        // Save variable and confirm Phase ref & comment are persisted on collection variable
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.modal, Modal::None));
+        let saved = app.data.collections[0]
+            .vars
+            .iter()
+            .find(|v| v.key == "MY_STRIPE")
+            .expect("MY_STRIPE saved");
+        assert!(saved.is_phase_synced());
+        assert_eq!(saved.value, "sk_live_secret");
+        assert_eq!(saved.comment, "Synced Stripe API key");
+        assert_eq!(
+            saved.phase_ref.as_ref().unwrap().reference_syntax(),
+            "${backend_api::production./backend/payments/STRIPE_KEY}"
+        );
+
+        // Switching source back to Manual unlocks field 3 for manual comment editing
+        app.modal = Modal::VarEditor {
+            is_edit: false,
+            original_index: None,
+            var_key: "MANUAL_AFTER".to_string(),
+            is_phase_source: true,
+            phase_ref: None,
+            var_value: "v".to_string(),
+            var_comment: String::new(),
+            active_field: 1,
+            error: None,
+        };
+        app.handle_key(KeyEvent::from(KeyCode::Left));
+        assert!(matches!(app.modal, Modal::VarEditor { is_phase_source: false, .. }));
+        app.handle_key(KeyEvent::from(KeyCode::Tab)); // -> 2
+        app.handle_key(KeyEvent::from(KeyCode::Tab)); // -> 3 (Comment)
+        assert!(matches!(app.modal, Modal::VarEditor { active_field: 3, .. }));
+        app.handle_key(KeyEvent::from(KeyCode::Char('O')));
+        app.handle_key(KeyEvent::from(KeyCode::Char('K')));
+        match &app.modal {
+            Modal::VarEditor { var_comment, .. } => assert_eq!(var_comment, "OK"),
+            _ => panic!("Expected VarEditor"),
+        }
+    }
+
+    #[test]
+    fn test_phase_var_picker_four_step_navigation_populates_editor() {
+        let mut app = make_test_app();
+        app.modal = Modal::PhaseVarPicker {
+            is_edit: false,
+            original_index: None,
+            var_key: String::new(),
+            prev_value: String::new(),
+            prev_comment: String::new(),
+            existing_phase_ref: None,
+            apps: vec![PhaseAppInfo {
+                id: "app1".to_string(),
+                name: "backend_api".to_string(),
+                environments: vec![crate::phase::PhaseEnvInfo {
+                    id: "env1".to_string(),
+                    name: "production".to_string(),
+                    identity_key: String::new(),
+                    wrapped_seed: String::new(),
+                    wrapped_salt: String::new(),
+                    cached_secrets: Vec::new(),
+                }],
+            }],
+            selected_app: 0,
+            selected_env: 0,
+            loaded_env: Some(("app1".to_string(), "env1".to_string())),
+            env_secrets: vec![
+                PhaseSecretItem {
+                    key: "ROOT_VAR".to_string(),
+                    value: "root_val".to_string(),
+                    path: "/".to_string(),
+                    comment: "Root comment".to_string(),
+                },
+                PhaseSecretItem {
+                    key: "STRIPE_KEY".to_string(),
+                    value: "sk_live_123".to_string(),
+                    path: "/backend/payments".to_string(),
+                    comment: "Live Stripe key".to_string(),
+                },
+            ],
+            folders: vec!["/".to_string(), "/backend/payments".to_string()],
+            selected_folder: 0,
+            selected_secret: 0,
+            picker_step: 0,
+            error: None,
+        };
+
+        // Render Step 0 and confirm all 4 picker panes and root preview appear
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen_text: String = (0..buffer.area.height)
+            .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen_text.contains("1. Select App"));
+        assert!(screen_text.contains("2. Select Environment"));
+        assert!(screen_text.contains("3. Select Folder (Path)"));
+        assert!(screen_text.contains("4. Select Variable"));
+        assert!(screen_text.contains("${backend_api::production.ROOT_VAR}"));
+
+        // Navigate App -> Env -> Folder (/backend/payments) -> Variable (STRIPE_KEY)
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.modal, Modal::PhaseVarPicker { picker_step: 1, .. }));
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.modal, Modal::PhaseVarPicker { picker_step: 2, .. }));
+        app.handle_key(KeyEvent::from(KeyCode::Down));
+        assert!(matches!(app.modal, Modal::PhaseVarPicker { selected_folder: 1, .. }));
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.modal, Modal::PhaseVarPicker { picker_step: 3, .. }));
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+
+        match &app.modal {
+            Modal::VarEditor {
+                is_phase_source,
+                var_key,
+                var_value,
+                var_comment,
+                phase_ref,
+                ..
+            } => {
+                assert!(*is_phase_source);
+                assert_eq!(var_key, "STRIPE_KEY");
+                assert_eq!(var_value, "sk_live_123");
+                assert_eq!(var_comment, "Live Stripe key");
+                let pref = phase_ref.as_ref().expect("phase_ref populated");
+                assert_eq!(
+                    pref.reference_syntax(),
+                    "${backend_api::production./backend/payments/STRIPE_KEY}"
+                );
+            }
+            _ => panic!("Expected VarEditor populated from PhaseVarPicker"),
+        }
+    }
+
+    #[test]
+    fn test_vars_pane_displays_manual_and_phase_indicators() {
+        let mut app = make_test_app();
+        app.data.collections[0].vars.push(EnvVar::with_phase_ref(
+            "MANUAL_ONLY".to_string(),
+            "manual_val".to_string(),
+            "Entered manually".to_string(),
+            None,
+        ));
+        app.data.collections[0].vars.push(EnvVar::with_phase_ref(
+            "PHASE_REF_VAR".to_string(),
+            "phase_val".to_string(),
+            "From Phase folder".to_string(),
+            Some(PhaseVarRef {
+                app_id: "app1".to_string(),
+                app_name: "backend_api".to_string(),
+                env_id: "env1".to_string(),
+                env_name: "production".to_string(),
+                path: "/payments".to_string(),
+                secret_key: "API_SECRET".to_string(),
+            }),
+        ));
+        app.data.collections[0].last_sync_epoch = Some(1_700_000_000);
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen_text: String = (0..buffer.area.height)
+            .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen_text.contains("MANUAL_ONLY"));
+        assert!(screen_text.contains("[Manual]"));
+        assert!(screen_text.contains("PHASE_REF_VAR"));
+        assert!(screen_text.contains("[Phase]"));
+        assert!(screen_text.contains("Last sync:"));
+    }
+
+    #[test]
+    fn test_phase_var_picker_loads_folders_and_vars_immediately_on_env_select() {
+        let mut app = make_test_app();
+        let area = Rect::new(0, 0, 120, 30);
+        app.last_area = area;
+
+        app.modal = Modal::PhaseVarPicker {
+            is_edit: false,
+            original_index: None,
+            var_key: String::new(),
+            prev_value: String::new(),
+            prev_comment: String::new(),
+            existing_phase_ref: None,
+            apps: vec![PhaseAppInfo {
+                id: "app1".to_string(),
+                name: "di2nsino".to_string(),
+                environments: vec![
+                    crate::phase::PhaseEnvInfo {
+                        id: "env_dev".to_string(),
+                        name: "Development".to_string(),
+                        identity_key: String::new(),
+                        wrapped_seed: String::new(),
+                        wrapped_salt: String::new(),
+                        cached_secrets: vec![PhaseSecretItem {
+                            key: "DEV_API_KEY".to_string(),
+                            value: "dev_val".to_string(),
+                            path: "/".to_string(),
+                            comment: "Dev key".to_string(),
+                        }],
+                    },
+                    crate::phase::PhaseEnvInfo {
+                        id: "env_prod".to_string(),
+                        name: "Production".to_string(),
+                        identity_key: String::new(),
+                        wrapped_seed: String::new(),
+                        wrapped_salt: String::new(),
+                        cached_secrets: vec![PhaseSecretItem {
+                            key: "PROD_PAYMENT_KEY".to_string(),
+                            value: "prod_val".to_string(),
+                            path: "/payments".to_string(),
+                            comment: "Prod payment".to_string(),
+                        }],
+                    },
+                ],
+            }],
+            selected_app: 0,
+            selected_env: 0,
+            loaded_env: None,
+            env_secrets: Vec::new(),
+            folders: Vec::new(),
+            selected_folder: 0,
+            selected_secret: 0,
+            picker_step: 0,
+            error: None,
+        };
+
+        // Compute the inner top-right ("2. Select Environment") panel bounds for mouse click
+        let popup = get_modal_rect(&app.modal, area);
+        let block_inner = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .padding(Padding::new(1, 1, 1, 0))
+            .inner(popup);
+        let picker_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(10),
+                Constraint::Length(4),
+                Constraint::Length(1),
+            ])
+            .split(block_inner);
+        let grid_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .split(picker_chunks[0]);
+        let top_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(grid_rows[0]);
+
+        // Click first environment ("Development") directly without touching bottom panels
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: top_cols[1].x + 2,
+            row: top_cols[1].y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen_dev: String = (0..buffer.area.height)
+            .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(matches!(app.modal, Modal::PhaseVarPicker { picker_step: 1, selected_env: 0, .. }));
+        assert!(screen_dev.contains("DEV_API_KEY"), "Folders & variables must display immediately after selecting Env");
+
+        // Pressing Down in step 1 selects "Production" and immediately refreshes folders & variables below
+        app.handle_key(KeyEvent::from(KeyCode::Down));
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer2 = terminal.backend().buffer();
+        let screen_prod: String = (0..buffer2.area.height)
+            .map(|y| (0..buffer2.area.width).map(|x| buffer2[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(matches!(app.modal, Modal::PhaseVarPicker { picker_step: 1, selected_env: 1, .. }));
+        assert!(screen_prod.contains("/payments"));
+        assert!(screen_prod.contains("PROD_PAYMENT_KEY"));
     }
 }

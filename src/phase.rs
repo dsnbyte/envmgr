@@ -1,4 +1,6 @@
-use crate::model::{AppStateData, HostMode, PhaseAuthMethod, PhaseConfig, PHASE_CLOUD_HOST};
+use crate::model::{
+    normalize_secret_path, AppStateData, HostMode, PhaseAuthMethod, PhaseConfig, PHASE_CLOUD_HOST,
+};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use blake2::{
     digest::{Update, VariableOutput},
@@ -24,6 +26,8 @@ pub struct PhaseEnvInfo {
     pub wrapped_seed: String,
     #[serde(default)]
     pub wrapped_salt: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cached_secrets: Vec<PhaseSecretItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,6 +195,32 @@ pub fn parse_phase_cli_config_json(content: &str, status: &mut PhaseCliStatus) {
     }
 }
 
+/// Returns `true` if a local `phase auth` account exists in `~/.phase/secrets/config.json` or `~/.phase/config.json`.
+pub fn has_local_cli_account() -> bool {
+    let mut status = PhaseCliStatus::default();
+    for cfg_path in phase_config_candidate_paths() {
+        if let Ok(content) = std::fs::read_to_string(&cfg_path) {
+            parse_phase_cli_config_json(&content, &mut status);
+            if status.logged_in {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// CLI credentials configured via `phase auth` take precedence over `PHASE_SERVICE_TOKEN`,
+/// and invalid non-PSS tokens in `PHASE_SERVICE_TOKEN` are always stripped from CLI subprocesses.
+pub fn should_strip_phase_service_token(has_cli_login: bool, env_token: Option<&str>) -> bool {
+    if has_cli_login {
+        return true;
+    }
+    match env_token {
+        Some(tok) if !tok.trim().is_empty() => PssToken::parse(tok).is_err(),
+        _ => false,
+    }
+}
+
 /// Fast, non-blocking detection of the installed Phase CLI and local configuration.
 pub fn detect_phase_cli() -> PhaseCliStatus {
     let mut status = PhaseCliStatus::default();
@@ -210,17 +240,21 @@ pub fn detect_phase_cli() -> PhaseCliStatus {
         }
     }
 
-    if let Ok(env_host) = std::env::var("PHASE_HOST") {
-        if !env_host.trim().is_empty() {
-            status.host = Some(env_host.trim().trim_end_matches('/').to_string());
+    if !status.logged_in || status.host.is_none() {
+        if let Ok(env_host) = std::env::var("PHASE_HOST") {
+            if !env_host.trim().is_empty() {
+                status.host = Some(env_host.trim().trim_end_matches('/').to_string());
+            }
         }
     }
 
-    if let Ok(svc_tok) = std::env::var("PHASE_SERVICE_TOKEN") {
-        if !svc_tok.trim().is_empty() {
-            status.logged_in = true;
-            if status.host.is_none() {
-                status.host = Some(PHASE_CLOUD_HOST.to_string());
+    if !status.logged_in {
+        if let Ok(svc_tok) = std::env::var("PHASE_SERVICE_TOKEN") {
+            if PssToken::parse(&svc_tok).is_ok() {
+                status.logged_in = true;
+                if status.host.is_none() {
+                    status.host = Some(PHASE_CLOUD_HOST.to_string());
+                }
             }
         }
     }
@@ -287,7 +321,8 @@ pub fn try_detect_local_phase_cli_host() -> Option<(HostMode, String)> {
 }
 
 /// Builds a `Command` for `phase` CLI with AI-agent detection env vars cleared
-/// so `phase` CLI never redacts secret values with `[REDACTED]`.
+/// so `phase` CLI never redacts secret values with `[REDACTED]`, and sanitizes
+/// `PHASE_SERVICE_TOKEN` / `PHASE_HOST` so configured CLI credentials take precedence.
 fn clean_phase_command(bin: &str) -> Command {
     let mut cmd = Command::new(bin);
     cmd.env_remove("CLAUDECODE")
@@ -295,6 +330,16 @@ fn clean_phase_command(bin: &str) -> Command {
         .env_remove("CODEX")
         .env_remove("OPENCODE")
         .env_remove("AGENT");
+
+    let has_cli_login = has_local_cli_account();
+    let env_tok = std::env::var("PHASE_SERVICE_TOKEN").ok();
+    if should_strip_phase_service_token(has_cli_login, env_tok.as_deref()) {
+        cmd.env_remove("PHASE_SERVICE_TOKEN");
+    }
+    if has_cli_login {
+        cmd.env_remove("PHASE_HOST");
+    }
+
     cmd
 }
 
@@ -565,6 +610,7 @@ pub fn parse_cli_apps_json(raw_json: &str) -> Result<Vec<PhaseAppInfo>, String> 
                     identity_key: String::new(),
                     wrapped_seed: String::new(),
                     wrapped_salt: String::new(),
+                    cached_secrets: Vec::new(),
                 })
                 .collect(),
         })
@@ -610,37 +656,188 @@ fn fetch_apps_and_envs_via_cli() -> Result<Vec<PhaseAppInfo>, String> {
     parse_cli_apps_json(&stdout)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhaseSecretItem {
+    pub key: String,
+    pub value: String,
+    pub path: String,
+    pub comment: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct CliSecretDetail {
     #[serde(default)]
     key: String,
     #[serde(default)]
+    value: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
     comment: String,
 }
 
-pub fn parse_cli_secrets_comments(raw_json: &str) -> HashMap<String, String> {
-    let mut comments = HashMap::new();
+pub fn parse_cli_secrets_details(raw_json: &str) -> Vec<PhaseSecretItem> {
     let trimmed = raw_json.trim();
     if let Ok(list) = serde_json::from_str::<Vec<CliSecretDetail>>(trimmed) {
-        for item in list {
-            if !item.key.is_empty() {
-                comments.insert(item.key, item.comment);
-            }
-        }
+        list.into_iter()
+            .filter(|item| !item.key.is_empty())
+            .map(|item| PhaseSecretItem {
+                key: item.key,
+                value: item.value,
+                path: normalize_secret_path(&item.path),
+                comment: item.comment,
+            })
+            .collect()
     } else if let Ok(single) = serde_json::from_str::<CliSecretDetail>(trimmed) {
-        if !single.key.is_empty() {
-            comments.insert(single.key, single.comment);
+        if single.key.is_empty() {
+            Vec::new()
+        } else {
+            vec![PhaseSecretItem {
+                key: single.key,
+                value: single.value,
+                path: normalize_secret_path(&single.path),
+                comment: single.comment,
+            }]
         }
+    } else {
+        Vec::new()
     }
-    comments
 }
 
-fn fetch_secrets_for_env_via_cli(
+fn parse_phase_secret_reference(expr: &str) -> Option<(Option<&str>, Option<&str>, String, &str)> {
+    let expr = expr.trim();
+    if expr.is_empty() || expr.contains(char::is_whitespace) {
+        return None;
+    }
+
+    let (ref_app, rem) = match expr.split_once("::") {
+        Some((app_part, rest)) if !app_part.is_empty() && !app_part.contains('/') => {
+            (Some(app_part), rest)
+        }
+        Some(_) => return None,
+        None => (None, expr),
+    };
+
+    let (ref_env, path_and_key) = if rem.starts_with('/') {
+        (None, rem)
+    } else if let Some((env_part, after_dot)) = rem.split_once('.') {
+        if !env_part.is_empty() && !env_part.contains('/') {
+            (Some(env_part), after_dot)
+        } else {
+            (None, rem)
+        }
+    } else {
+        (None, rem)
+    };
+
+    let (folder_path, secret_key) = if path_and_key.starts_with('/') {
+        let last_slash = path_and_key.rfind('/')?;
+        let key_part = &path_and_key[last_slash + 1..];
+        let folder_part = &path_and_key[..last_slash];
+        (normalize_secret_path(folder_part), key_part)
+    } else {
+        ("/".to_string(), path_and_key)
+    };
+
+    if secret_key.is_empty() {
+        return None;
+    }
+
+    Some((ref_app, ref_env, folder_path, secret_key))
+}
+
+fn resolve_item_value(
+    idx: usize,
+    items: &[PhaseSecretItem],
+    current_app: &str,
+    current_env: &str,
+    visiting: &mut std::collections::HashSet<usize>,
+) -> String {
+    if !visiting.insert(idx) {
+        return items[idx].value.clone();
+    }
+
+    let raw = &items[idx].value;
+    let mut out = String::with_capacity(raw.len());
+    let mut cursor = 0;
+
+    while let Some(rel_start) = raw[cursor..].find("${") {
+        let start = cursor + rel_start;
+        out.push_str(&raw[cursor..start]);
+
+        if let Some(rel_end) = raw[start + 2..].find('}') {
+            let end = start + 2 + rel_end;
+            let expr = &raw[start + 2..end];
+            if let Some((ref_app, ref_env, target_path, target_key)) =
+                parse_phase_secret_reference(expr)
+            {
+                let app_matches = match ref_app {
+                    Some(a) => !current_app.is_empty() && a.eq_ignore_ascii_case(current_app),
+                    None => true,
+                };
+                let env_matches = match ref_env {
+                    Some(e) => !current_env.is_empty() && e.eq_ignore_ascii_case(current_env),
+                    None => true,
+                };
+                if app_matches && env_matches {
+                    if let Some(target_idx) = items.iter().position(|it| {
+                        it.key == target_key && normalize_secret_path(&it.path) == target_path
+                    }) {
+                        let resolved = resolve_item_value(
+                            target_idx,
+                            items,
+                            current_app,
+                            current_env,
+                            visiting,
+                        );
+                        out.push_str(&resolved);
+                        cursor = end + 1;
+                        continue;
+                    }
+                }
+            }
+            out.push_str(&raw[start..=end]);
+            cursor = end + 1;
+        } else {
+            out.push_str(&raw[start..]);
+            cursor = raw.len();
+            break;
+        }
+    }
+
+    out.push_str(&raw[cursor..]);
+    visiting.remove(&idx);
+    out
+}
+
+/// Resolves Phase.dev `${...}` secret references within the fetched environment items.
+pub fn resolve_secret_references(
+    items: &mut [PhaseSecretItem],
+    current_app: &str,
+    current_env: &str,
+) {
+    let mut resolved_values = Vec::with_capacity(items.len());
+    for i in 0..items.len() {
+        let mut visiting = std::collections::HashSet::new();
+        resolved_values.push(resolve_item_value(
+            i,
+            items,
+            current_app,
+            current_env,
+            &mut visiting,
+        ));
+    }
+    for (item, val) in items.iter_mut().zip(resolved_values) {
+        item.value = val;
+    }
+}
+
+fn fetch_detailed_secrets_for_env_via_cli(
     app_id: &str,
     env_id: &str,
     env_name_hint: Option<&str>,
     export_all_paths: bool,
-) -> Result<Vec<(String, String, String)>, String> {
+) -> Result<Vec<PhaseSecretItem>, String> {
     let Some(bin) = find_phase_binary() else {
         return Err("Phase CLI binary (`phase`) not found in PATH.".to_string());
     };
@@ -688,7 +885,6 @@ fn fetch_secrets_for_env_via_cli(
         return Ok(Vec::new());
     }
 
-    let mut comments = HashMap::new();
     let mut get_cmd = clean_phase_command(&bin_str);
     get_cmd.args(["secrets", "get"]);
     for (k, _) in &pairs {
@@ -704,20 +900,55 @@ fn fetch_secrets_for_env_via_cli(
         get_cmd.args(["--path", "/"]);
     }
 
+    let mut details = Vec::new();
     if let Ok(get_out) = get_cmd.output() {
         if get_out.status.success() {
             let get_stdout = String::from_utf8_lossy(&get_out.stdout);
-            comments = parse_cli_secrets_comments(&get_stdout);
+            details = parse_cli_secrets_details(&get_stdout);
         }
     }
 
-    let mut result = Vec::with_capacity(pairs.len());
-    for (k, v) in pairs {
-        let comment = comments.remove(&k).unwrap_or_default();
-        result.push((k, v, comment));
+    let pairs_map: HashMap<String, String> = pairs.iter().cloned().collect();
+    if details.is_empty() {
+        details = pairs
+            .into_iter()
+            .map(|(k, v)| PhaseSecretItem {
+                key: k,
+                value: v,
+                path: "/".to_string(),
+                comment: String::new(),
+            })
+            .collect();
+    } else {
+        let mut key_counts: HashMap<String, usize> = HashMap::new();
+        for item in &details {
+            *key_counts.entry(item.key.clone()).or_insert(0) += 1;
+        }
+        for item in &mut details {
+            if let Some(exported) = pairs_map.get(&item.key) {
+                let is_unique = key_counts.get(&item.key).copied().unwrap_or(0) == 1;
+                if item.value.is_empty()
+                    || (item.value.contains("${") && is_unique && !exported.contains("${"))
+                {
+                    item.value = exported.clone();
+                }
+            }
+        }
+        for (k, v) in pairs {
+            if !key_counts.contains_key(&k) {
+                details.push(PhaseSecretItem {
+                    key: k,
+                    value: v,
+                    path: "/".to_string(),
+                    comment: String::new(),
+                });
+            }
+        }
     }
 
-    Ok(result)
+    resolve_secret_references(&mut details, "", &resolved_env_name);
+    details.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.path.cmp(&b.path)));
+    Ok(details)
 }
 
 /// Fetches the list of accessible Applications and Environments from Phase.dev
@@ -770,6 +1001,7 @@ pub fn fetch_apps_and_envs(config: &PhaseConfig) -> Result<Vec<PhaseAppInfo>, St
                     identity_key: ek.identity_key,
                     wrapped_seed: ek.wrapped_seed,
                     wrapped_salt: ek.wrapped_salt,
+                    cached_secrets: Vec::new(),
                 })
                 .collect(),
         })
@@ -778,16 +1010,21 @@ pub fn fetch_apps_and_envs(config: &PhaseConfig) -> Result<Vec<PhaseAppInfo>, St
     Ok(apps)
 }
 
-/// Fetches and decrypts all secrets for a given App and Environment from Phase.dev.
-pub fn fetch_secrets_for_env(
+/// Fetches and decrypts all secrets (including folder path and comment) for a given App and Environment from Phase.dev.
+pub fn fetch_detailed_secrets_for_env(
     config: &PhaseConfig,
     app_id: &str,
     env_id: &str,
     env_name_hint: Option<&str>,
     export_all_paths: bool,
-) -> Result<Vec<(String, String, String)>, String> {
+) -> Result<Vec<PhaseSecretItem>, String> {
     if config.auth_method == PhaseAuthMethod::Cli {
-        return fetch_secrets_for_env_via_cli(app_id, env_id, env_name_hint, export_all_paths);
+        return fetch_detailed_secrets_for_env_via_cli(
+            app_id,
+            env_id,
+            env_name_hint,
+            export_all_paths,
+        );
     }
 
     let pss = PssToken::parse(&config.pat_token)?;
@@ -807,6 +1044,8 @@ pub fn fetch_secrets_for_env(
         .into_json()
         .map_err(|e| format!("Failed to decode Phase user context: {}", e))?;
 
+    let mut target_app_name = String::new();
+    let mut target_env_name = String::new();
     let mut target_env_key: Option<RawEnvKey> = None;
     for app in user_data.apps {
         if !app_id.is_empty() && app.id != app_id {
@@ -814,6 +1053,8 @@ pub fn fetch_secrets_for_env(
         }
         for ek in app.environment_keys {
             if ek.environment.id == env_id {
+                target_app_name = app.name.clone();
+                target_env_name = ek.environment.name.clone();
                 target_env_key = Some(ek);
                 break;
             }
@@ -844,12 +1085,21 @@ pub fn fetch_secrets_for_env(
         .into_json()
         .map_err(|e| format!("Failed to parse secrets JSON: {}", e))?;
 
-    let mut pairs = Vec::with_capacity(raw_secrets.len());
+    let mut items = Vec::with_capacity(raw_secrets.len());
     for item in raw_secrets {
         if item.key.is_empty() {
             continue;
         }
-        if !export_all_paths && !item.path.is_empty() && item.path != "/" {
+        let item_path = if item.path.is_empty() {
+            "/".to_string()
+        } else if item.path.starts_with("ph:v1:") {
+            let dec = decrypt_asymmetric(&item.path, &env_priv_key, &env_pub_key)
+                .unwrap_or_else(|_| "/".to_string());
+            normalize_secret_path(&dec)
+        } else {
+            normalize_secret_path(&item.path)
+        };
+        if !export_all_paths && item_path != "/" {
             continue;
         }
         let ov = item.override_field.as_ref().or(item.override_val.as_ref());
@@ -873,15 +1123,40 @@ pub fn fetch_secrets_for_env(
             item.comment.clone()
         };
 
-        pairs.push((key_plain, val_plain, comment_plain));
+        items.push(PhaseSecretItem {
+            key: key_plain,
+            value: val_plain,
+            path: item_path,
+            comment: comment_plain,
+        });
     }
 
-    pairs.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(pairs)
+    let effective_env = env_name_hint
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(&target_env_name);
+    resolve_secret_references(&mut items, &target_app_name, effective_env);
+    items.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.path.cmp(&b.path)));
+    Ok(items)
 }
 
-/// Synchronizes Phase.dev collections in `state`.
-/// If `only_collection_idx` is `Some(idx)`, syncs only that collection; otherwise syncs all eligible Phase collections.
+/// Fetches and decrypts all secrets for a given App and Environment from Phase.dev.
+pub fn fetch_secrets_for_env(
+    config: &PhaseConfig,
+    app_id: &str,
+    env_id: &str,
+    env_name_hint: Option<&str>,
+    export_all_paths: bool,
+) -> Result<Vec<(String, String, String)>, String> {
+    let items =
+        fetch_detailed_secrets_for_env(config, app_id, env_id, env_name_hint, export_all_paths)?;
+    Ok(items
+        .into_iter()
+        .map(|it| (it.key, it.value, it.comment))
+        .collect())
+}
+
+/// Synchronizes Phase.dev collections and custom Phase-synced variables in `state`.
+/// If `only_collection_idx` is `Some(idx)`, syncs only that collection; otherwise syncs all eligible collections.
 /// Returns `(synced_collection_count, total_vars_fetched)`.
 pub fn sync_phase_collections(
     state: &mut AppStateData,
@@ -893,7 +1168,12 @@ pub fn sync_phase_collections(
 
     let only_enabled = state.settings.sync_only_enabled_collections && only_collection_idx.is_none();
 
-    let targets: Vec<(usize, crate::model::PhaseBinding)> = state
+    enum SyncTarget {
+        PhaseCollection(usize, crate::model::PhaseBinding),
+        CustomPhaseVars(usize),
+    }
+
+    let targets: Vec<SyncTarget> = state
         .collections
         .iter()
         .enumerate()
@@ -905,7 +1185,13 @@ pub fn sync_phase_collections(
             } else if only_enabled && !c.enabled {
                 return None;
             }
-            c.phase_binding.clone().map(|b| (idx, b))
+            if let Some(b) = &c.phase_binding {
+                Some(SyncTarget::PhaseCollection(idx, b.clone()))
+            } else if c.has_phase_vars() {
+                Some(SyncTarget::CustomPhaseVars(idx))
+            } else {
+                None
+            }
         })
         .collect();
 
@@ -915,19 +1201,90 @@ pub fn sync_phase_collections(
 
     let mut synced_collections = 0;
     let mut total_vars = 0;
+    let mut detailed_cache: HashMap<(String, String), Vec<PhaseSecretItem>> = HashMap::new();
 
-    for (idx, binding) in targets {
-        let fetched = fetch_secrets_for_env(
-            &state.phase,
-            &binding.app_id,
-            &binding.env_id,
-            Some(&binding.env_name),
-            binding.export_all_paths,
-        )?;
-        total_vars += fetched.len();
-        if let Some(coll) = state.collections.get_mut(idx) {
-            coll.set_phase_vars(binding, fetched);
-            synced_collections += 1;
+    for target in targets {
+        match target {
+            SyncTarget::PhaseCollection(idx, binding) => {
+                let fetched = fetch_secrets_for_env(
+                    &state.phase,
+                    &binding.app_id,
+                    &binding.env_id,
+                    Some(&binding.env_name),
+                    binding.export_all_paths,
+                )?;
+                total_vars += fetched.len();
+                if let Some(coll) = state.collections.get_mut(idx) {
+                    coll.set_phase_vars(binding, fetched);
+                    synced_collections += 1;
+                }
+            }
+            SyncTarget::CustomPhaseVars(idx) => {
+                let refs: Vec<(String, String, String)> = state
+                    .collections
+                    .get(idx)
+                    .map(|c| {
+                        c.vars
+                            .iter()
+                            .filter_map(|v| {
+                                v.phase_ref.as_ref().map(|r| {
+                                    (r.app_id.clone(), r.env_id.clone(), r.env_name.clone())
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                for (app_id, env_id, env_name) in refs {
+                    let cache_key = (app_id.clone(), env_id.clone());
+                    if !detailed_cache.contains_key(&cache_key) {
+                        let items = fetch_detailed_secrets_for_env(
+                            &state.phase,
+                            &app_id,
+                            &env_id,
+                            Some(&env_name),
+                            true,
+                        )?;
+                        detailed_cache.insert(cache_key, items);
+                    }
+                }
+
+                if let Some(coll) = state.collections.get_mut(idx) {
+                    let mut synced_any = false;
+                    for var in &mut coll.vars {
+                        let Some(pref) = &var.phase_ref else {
+                            continue;
+                        };
+                        let cache_key = (pref.app_id.clone(), pref.env_id.clone());
+                        if let Some(items) = detailed_cache.get(&cache_key) {
+                            let target_path = pref.normalized_path();
+                            let found = items
+                                .iter()
+                                .find(|s| {
+                                    normalize_secret_path(&s.path) == target_path
+                                        && s.key == pref.secret_key
+                                })
+                                .or_else(|| {
+                                    if target_path == "/" {
+                                        items.iter().find(|s| s.key == pref.secret_key)
+                                    } else {
+                                        None
+                                    }
+                                });
+                            if let Some(secret) = found {
+                                var.set_value(secret.value.clone());
+                                var.comment = secret.comment.chars().take(100).collect();
+                                total_vars += 1;
+                                synced_any = true;
+                            }
+                        }
+                    }
+                    if synced_any {
+                        coll.last_sync_epoch = Some(AppStateData::current_epoch_secs());
+                    }
+                    synced_collections += 1;
+                }
+            }
         }
     }
 
@@ -1061,19 +1418,21 @@ mod tests {
             ]
         );
 
-        // Test parse_cli_secrets_comments with array of secrets
+        // Test parse_cli_secrets_details with array of secrets
         let details_array_json = r#"[
             { "key": "A_KEY", "value": "a_val", "comment": "Primary API key" },
             { "key": "Z_KEY", "value": "z_val", "comment": "Zero-index marker" }
         ]"#;
-        let comments_map = parse_cli_secrets_comments(details_array_json);
-        assert_eq!(comments_map.get("A_KEY").map(String::as_str), Some("Primary API key"));
-        assert_eq!(comments_map.get("Z_KEY").map(String::as_str), Some("Zero-index marker"));
+        let details = parse_cli_secrets_details(details_array_json);
+        assert_eq!(details[0].comment, "Primary API key");
+        assert_eq!(details[1].comment, "Zero-index marker");
 
-        // Test parse_cli_secrets_comments with single secret object
+        // Test parse_cli_secrets_details with single secret object
         let single_detail_json = r#"{ "key": "SINGLE_KEY", "value": "foo", "comment": "Single comment test" }"#;
-        let single_map = parse_cli_secrets_comments(single_detail_json);
-        assert_eq!(single_map.get("SINGLE_KEY").map(String::as_str), Some("Single comment test"));
+        let single = parse_cli_secrets_details(single_detail_json);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].key, "SINGLE_KEY");
+        assert_eq!(single[0].comment, "Single comment test");
     }
 
     #[test]
@@ -1113,5 +1472,89 @@ mod tests {
         let decrypted =
             decrypt_asymmetric(&encrypted_comment, &server_priv_hex, &server_pub_hex).unwrap();
         assert_eq!(decrypted, "Postgres primary database URL");
+    }
+
+    #[test]
+    fn test_parse_cli_secrets_details_with_path_and_comment() {
+        let json = r#"[
+            {"key": "APP_URL", "value": "https://example.com", "path": "", "comment": "Public app URL"},
+            {"key": "STRIPE_KEY", "value": "sk_test_999", "path": "backend/payments/", "comment": "Stripe secret"}
+        ]"#;
+        let items = parse_cli_secrets_details(json);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].key, "APP_URL");
+        assert_eq!(items[0].path, "/");
+        assert_eq!(items[0].comment, "Public app URL");
+        assert_eq!(items[1].key, "STRIPE_KEY");
+        assert_eq!(items[1].path, "/backend/payments");
+        assert_eq!(items[1].comment, "Stripe secret");
+    }
+
+    #[test]
+    fn test_resolve_secret_references_root_and_folder() {
+        let mut items = vec![
+            PhaseSecretItem {
+                key: "HOST".to_string(),
+                value: "api.example.com".to_string(),
+                path: "/".to_string(),
+                comment: String::new(),
+            },
+            PhaseSecretItem {
+                key: "TOKEN".to_string(),
+                value: "tok_abc".to_string(),
+                path: "/backend/payments".to_string(),
+                comment: String::new(),
+            },
+            PhaseSecretItem {
+                key: "SAME_ENV_ROOT".to_string(),
+                value: "https://${HOST}/v1".to_string(),
+                path: "/".to_string(),
+                comment: String::new(),
+            },
+            PhaseSecretItem {
+                key: "SAME_ENV_FOLDER".to_string(),
+                value: "Bearer ${/backend/payments/TOKEN}".to_string(),
+                path: "/".to_string(),
+                comment: String::new(),
+            },
+            PhaseSecretItem {
+                key: "EXPLICIT_APP_ENV_FOLDER".to_string(),
+                value: "key=${backend_api::production./backend/payments/TOKEN}".to_string(),
+                path: "/frontend".to_string(),
+                comment: String::new(),
+            },
+        ];
+
+        resolve_secret_references(&mut items, "backend_api", "production");
+
+        assert_eq!(items[2].value, "https://api.example.com/v1");
+        assert_eq!(items[3].value, "Bearer tok_abc");
+        assert_eq!(items[4].value, "key=tok_abc");
+    }
+
+    #[test]
+    fn test_cli_credentials_precedence_and_invalid_service_token_stripped() {
+        // Configured local CLI account always takes precedence over PHASE_SERVICE_TOKEN
+        assert!(should_strip_phase_service_token(
+            true,
+            Some("pss_service:v1:aa:bb:cc:dd")
+        ));
+        assert!(should_strip_phase_service_token(
+            true,
+            Some("09e721428a1f0000")
+        ));
+
+        // Without local CLI credentials, invalid/non-PSS PHASE_SERVICE_TOKEN is stripped
+        assert!(should_strip_phase_service_token(
+            false,
+            Some("09e721428a1f0000")
+        ));
+
+        // Without local CLI credentials, a syntactically valid PSS service token is kept
+        assert!(!should_strip_phase_service_token(
+            false,
+            Some("pss_service:v1:aa:bb:cc:dd")
+        ));
+        assert!(!should_strip_phase_service_token(false, None));
     }
 }
