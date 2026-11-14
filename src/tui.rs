@@ -101,6 +101,12 @@ pub enum Modal {
         name: String,
         error: Option<String>,
     },
+    VarDetail {
+        key: String,
+        value: String,
+        source: String,
+        comment: String,
+    },
     Settings {
         tab: SettingsTab,
         draft: AppSettings,
@@ -192,6 +198,7 @@ pub struct App {
     pub pending_phase_sync: Option<PendingSyncTarget>,
     pub sync_start_time: Option<Instant>,
     pub input_cursor: usize,
+    pub last_var_click: Option<(FocusPane, usize, Instant)>,
 }
 
 impl App {
@@ -227,6 +234,7 @@ impl App {
             pending_phase_sync: None,
             sync_start_time: None,
             input_cursor: 0,
+            last_var_click: None,
         };
 
         if !cfg!(test) {
@@ -729,6 +737,64 @@ impl App {
             }
         }
         self.set_info("No effective variable selected to edit.");
+    }
+
+    fn open_var_detail(&mut self) {
+        let Some(coll) = self.current_collection() else {
+            self.set_info("No collection selected.");
+            return;
+        };
+        if let Some(var) = coll.vars.get(self.selected_var) {
+            self.modal = Modal::VarDetail {
+                key: var.key.clone(),
+                value: var.value.clone(),
+                source: coll.var_source_label(var),
+                comment: var.comment.clone(),
+            };
+        } else {
+            self.set_info("No variable selected.");
+        }
+    }
+
+    fn open_effective_var_detail(&mut self) {
+        let eff = self.data.compute_effective_vars();
+        if let Some(ev) = eff.get(self.selected_effective) {
+            let comment = self
+                .data
+                .collections
+                .iter()
+                .filter(|c| c.enabled)
+                .find_map(|c| c.vars.iter().find(|v| v.key == ev.key))
+                .map(|v| v.comment.clone())
+                .unwrap_or_default();
+            self.modal = Modal::VarDetail {
+                key: ev.key.clone(),
+                value: ev.value.clone(),
+                source: ev.source_label.clone(),
+                comment,
+            };
+        } else {
+            self.set_info("No effective variable selected.");
+        }
+    }
+
+    fn register_var_click(&mut self, pane: FocusPane, idx: usize) -> bool {
+        let now = Instant::now();
+        let is_double = self
+            .last_var_click
+            .map(|(p, prev_idx, t)| {
+                p == pane
+                    && prev_idx == idx
+                    && now.duration_since(t) <= std::time::Duration::from_millis(500)
+            })
+            .unwrap_or(false);
+        if is_double {
+            self.last_var_click = None;
+            true
+        } else {
+            self.last_var_click = Some((pane, idx, now));
+            false
+        }
     }
 
     fn handle_delete_action(&mut self) {
@@ -1245,7 +1311,7 @@ impl App {
                 }
             }
             KeyCode::Enter if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.open_edit_var();
+                self.open_var_detail();
             }
             KeyCode::Char('y') => {
                 self.copy_selected_key();
@@ -1271,7 +1337,7 @@ impl App {
                 }
             }
             KeyCode::Enter if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.open_edit_effective_var();
+                self.open_effective_var_detail();
             }
             KeyCode::Char('y') => {
                 self.copy_selected_key();
@@ -2855,6 +2921,43 @@ impl App {
                 };
             }
 
+            Modal::VarDetail {
+                key: var_key,
+                value: var_value,
+                source,
+                comment,
+            } => match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('c') => {}
+                KeyCode::Char('y') | KeyCode::Char('k') => {
+                    copy_to_clipboard(&var_key);
+                    self.set_info(format!("Copied key '{}' to clipboard", var_key));
+                    self.modal = Modal::VarDetail {
+                        key: var_key,
+                        value: var_value,
+                        source,
+                        comment,
+                    };
+                }
+                KeyCode::Char('Y') | KeyCode::Char('v') => {
+                    copy_to_clipboard(&var_value);
+                    self.set_info(format!("Copied value for '{}' to clipboard", var_key));
+                    self.modal = Modal::VarDetail {
+                        key: var_key,
+                        value: var_value,
+                        source,
+                        comment,
+                    };
+                }
+                _ => {
+                    self.modal = Modal::VarDetail {
+                        key: var_key,
+                        value: var_value,
+                        source,
+                        comment,
+                    };
+                }
+            },
+
             Modal::Help => match key.code {
                 KeyCode::Esc
                 | KeyCode::Char('?')
@@ -3036,39 +3139,38 @@ impl App {
             Style::default().fg(Color::DarkGray)
         };
 
+        let (key_col_width, _) = right_pane_effective_col_widths(area.width);
+        let constraints = [
+            Constraint::Length(key_col_width),
+            Constraint::Percentage(46),
+            Constraint::Percentage(54),
+        ];
+        let vars_cols = Layout::horizontal(constraints)
+            .spacing(1)
+            .split(Rect::new(0, 0, area.width.saturating_sub(6), 1));
+        let max_val_width = vars_cols[1].width as usize;
+
+        let coll_opt = self.current_collection();
         let vars = self.current_vars();
         let rows: Vec<Row> = vars
             .iter()
             .map(|v| {
-                let val_display = v.masked_display(self.show_values);
-                let (badge_text, badge_style) = if v.is_phase_synced() {
-                    (
-                        "[Phase] ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                } else {
-                    (
-                        "[Manual] ",
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                };
-                let value_cell = Line::from(vec![
-                    Span::styled(badge_text, badge_style),
-                    Span::raw(val_display),
-                ]);
+                let val_display = truncate_with_ellipsis(
+                    v.masked_display(self.show_values),
+                    max_val_width,
+                );
+                let source_label = coll_opt
+                    .map(|c| c.var_source_label(v))
+                    .unwrap_or_else(|| "Manual".to_string());
                 Row::new(vec![
                     Cell::from(v.key.clone()),
-                    Cell::from(value_cell),
-                    Cell::from(v.comment.clone()),
+                    Cell::from(val_display),
+                    Cell::from(source_label),
                 ])
             })
             .collect();
 
-        let header = Row::new(vec!["KEY", "VALUE", "COMMENT"]).style(
+        let header = Row::new(vec!["KEY", "VALUE", "SOURCE"]).style(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -3102,14 +3204,7 @@ impl App {
             " 0 variables in collection ".to_string()
         };
 
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Percentage(24),
-                Constraint::Percentage(36),
-                Constraint::Percentage(40),
-            ],
-        )
+        let table = Table::new(rows, constraints)
         .header(header)
         .block(
             Block::default()
@@ -3142,6 +3237,8 @@ impl App {
         };
 
         let effective = self.data.compute_effective_vars();
+        let (_, max_val_width) = right_pane_effective_col_widths(area.width);
+        let max_val_width = max_val_width as usize;
         let (header, constraints, rows): (Row, Vec<Constraint>, Vec<Row>) = if area.width >= 55 {
             (
                 Row::new(vec!["EXPORTED KEY", "EFFECTIVE VALUE", "COLLECTION", "SOURCE"]).style(
@@ -3156,7 +3253,10 @@ impl App {
                 effective
                     .iter()
                     .map(|ev| {
-                        let val_display = ev.masked_display(self.show_values);
+                        let val_display = truncate_with_ellipsis(
+                            ev.masked_display(self.show_values),
+                            max_val_width,
+                        );
                         Row::new(vec![
                             ev.key.clone(),
                             val_display,
@@ -3180,7 +3280,10 @@ impl App {
                 effective
                     .iter()
                     .map(|ev| {
-                        let val_display = ev.masked_display(self.show_values);
+                        let val_display = truncate_with_ellipsis(
+                            ev.masked_display(self.show_values),
+                            max_val_width,
+                        );
                         Row::new(vec![
                             ev.key.clone(),
                             val_display,
@@ -3503,8 +3606,8 @@ impl App {
                 lines.extend(modern_vertical_radio_options(
                     "2. Collection Data Source:",
                     &[
-                        ("custom", "Custom Environment (Manual Variables)"),
-                        ("phase", "Phase.dev Synchronization (Select App & Env)"),
+                        ("custom", "Custom Environment"),
+                        ("phase", "Phase.dev Synchronization"),
                     ],
                     if *pull_from_phase { 1 } else { 0 },
                     *active_field == 1,
@@ -4171,7 +4274,7 @@ impl App {
                     .collections
                     .get(*collection_idx)
                     .map(|c| c.source_label())
-                    .unwrap_or_else(|| "Custom".to_string());
+                    .unwrap_or_else(|| "Manual".to_string());
 
                 let block = Block::default()
                     .borders(Borders::ALL)
@@ -4224,6 +4327,113 @@ impl App {
                 if let Some(btns) = get_modal_buttons(&self.modal) {
                     render_modal_buttons(frame, chunks[1], btns);
                 }
+            }
+
+            Modal::VarDetail {
+                key,
+                value,
+                source,
+                comment,
+            } => {
+                let popup = get_modal_rect(&self.modal, area);
+                frame.render_widget(Clear, popup);
+
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .padding(Padding::new(1, 1, 1, 0))
+                    .title(" Variable Details ");
+                let inner = block.inner(popup);
+                frame.render_widget(block, popup);
+
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(1), Constraint::Length(1)])
+                    .split(inner);
+
+                let label_style = Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD);
+                let max_field_width = (chunks[0].width as usize).saturating_sub(9);
+                let key_display = truncate_with_ellipsis(key.clone(), max_field_width);
+                let val_line = if value.is_empty() {
+                    Span::styled("<empty>", Style::default().fg(Color::DarkGray))
+                } else {
+                    let val_display = truncate_with_ellipsis(
+                        value.replace(['\r', '\n'], " "),
+                        max_field_width,
+                    );
+                    Span::styled(val_display, Style::default().fg(Color::White))
+                };
+                let source_display = truncate_with_ellipsis(source.clone(), max_field_width);
+                let comment_line = if comment.is_empty() {
+                    Span::styled("<none>", Style::default().fg(Color::DarkGray))
+                } else {
+                    let comment_display = truncate_with_ellipsis(
+                        comment.replace(['\r', '\n'], " "),
+                        max_field_width,
+                    );
+                    Span::styled(comment_display, Style::default().fg(Color::Gray))
+                };
+
+                let lines = vec![
+                    Line::from(vec![
+                        Span::styled("Key:     ", label_style),
+                        Span::styled(
+                            key_display,
+                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                        ),
+                    ]),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("Value:   ", label_style),
+                        val_line,
+                    ]),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("Source:  ", label_style),
+                        Span::styled(source_display, Style::default().fg(Color::Cyan)),
+                    ]),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("Comment: ", label_style),
+                        comment_line,
+                    ]),
+                ];
+
+                frame.render_widget(Paragraph::new(lines), chunks[0]);
+
+                let btns = var_detail_buttons();
+                let total_len: usize = btns.iter().map(|b| b.len()).sum::<usize>() + 4;
+                let left_pad = (chunks[1].width as usize).saturating_sub(total_len) / 2;
+                let btn_line = Line::from(vec![
+                    Span::raw(" ".repeat(left_pad)),
+                    Span::styled(
+                        btns[0],
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(
+                        btns[1],
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(
+                        btns[2],
+                        Style::default()
+                            .fg(Color::White)
+                            .bg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]);
+                frame.render_widget(Paragraph::new(btn_line), chunks[1]);
             }
 
             Modal::Settings {
@@ -4764,6 +4974,7 @@ impl App {
 
                 // Panes & items left-click handling
                 if rect_contains(collections_rect, mouse.column, mouse.row) {
+                    self.last_var_click = None;
                     self.focus = FocusPane::Collections;
                     if let Some(idx) = self.collection_index_at_row(collections_rect, mouse.row) {
                         if self.selected_collection != idx {
@@ -4780,12 +4991,24 @@ impl App {
                     self.focus = FocusPane::Vars;
                     if let Some(idx) = self.var_index_at_row(vars_rect, mouse.row) {
                         self.selected_var = idx;
+                        if self.register_var_click(FocusPane::Vars, idx) {
+                            self.open_var_detail();
+                        }
+                    } else {
+                        self.last_var_click = None;
                     }
                 } else if rect_contains(effective_rect, mouse.column, mouse.row) {
                     self.focus = FocusPane::Effective;
                     if let Some(idx) = self.effective_index_at_row(effective_rect, mouse.row) {
                         self.selected_effective = idx;
+                        if self.register_var_click(FocusPane::Effective, idx) {
+                            self.open_effective_var_detail();
+                        }
+                    } else {
+                        self.last_var_click = None;
                     }
+                } else {
+                    self.last_var_click = None;
                 }
             }
 
@@ -4961,6 +5184,33 @@ impl App {
         } else {
             chunks[1]
         };
+
+        if let Modal::VarDetail { key, value, .. } = &self.modal {
+            if row == btn_chunk.y {
+                let btns = var_detail_buttons();
+                let total_len: usize = btns.iter().map(|b| b.len()).sum::<usize>() + 4;
+                let start_x = btn_chunk.x + (btn_chunk.width.saturating_sub(total_len as u16)) / 2;
+                let copy_key_end = start_x + btns[0].len() as u16;
+                let copy_val_start = copy_key_end + 2;
+                let copy_val_end = copy_val_start + btns[1].len() as u16;
+                let close_start = copy_val_end + 2;
+                let close_end = close_start + btns[2].len() as u16;
+
+                if col >= start_x && col < copy_key_end {
+                    let k = key.clone();
+                    copy_to_clipboard(&k);
+                    self.set_info(format!("Copied key '{}' to clipboard", k));
+                } else if col >= copy_val_start && col < copy_val_end {
+                    let k = key.clone();
+                    let v = value.clone();
+                    copy_to_clipboard(&v);
+                    self.set_info(format!("Copied value for '{}' to clipboard", k));
+                } else if col >= close_start && col < close_end {
+                    self.modal = Modal::None;
+                }
+            }
+            return;
+        }
 
         if let Some(btns) = get_modal_buttons(&self.modal) {
             let total_len = if btns.cancel.is_empty() {
@@ -5422,6 +5672,7 @@ pub fn get_modal_rect(modal: &Modal, area: Rect) -> Rect {
             compact_modal_rect(54, 9, area)
         }
         Modal::EditCollection { .. } => compact_modal_rect(58, 12, area),
+        Modal::VarDetail { .. } => compact_modal_rect(76, 17, area),
         Modal::NewCollection { .. } => compact_modal_rect(64, 14, area),
         Modal::VarEditor { .. } => compact_modal_rect(80, 21, area),
         Modal::PhaseVarPicker { .. } => compact_modal_rect(84, 22, area),
@@ -5436,6 +5687,10 @@ pub struct ModalButtons {
     pub primary: &'static str,
     pub cancel: &'static str,
     pub is_danger: bool,
+}
+
+fn var_detail_buttons() -> [&'static str; 3] {
+    [" [Copy Key] ", " [Copy Value] ", " [Close] "]
 }
 
 pub fn get_modal_buttons(modal: &Modal) -> Option<ModalButtons> {
@@ -5512,6 +5767,7 @@ pub fn get_modal_buttons(modal: &Modal) -> Option<ModalButtons> {
             cancel: "",
             is_danger: false,
         }),
+        Modal::VarDetail { .. } => None,
     }
 }
 
@@ -5957,6 +6213,39 @@ fn modern_input_lines(
     ]
 }
 
+fn right_pane_effective_col_widths(area_width: u16) -> (u16, u16) {
+    if area_width >= 55 {
+        // borders (2) + padding (2) + highlight_symbol "▶ " (2)
+        let table_inner_w = area_width.saturating_sub(6);
+        let cols = Layout::horizontal([
+            Constraint::Percentage(22),
+            Constraint::Percentage(34),
+            Constraint::Percentage(12),
+            Constraint::Percentage(32),
+        ])
+        .spacing(1)
+        .split(Rect::new(0, 0, table_inner_w, 1));
+        (cols[0].width, cols[1].width)
+    } else {
+        (3, 3)
+    }
+}
+
+fn truncate_with_ellipsis(s: String, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= max_width {
+        return s;
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+    let mut out: String = s.chars().take(max_width - 1).collect();
+    out.push('…');
+    out
+}
+
 fn modern_readonly_lines(
     label: &str,
     value: &str,
@@ -6213,6 +6502,7 @@ mod tests {
             pending_phase_sync: None,
             sync_start_time: None,
             input_cursor: 0,
+            last_var_click: None,
         }
     }
 
@@ -7154,9 +7444,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // 1. Radio options are rendered vertically (with (●) / (○))
+        // 1. Radio options are rendered vertically (with (●) / (○)) without parenthetical descriptions
         assert!(content.contains("(●) Custom Environment"));
         assert!(content.contains("(○) Phase.dev Synchronization"));
+        assert!(!content.contains("(Manual Variables)"));
+        assert!(!content.contains("(Select App & Env)"));
 
         // Verify they are on different vertical rows
         let custom_row = (0..buffer.area.height).find(|&y| {
@@ -8391,9 +8683,10 @@ mod tests {
 
         assert!(screen_text.contains("KEY"));
         assert!(screen_text.contains("VALUE"));
-        assert!(screen_text.contains("COMMENT"));
-        assert!(screen_text.contains("[Manual]"));
-        assert!(screen_text.contains("Timeout for client database"));
+        assert!(screen_text.contains("SOURCE"));
+        assert!(!screen_text.contains("COMMENT"));
+        assert!(!screen_text.contains("[Manual]"));
+        assert!(screen_text.contains("Manual"));
     }
 
     #[test]
@@ -8471,8 +8764,8 @@ mod tests {
             .join("\n");
 
         assert!(screen_text.contains("API_URL"));
-        assert!(screen_text.contains("[Phase]"));
-        assert!(screen_text.contains("Main Phase API endpoint"));
+        assert!(!screen_text.contains("[Phase]"));
+        assert!(screen_text.contains("Phase (Backend/Production)"));
     }
 
     #[test]
@@ -8748,10 +9041,159 @@ mod tests {
             .join("\n");
 
         assert!(screen_text.contains("MANUAL_ONLY"));
-        assert!(screen_text.contains("[Manual]"));
+        assert!(screen_text.contains("Manual"));
         assert!(screen_text.contains("PHASE_REF_VAR"));
-        assert!(screen_text.contains("[Phase]"));
+        assert!(screen_text.contains("Phase (backend_api/production"));
         assert!(screen_text.contains("Last sync:"));
+    }
+
+    #[test]
+    fn test_right_panel_key_and_value_alignment_and_value_ellipsis_truncation() {
+        let mut app = make_test_app();
+        app.show_values = true;
+        let long_val = "very_long_unmasked_secret_value_that_exceeds_column_width_1234567890";
+        app.data.collections[0].vars.push(EnvVar::new(
+            "LONG_VAL_KEY".to_string(),
+            long_val.to_string(),
+            VarSource::Custom,
+        ));
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+
+        let char_col = |row: &str, needle: &str| -> Option<usize> {
+            row.find(needle).map(|byte_idx| row[..byte_idx].chars().count())
+        };
+
+        let upper_header = rows.iter().find(|r| r.contains("KEY") && r.contains("SOURCE")).expect("upper header");
+        let lower_header = rows.iter().find(|r| r.contains("EXPORTED KEY") && r.contains("EFFECTIVE VALUE")).expect("lower header");
+
+        assert_eq!(
+            char_col(upper_header, "KEY"),
+            char_col(lower_header, "EXPORTED KEY"),
+            "Key column must start at same x in upper and lower right panels"
+        );
+        assert_eq!(
+            char_col(upper_header, "VALUE"),
+            char_col(lower_header, "EFFECTIVE VALUE"),
+            "Value column must align between upper and lower right panels"
+        );
+
+        let upper_var_row = rows.iter().find(|r| r.contains("LONG_VAL_KEY") && r.contains("very_long")).expect("upper var row");
+        assert!(upper_var_row.contains('…'), "Upper panel unmasked long value should truncate with ellipsis");
+        assert!(!upper_var_row.contains("7890"));
+
+        let lower_var_row = rows.iter().rfind(|r| r.contains("LONG_VAL_KEY") && r.contains("very_long")).expect("lower var row");
+        assert!(lower_var_row.contains('…'), "Lower panel unmasked long value should truncate with ellipsis");
+        assert!(!lower_var_row.contains("7890"));
+    }
+
+    #[test]
+    fn test_enter_and_double_click_open_var_detail_popup_in_both_panels() {
+        let mut app = make_test_app();
+        let area = Rect::new(0, 0, 120, 30);
+        app.last_area = area;
+        app.data.collections[0].vars.clear();
+        app.data.collections[0].vars.push(EnvVar::with_comment(
+            "DETAIL_KEY".to_string(),
+            "secret_detail_value".to_string(),
+            "Detail comment".to_string(),
+            VarSource::Custom,
+        ));
+
+        // 1. Enter in Vars pane opens VarDetail
+        app.focus = FocusPane::Vars;
+        app.selected_var = 0;
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(
+            &app.modal,
+            Modal::VarDetail { key, value, source, comment }
+            if key == "DETAIL_KEY" && value == "secret_detail_value" && source == "Manual" && comment == "Detail comment"
+        ));
+
+        // Render VarDetail and verify fields & buttons
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..buffer.area.height)
+            .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("Variable Details"));
+        assert!(screen.contains("DETAIL_KEY"));
+        assert!(screen.contains("secret_detail_value"));
+        assert!(screen.contains("Manual"));
+        assert!(screen.contains("Detail comment"));
+        assert!(screen.contains("[Copy Key]"));
+        assert!(screen.contains("[Copy Value]"));
+        assert!(screen.contains("[Close]"));
+
+        // Esc closes VarDetail
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(matches!(app.modal, Modal::None));
+
+        // 2. Enter in Effective pane opens VarDetail
+        app.focus = FocusPane::Effective;
+        app.selected_effective = 0;
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(
+            &app.modal,
+            Modal::VarDetail { key, value, source, comment }
+            if key == "DETAIL_KEY" && value == "secret_detail_value" && source == "Manual" && comment == "Detail comment"
+        ));
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(matches!(app.modal, Modal::None));
+
+        // 3. Double-click in Vars pane opens VarDetail
+        let (_, _, vars_rect, effective_rect, _) = compute_layout_chunks(area);
+        let vars_row_y = vars_rect.y + 3; // border(1) + top padding(1) + header(1) = row 0
+        let click_vars = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: vars_rect.x + 4,
+            row: vars_row_y,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(click_vars);
+        assert!(matches!(app.modal, Modal::None), "Single click should only select");
+        app.handle_mouse(click_vars);
+        assert!(matches!(app.modal, Modal::VarDetail { .. }), "Double click in Vars pane should open VarDetail");
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+
+        // 4. Double-click in Effective pane opens VarDetail
+        let eff_row_y = effective_rect.y + 3;
+        let click_eff = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: effective_rect.x + 4,
+            row: eff_row_y,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(click_eff);
+        assert!(matches!(app.modal, Modal::None), "Single click should only select");
+        app.handle_mouse(click_eff);
+        assert!(matches!(app.modal, Modal::VarDetail { .. }), "Double click in Effective pane should open VarDetail");
+
+        // 5. Long value in VarDetail stays single-line and truncates with ellipsis
+        app.modal = Modal::VarDetail {
+            key: "VERY_LONG_KEY".to_string(),
+            value: "a".repeat(120) + "_TAIL_MARKER",
+            source: "Manual".to_string(),
+            comment: "b".repeat(120) + "_COMMENT_TAIL",
+        };
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let detail_rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        let value_row = detail_rows.iter().find(|r| r.contains("Value:")).expect("Value row");
+        assert!(value_row.contains('…'), "Long value in VarDetail must truncate with ellipsis");
+        assert!(!detail_rows.iter().any(|r| r.contains("_TAIL_MARKER")), "Long value must not wrap onto next line");
     }
 
     #[test]

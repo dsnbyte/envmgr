@@ -432,7 +432,20 @@ impl Collection {
     pub fn source_label(&self) -> String {
         match &self.phase_binding {
             Some(b) => format!("Phase ({}/{})", b.app_name, b.env_name),
-            None => "Custom".to_string(),
+            None => "Manual".to_string(),
+        }
+    }
+
+    pub fn var_source_label(&self, var: &EnvVar) -> String {
+        if let Some(pref) = &var.phase_ref {
+            let p = pref.normalized_path();
+            if p == "/" {
+                format!("Phase ({}/{})", pref.app_name, pref.env_name)
+            } else {
+                format!("Phase ({}/{}{})", pref.app_name, pref.env_name, p)
+            }
+        } else {
+            self.source_label()
         }
     }
 
@@ -641,21 +654,11 @@ impl AppStateData {
                 continue;
             }
             let owner = collection.name.clone();
-            let coll_source = collection.source_label();
             for var in &collection.vars {
                 if !map.contains_key(&var.key) {
                     order.push(var.key.clone());
                 }
-                let source_label = if let Some(pref) = &var.phase_ref {
-                    let p = pref.normalized_path();
-                    if p == "/" {
-                        format!("Phase ({}/{})", pref.app_name, pref.env_name)
-                    } else {
-                        format!("Phase ({}/{}{})", pref.app_name, pref.env_name, p)
-                    }
-                } else {
-                    coll_source.clone()
-                };
+                let source_label = collection.var_source_label(var);
                 map.insert(
                     var.key.clone(),
                     EffectiveVar {
@@ -1154,7 +1157,7 @@ mod tests {
         let root_ref = effective.iter().find(|v| v.key == "ROOT_REF").unwrap();
         let folder_ref = effective.iter().find(|v| v.key == "FOLDER_REF").unwrap();
 
-        assert_eq!(manual.source_label, "Custom");
+        assert_eq!(manual.source_label, "Manual");
         assert_eq!(root_ref.source_label, "Phase (backend_api/production)");
         assert_eq!(folder_ref.source_label, "Phase (backend_api/production/backend/payments)");
     }
