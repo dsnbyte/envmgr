@@ -126,6 +126,8 @@ pub enum Modal {
 pub enum ContextAction {
     ToggleCollection,
     ToggleVar,
+    EnableAllVars,
+    DisableAllVars,
     Edit,
     Delete,
     MoveUp,
@@ -144,8 +146,23 @@ pub enum ContextAction {
 pub struct ContextMenuItem {
     pub label: String,
     pub shortcut: &'static str,
-    pub action: ContextAction,
+    pub action: Option<ContextAction>,
     pub is_danger: bool,
+}
+
+impl ContextMenuItem {
+    pub fn divider() -> Self {
+        Self {
+            label: String::new(),
+            shortcut: "",
+            action: None,
+            is_danger: false,
+        }
+    }
+
+    pub fn is_divider(&self) -> bool {
+        self.action.is_none()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -157,13 +174,38 @@ pub struct ContextMenu {
 }
 
 impl ContextMenu {
+    pub fn move_selection(&mut self, forward: bool) {
+        let len = self.items.len();
+        if len == 0 {
+            return;
+        }
+        let mut idx = self.selected.min(len - 1);
+        for _ in 0..len {
+            idx = if forward {
+                (idx + 1) % len
+            } else {
+                (idx + len - 1) % len
+            };
+            if !self.items[idx].is_divider() {
+                self.selected = idx;
+                return;
+            }
+        }
+    }
+
     pub fn rect(&self, area: Rect) -> Rect {
         let min_gap = 4;
         let content_width = self
             .items
             .iter()
+            .filter(|item| !item.is_divider())
             .map(|item| {
-                2 + item.label.chars().count() + min_gap + item.shortcut.chars().count() + 2 + 1
+                let shortcut_len = if item.shortcut.is_empty() {
+                    0
+                } else {
+                    item.shortcut.chars().count() + 2
+                };
+                2 + item.label.chars().count() + min_gap + shortcut_len + 1
             })
             .max()
             .unwrap_or(18) as u16;
@@ -920,6 +962,16 @@ impl App {
         }
     }
 
+    fn set_all_vars_enabled(&mut self, enabled: bool) {
+        if let Some(coll) = self.current_collection_mut() {
+            for var in &mut coll.vars {
+                var.enabled = enabled;
+            }
+            self.clamp_selections();
+            self.sync_to_system_silent();
+        }
+    }
+
     pub fn sync_all_phase_collections(&mut self) {
         let has_any_phase = self
             .data
@@ -984,6 +1036,8 @@ impl App {
         match action {
             ContextAction::ToggleCollection => self.toggle_current_collection(),
             ContextAction::ToggleVar => self.toggle_current_var(),
+            ContextAction::EnableAllVars => self.set_all_vars_enabled(true),
+            ContextAction::DisableAllVars => self.set_all_vars_enabled(false),
             ContextAction::Edit => self.handle_edit_action(),
             ContextAction::Delete => self.handle_delete_action(),
             ContextAction::MoveUp => self.move_selected_collection_up(),
@@ -1012,52 +1066,52 @@ impl App {
                     items.push(ContextMenuItem {
                         label: "Edit Collection".to_string(),
                         shortcut: "Ctrl+E",
-                        action: ContextAction::Edit,
+                        action: Some(ContextAction::Edit),
                         is_danger: false,
                     });
                     items.push(ContextMenuItem {
                         label: toggle_label.to_string(),
                         shortcut: "Space",
-                        action: ContextAction::ToggleCollection,
+                        action: Some(ContextAction::ToggleCollection),
                         is_danger: false,
                     });
                     items.push(ContextMenuItem {
                         label: "Move Priority Up".to_string(),
                         shortcut: "u",
-                        action: ContextAction::MoveUp,
+                        action: Some(ContextAction::MoveUp),
                         is_danger: false,
                     });
                     items.push(ContextMenuItem {
                         label: "Move Priority Down".to_string(),
                         shortcut: "d",
-                        action: ContextAction::MoveDown,
+                        action: Some(ContextAction::MoveDown),
                         is_danger: false,
                     });
                     if coll.is_phase() {
                         items.push(ContextMenuItem {
                             label: "Sync Environment".to_string(),
                             shortcut: "Ctrl+B",
-                            action: ContextAction::PhaseSync,
+                            action: Some(ContextAction::PhaseSync),
                             is_danger: false,
                         });
                         items.push(ContextMenuItem {
                             label: "Change Phase App/Env".to_string(),
                             shortcut: "P",
-                            action: ContextAction::PhaseRebind,
+                            action: Some(ContextAction::PhaseRebind),
                             is_danger: false,
                         });
                     } else {
                         items.push(ContextMenuItem {
                             label: "Add Variable".to_string(),
                             shortcut: "Ctrl+A",
-                            action: ContextAction::AddVar,
+                            action: Some(ContextAction::AddVar),
                             is_danger: false,
                         });
                         if coll.has_phase_vars() {
                             items.push(ContextMenuItem {
                                 label: "Sync Phase Variables".to_string(),
                                 shortcut: "Ctrl+B",
-                                action: ContextAction::PhaseSync,
+                                action: Some(ContextAction::PhaseSync),
                                 is_danger: false,
                             });
                         }
@@ -1065,20 +1119,20 @@ impl App {
                     items.push(ContextMenuItem {
                         label: "New Collection".to_string(),
                         shortcut: "Ctrl+N",
-                        action: ContextAction::NewCollection,
+                        action: Some(ContextAction::NewCollection),
                         is_danger: false,
                     });
                     items.push(ContextMenuItem {
                         label: "Delete Collection".to_string(),
                         shortcut: "Delete",
-                        action: ContextAction::Delete,
+                        action: Some(ContextAction::Delete),
                         is_danger: true,
                     });
                 } else {
                     items.push(ContextMenuItem {
                         label: "New Collection".to_string(),
                         shortcut: "Ctrl+N",
-                        action: ContextAction::NewCollection,
+                        action: Some(ContextAction::NewCollection),
                         is_danger: false,
                     });
                 }
@@ -1093,13 +1147,13 @@ impl App {
                     items.push(ContextMenuItem {
                         label: "Edit Variable".to_string(),
                         shortcut: "Ctrl+E",
-                        action: ContextAction::Edit,
+                        action: Some(ContextAction::Edit),
                         is_danger: false,
                     });
                     items.push(ContextMenuItem {
                         label: "Delete Variable".to_string(),
                         shortcut: "Delete",
-                        action: ContextAction::Delete,
+                        action: Some(ContextAction::Delete),
                         is_danger: true,
                     });
                 }
@@ -1112,7 +1166,7 @@ impl App {
                     items.push(ContextMenuItem {
                         label: toggle_label.to_string(),
                         shortcut: "Space",
-                        action: ContextAction::ToggleVar,
+                        action: Some(ContextAction::ToggleVar),
                         is_danger: false,
                     });
                 }
@@ -1120,21 +1174,21 @@ impl App {
                     items.push(ContextMenuItem {
                         label: "Sync Environment".to_string(),
                         shortcut: "Ctrl+B",
-                        action: ContextAction::PhaseSync,
+                        action: Some(ContextAction::PhaseSync),
                         is_danger: false,
                     });
                 } else {
                     items.push(ContextMenuItem {
                         label: "Add Variable".to_string(),
                         shortcut: "Ctrl+A",
-                        action: ContextAction::AddVar,
+                        action: Some(ContextAction::AddVar),
                         is_danger: false,
                     });
                     if has_phase_vars {
                         items.push(ContextMenuItem {
                             label: "Sync Phase Variables".to_string(),
                             shortcut: "Ctrl+B",
-                            action: ContextAction::PhaseSync,
+                            action: Some(ContextAction::PhaseSync),
                             is_danger: false,
                         });
                     }
@@ -1143,13 +1197,26 @@ impl App {
                     items.push(ContextMenuItem {
                         label: "Copy Key".to_string(),
                         shortcut: "Y",
-                        action: ContextAction::CopyKey,
+                        action: Some(ContextAction::CopyKey),
                         is_danger: false,
                     });
                     items.push(ContextMenuItem {
                         label: "Copy Value".to_string(),
                         shortcut: "Shift+Y",
-                        action: ContextAction::CopyValue,
+                        action: Some(ContextAction::CopyValue),
+                        is_danger: false,
+                    });
+                    items.push(ContextMenuItem::divider());
+                    items.push(ContextMenuItem {
+                        label: "Enable All".to_string(),
+                        shortcut: "",
+                        action: Some(ContextAction::EnableAllVars),
+                        is_danger: false,
+                    });
+                    items.push(ContextMenuItem {
+                        label: "Disable All".to_string(),
+                        shortcut: "",
+                        action: Some(ContextAction::DisableAllVars),
                         is_danger: false,
                     });
                 }
@@ -1160,43 +1227,44 @@ impl App {
                     items.push(ContextMenuItem {
                         label: "Edit Variable".to_string(),
                         shortcut: "Ctrl+E",
-                        action: ContextAction::Edit,
+                        action: Some(ContextAction::Edit),
                         is_danger: false,
                     });
                     items.push(ContextMenuItem {
                         label: "Delete Variable".to_string(),
                         shortcut: "Delete",
-                        action: ContextAction::Delete,
+                        action: Some(ContextAction::Delete),
                         is_danger: true,
                     });
                     items.push(ContextMenuItem {
                         label: "Copy Key".to_string(),
                         shortcut: "Y",
-                        action: ContextAction::CopyKey,
+                        action: Some(ContextAction::CopyKey),
                         is_danger: false,
                     });
                     items.push(ContextMenuItem {
                         label: "Copy Value".to_string(),
                         shortcut: "Shift+Y",
-                        action: ContextAction::CopyValue,
+                        action: Some(ContextAction::CopyValue),
                         is_danger: false,
                     });
                 }
                 items.push(ContextMenuItem {
                     label: "Reload Shell Env".to_string(),
                     shortcut: "Ctrl+S",
-                    action: ContextAction::ReloadShell,
+                    action: Some(ContextAction::ReloadShell),
                     is_danger: false,
                 });
             }
         };
 
         if !items.is_empty() {
+            let selected = items.iter().position(|i| !i.is_divider()).unwrap_or(0);
             self.context_menu = Some(ContextMenu {
                 x,
                 y,
                 items,
-                selected: 0,
+                selected,
             });
         }
     }
@@ -1212,16 +1280,17 @@ impl App {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {}
             KeyCode::Up | KeyCode::Char('k') => {
-                menu.selected = (menu.selected + len - 1) % len;
+                menu.move_selection(false);
                 self.context_menu = Some(menu);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                menu.selected = (menu.selected + 1) % len;
+                menu.move_selection(true);
                 self.context_menu = Some(menu);
             }
             KeyCode::Enter => {
-                let action = menu.items[menu.selected].action;
-                self.execute_context_action(action);
+                if let Some(action) = menu.items.get(menu.selected).and_then(|i| i.action) {
+                    self.execute_context_action(action);
+                }
             }
             KeyCode::Delete => {
                 self.execute_context_action(ContextAction::Delete);
@@ -3443,17 +3512,34 @@ impl App {
         frame.render_widget(Clear, popup);
 
         let inner_width = popup.width.saturating_sub(2) as usize;
+        let menu_bg = Color::Rgb(20, 26, 38);
         let items: Vec<ListItem> = menu
             .items
             .iter()
             .enumerate()
             .map(|(idx, item)| {
+                if item.is_divider() {
+                    let line = Line::from(Span::styled(
+                        "─".repeat(inner_width),
+                        Style::default().fg(Color::Rgb(65, 85, 115)).bg(menu_bg),
+                    ));
+                    return ListItem::new(line).style(Style::default().bg(menu_bg));
+                }
+
                 let is_sel = idx == menu.selected;
-                let shortcut_str = format!("[{}]", item.shortcut);
+                let shortcut_str = if item.shortcut.is_empty() {
+                    String::new()
+                } else {
+                    format!("[{}]", item.shortcut)
+                };
 
                 let prefix = if is_sel { "▸ " } else { "  " };
                 let left_len = 2 + item.label.chars().count();
-                let right_len = shortcut_str.chars().count() + 1;
+                let right_len = if shortcut_str.is_empty() {
+                    1
+                } else {
+                    shortcut_str.chars().count() + 1
+                };
 
                 let pad = inner_width.saturating_sub(left_len + right_len);
                 let spaces = " ".repeat(pad);
@@ -3465,12 +3551,12 @@ impl App {
                         (Color::White, Color::Cyan, Color::Rgb(40, 68, 105))
                     }
                 } else if item.is_danger {
-                    (Color::LightRed, Color::DarkGray, Color::Rgb(20, 26, 38))
+                    (Color::LightRed, Color::DarkGray, menu_bg)
                 } else {
-                    (Color::White, Color::DarkGray, Color::Rgb(20, 26, 38))
+                    (Color::White, Color::DarkGray, menu_bg)
                 };
 
-                let line = Line::from(vec![
+                let mut spans = vec![
                     Span::styled(
                         format!("{}{}", prefix, item.label),
                         Style::default()
@@ -3483,12 +3569,16 @@ impl App {
                             }),
                     ),
                     Span::styled(spaces, Style::default().bg(row_bg)),
-                    Span::styled(
+                ];
+                if shortcut_str.is_empty() {
+                    spans.push(Span::styled(" ", Style::default().bg(row_bg)));
+                } else {
+                    spans.push(Span::styled(
                         format!("{} ", shortcut_str),
                         Style::default().fg(fg_key).bg(row_bg),
-                    ),
-                ]);
-                ListItem::new(line).style(Style::default().bg(row_bg))
+                    ));
+                }
+                ListItem::new(Line::from(spans)).style(Style::default().bg(row_bg))
             })
             .collect();
 
@@ -4927,32 +5017,35 @@ impl App {
                 MouseEventKind::Moved => {
                     if in_menu_rows {
                         let idx = (mouse.row - inner_top) as usize;
-                        if idx < menu.items.len() {
-                            menu.selected = idx;
+                        if let Some(item) = menu.items.get(idx) {
+                            if !item.is_divider() {
+                                menu.selected = idx;
+                            }
                         }
                     }
                     self.context_menu = Some(menu);
                     return;
                 }
                 MouseEventKind::ScrollUp => {
-                    if !menu.items.is_empty() {
-                        menu.selected = (menu.selected + menu.items.len() - 1) % menu.items.len();
-                    }
+                    menu.move_selection(false);
                     self.context_menu = Some(menu);
                     return;
                 }
                 MouseEventKind::ScrollDown => {
-                    if !menu.items.is_empty() {
-                        menu.selected = (menu.selected + 1) % menu.items.len();
-                    }
+                    menu.move_selection(true);
                     self.context_menu = Some(menu);
                     return;
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
                     if in_menu_rows {
                         let idx = (mouse.row - inner_top) as usize;
-                        if let Some(action) = menu.items.get(idx).map(|i| i.action) {
-                            self.execute_context_action(action);
+                        if let Some(item) = menu.items.get(idx) {
+                            if let Some(action) = item.action {
+                                self.execute_context_action(action);
+                                return;
+                            }
+                            self.context_menu = Some(menu);
+                            return;
                         }
                     }
                     return;
@@ -7614,10 +7707,18 @@ mod tests {
         assert!(content_vars.contains("Copy Value"));
         assert!(content_vars.contains("[Y]"));
         assert!(content_vars.contains("[Shift+Y]"));
+        let vars_items = app.context_menu.as_ref().unwrap().items.clone();
         let vars_bracket_col = vars_menu_rect.x + vars_menu_rect.width - 3;
-        for row in (vars_menu_rect.y + 1)..(vars_menu_rect.y + vars_menu_rect.height - 1) {
+        for (idx, item) in vars_items.iter().enumerate() {
+            let row = vars_menu_rect.y + 1 + idx as u16;
             let ch = buffer[(vars_bracket_col, row)].symbol();
-            assert_eq!(ch, "]", "Vars shortcut right bracket must be right-aligned at col {}", vars_bracket_col);
+            if item.is_divider() {
+                assert_eq!(ch, "─", "Divider row must render horizontal rule at row {}", row);
+            } else if item.shortcut.is_empty() {
+                assert_eq!(ch, " ", "Shortcut-less item '{}' must not render brackets", item.label);
+            } else {
+                assert_eq!(ch, "]", "Vars shortcut right bracket must be right-aligned at col {}", vars_bracket_col);
+            }
         }
         app.context_menu = None;
 
@@ -9448,7 +9549,7 @@ mod tests {
         app.selected_var = 1; // PHASE_ONLY
         app.open_context_menu_for_pane(FocusPane::Vars, 10, 10);
         let menu = app.context_menu.as_ref().expect("context menu open");
-        assert!(menu.items.iter().any(|i| i.label == "Disable Variable" && i.action == ContextAction::ToggleVar));
+        assert!(menu.items.iter().any(|i| i.label == "Disable Variable" && i.action == Some(ContextAction::ToggleVar)));
         app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
         assert!(app.context_menu.is_none());
         assert!(!app.data.collections[1].vars[1].enabled);
@@ -9478,5 +9579,125 @@ mod tests {
         let eff_re = app.data.compute_effective_vars();
         assert_eq!(eff_re.len(), 1);
         assert_eq!(eff_re[0].key, "MANUAL_VAR");
+    }
+
+    #[test]
+    fn test_vars_context_menu_enable_all_disable_all_with_divider() {
+        let mut app = make_test_app();
+        let area = Rect::new(0, 0, 120, 30);
+        app.last_area = area;
+
+        // Custom collection with 2 vars (one enabled, one disabled)
+        app.data.collections[0].vars.push(EnvVar::new(
+            "SECOND_VAR".to_string(),
+            "val2".to_string(),
+            VarSource::Custom,
+        ));
+        app.data.collections[0].vars[1].enabled = false;
+
+        // Open Vars context menu
+        app.focus = FocusPane::Vars;
+        app.selected_collection = 0;
+        app.selected_var = 0;
+        app.open_context_menu_for_pane(FocusPane::Vars, 35, 5);
+        let menu = app.context_menu.as_ref().expect("Vars context menu open");
+
+        // Divider separates individual-item actions from Enable All / Disable All at bottom
+        let len = menu.items.len();
+        assert!(len >= 4);
+        assert!(menu.items[len - 3].is_divider());
+        assert_eq!(menu.items[len - 2].label, "Enable All");
+        assert_eq!(menu.items[len - 2].shortcut, "");
+        assert_eq!(menu.items[len - 2].action, Some(ContextAction::EnableAllVars));
+        assert_eq!(menu.items[len - 1].label, "Disable All");
+        assert_eq!(menu.items[len - 1].shortcut, "");
+        assert_eq!(menu.items[len - 1].action, Some(ContextAction::DisableAllVars));
+        let popup = menu.rect(area);
+
+        // Render and verify horizontal divider and absence of [] brackets on Enable All / Disable All
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        let enable_row = rows.iter().find(|r| r.contains("Enable All")).expect("Enable All row");
+        let disable_row = rows.iter().find(|r| r.contains("Disable All")).expect("Disable All row");
+        assert!(!enable_row.contains("[]"), "Enable All must not show shortcut brackets");
+        assert!(!disable_row.contains("[]"), "Disable All must not show shortcut brackets");
+        let divider_y = (popup.y + 1 + (len - 3) as u16) as usize;
+        assert!(rows[divider_y].contains("────────"), "Horizontal divider must render above Enable All");
+
+        // Clicking the divider keeps menu open and does not select the divider
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: popup.x + 3,
+            row: divider_y as u16,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.context_menu.is_some());
+
+        // Keyboard navigation (Up from item 0 wraps to Disable All; Up again goes to Enable All; Up again skips divider)
+        app.handle_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(app.context_menu.as_ref().unwrap().selected, len - 1);
+        app.handle_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(app.context_menu.as_ref().unwrap().selected, len - 2);
+        app.handle_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(app.context_menu.as_ref().unwrap().selected, len - 4);
+        app.handle_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(app.context_menu.as_ref().unwrap().selected, len - 2);
+
+        // Click "Disable All" -> disables all vars in current collection
+        let disable_y = popup.y + 1 + (len - 1) as u16;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: popup.x + 3,
+            row: disable_y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.context_menu.is_none());
+        assert!(app.data.collections[0].vars.iter().all(|v| !v.enabled));
+        assert!(app.data.compute_effective_vars().is_empty());
+
+        // Also works on Phase.dev collections; click "Enable All" enables all vars
+        app.data.collections.push(Collection::new_phase(
+            "phase_prod".to_string(),
+            PhaseBinding {
+                app_id: "app1".to_string(),
+                app_name: "api".to_string(),
+                env_id: "env1".to_string(),
+                env_name: "prod".to_string(),
+                export_all_paths: true,
+            },
+            vec![
+                ("P1".to_string(), "v1".to_string(), String::new()),
+                ("P2".to_string(), "v2".to_string(), String::new()),
+            ],
+        ));
+        app.selected_collection = 1;
+        app.data.collections[1].vars[0].enabled = false;
+        app.data.collections[1].vars[1].enabled = false;
+
+        app.open_context_menu_for_pane(FocusPane::Vars, 35, 5);
+        let phase_menu = app.context_menu.as_ref().unwrap();
+        let p_len = phase_menu.items.len();
+        let p_popup = phase_menu.rect(area);
+        assert!(phase_menu.items[p_len - 3].is_divider());
+        assert_eq!(phase_menu.items[p_len - 2].action, Some(ContextAction::EnableAllVars));
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: p_popup.x + 3,
+            row: p_popup.y + 1 + (p_len - 2) as u16,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.data.collections[1].vars.iter().all(|v| v.enabled));
+        assert_eq!(app.data.compute_effective_vars().len(), 2);
+
+        // Collections and Effective panes do NOT include Enable All / Disable All
+        app.open_context_menu_for_pane(FocusPane::Collections, 5, 5);
+        assert!(!app.context_menu.as_ref().unwrap().items.iter().any(|i| i.label == "Enable All" || i.label == "Disable All"));
+        app.open_context_menu_for_pane(FocusPane::Effective, 35, 20);
+        assert!(!app.context_menu.as_ref().unwrap().items.iter().any(|i| i.label == "Enable All" || i.label == "Disable All"));
     }
 }
