@@ -1,0 +1,201 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --locked
+
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Linux cross-compilation toolchain
+        if: startsWith(matrix.os, 'ubuntu')
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package archive
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/envmgr" dist/envmgr
+          tar -C dist -czf "envmgr-${{ matrix.target }}.tar.gz" envmgr
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: envmgr-${{ matrix.target }}
+          path: envmgr-${{ matrix.target }}.tar.gz
+
+  release:
+    name: Publish Release
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum envmgr-*.tar.gz > checksums.txt
+
+      - name: Generate changelog
+        env:
+          CURRENT_TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+
+          tag = os.environ["CURRENT_TAG"]
+          repo = os.environ["REPO"]
+
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+
+          prev_tag = ""
+          try:
+              prev_tag = git("describe", "--tags", "--abbrev=0", f"{tag}^")
+          except subprocess.CalledProcessError:
+              prev_tag = ""
+
+          rev_range = f"{prev_tag}..{tag}" if prev_tag else tag
+          log_out = git("log", "--no-merges", "--pretty=format:%s\t%h", rev_range)
+
+          sections_order = [
+              ("Features", []),
+              ("Bug Fixes", []),
+              ("Performance & Refactoring", []),
+              ("Documentation & Maintenance", []),
+              ("Other Changes", []),
+          ]
+          by_title = {title: items for title, items in sections_order}
+          kind_to_title = {
+              "feat": "Features",
+              "fix": "Bug Fixes",
+              "perf": "Performance & Refactoring",
+              "refactor": "Performance & Refactoring",
+              "docs": "Documentation & Maintenance",
+              "chore": "Documentation & Maintenance",
+              "ci": "Documentation & Maintenance",
+              "build": "Documentation & Maintenance",
+              "test": "Documentation & Maintenance",
+              "style": "Documentation & Maintenance",
+          }
+
+          pattern = re.compile(r"^([a-zA-Z]+)(?:\(([^)]+)\))?(!)?:\s*(.+)$")
+
+          for line in log_out.splitlines():
+              if not line.strip():
+                  continue
+              subject, short_hash = line.rsplit("\t", 1)
+              m = pattern.match(subject)
+              if m:
+                  kind, scope, breaking, desc = m.groups()
+                  kind = kind.lower()
+                  prefix = f"**{scope}**: " if scope else ""
+                  if breaking:
+                      prefix = f"**BREAKING** {prefix}"
+                  entry = f"- {prefix}{desc} (`{short_hash}`)"
+                  title = kind_to_title.get(kind, "Other Changes")
+                  by_title[title].append(entry)
+              else:
+                  by_title["Other Changes"].append(f"- {subject} (`{short_hash}`)")
+
+          sections = [
+              f"### {title}\n\n" + "\n".join(items)
+              for title, items in sections_order
+              if items
+          ]
+
+          lines = ["## What's Changed", ""]
+          if sections:
+              lines.append("\n\n".join(sections))
+          else:
+              lines.append("_No changes recorded._")
+
+          lines.extend([
+              "",
+              "## Install",
+              "",
+              "```sh",
+              f"curl -fsSL https://raw.githubusercontent.com/{repo}/main/install.sh | ENVMGR_VERSION={tag} sh",
+              "```",
+          ])
+
+          if prev_tag:
+              lines.extend([
+                  "",
+                  f"**Full Changelog**: https://github.com/{repo}/compare/{prev_tag}...{tag}",
+              ])
+
+          with open("release_notes.md", "w", encoding="utf-8") as f:
+              f.write("\n".join(lines) + "\n")
+          PY
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body_path: release_notes.md
+          files: |
+            artifacts/*.tar.gz
+            artifacts/checksums.txt
