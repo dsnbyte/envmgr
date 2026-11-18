@@ -268,6 +268,8 @@ pub enum VarSource {
 pub struct EnvVar {
     pub key: String,
     pub value: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     #[serde(default)]
     pub comment: String,
     #[serde(default)]
@@ -301,6 +303,7 @@ impl EnvVar {
         Self {
             key,
             value,
+            enabled: true,
             comment,
             prefix,
             suffix,
@@ -319,6 +322,7 @@ impl EnvVar {
         Self {
             key,
             value,
+            enabled: true,
             comment,
             prefix,
             suffix,
@@ -449,7 +453,8 @@ impl Collection {
         }
     }
 
-    /// Replaces the collection's variables exclusively with Phase.dev variables for the bound app/env.
+    /// Replaces the collection's variables exclusively with Phase.dev variables for the bound app/env,
+    /// preserving individual variable enabled/disabled states for matching keys.
     pub fn set_phase_vars(
         &mut self,
         binding: PhaseBinding,
@@ -457,11 +462,17 @@ impl Collection {
     ) {
         let app_name = binding.app_name.clone();
         let env_name = binding.env_name.clone();
+        let prev_enabled: HashMap<String, bool> = self
+            .vars
+            .iter()
+            .map(|v| (v.key.clone(), v.enabled))
+            .collect();
         self.phase_binding = Some(binding);
         self.last_sync_epoch = Some(AppStateData::current_epoch_secs());
         self.vars.clear();
         for (k, v, c) in fetched {
-            self.vars.push(EnvVar::with_comment(
+            let enabled = prev_enabled.get(&k).copied().unwrap_or(true);
+            let mut var = EnvVar::with_comment(
                 k,
                 v,
                 c,
@@ -469,7 +480,9 @@ impl Collection {
                     app_name: app_name.clone(),
                     env_name: env_name.clone(),
                 },
-            ));
+            );
+            var.enabled = enabled;
+            self.vars.push(var);
         }
     }
 
@@ -642,8 +655,9 @@ impl AppStateData {
 
     /// Computes the final effective environment variables.
     /// Rules:
-    /// 1. Only enabled collections contribute variables.
-    /// 2. Among enabled collections, the collection highest in the list (smallest index, e.g. #1 at top) wins!
+    /// 1. Only enabled collections contribute variables (disabling a collection disables all its vars).
+    /// 2. Within an enabled collection, only individually enabled variables are included.
+    /// 3. Among enabled variables, the collection highest in the list (smallest index, e.g. #1 at top) wins!
     pub fn compute_effective_vars(&self) -> Vec<EffectiveVar> {
         let mut map: HashMap<String, EffectiveVar> = HashMap::new();
         let mut order: Vec<String> = Vec::new();
@@ -655,6 +669,9 @@ impl AppStateData {
             }
             let owner = collection.name.clone();
             for var in &collection.vars {
+                if !var.enabled {
+                    continue;
+                }
                 if !map.contains_key(&var.key) {
                     order.push(var.key.clone());
                 }
@@ -1160,5 +1177,95 @@ mod tests {
         assert_eq!(manual.source_label, "Manual");
         assert_eq!(root_ref.source_label, "Phase (backend_api/production)");
         assert_eq!(folder_ref.source_label, "Phase (backend_api/production/backend/payments)");
+    }
+
+    #[test]
+    fn test_individual_variable_enable_disable_and_collection_override() {
+        let binding = PhaseBinding {
+            app_id: "app1".to_string(),
+            app_name: "api".to_string(),
+            env_id: "env1".to_string(),
+            env_name: "prod".to_string(),
+            export_all_paths: true,
+        };
+
+        let mut custom_top = Collection::new_custom("custom_top".to_string());
+        let mut v_manual_disabled = EnvVar::new("SHARED".to_string(), "top_val".to_string(), VarSource::Custom);
+        v_manual_disabled.enabled = false;
+        let v_manual_enabled = EnvVar::new("TOP_ONLY".to_string(), "1".to_string(), VarSource::Custom);
+        let mut v_phase_ref_disabled = EnvVar::with_phase_ref(
+            "REF_KEY".to_string(),
+            "ref_val".to_string(),
+            String::new(),
+            Some(PhaseVarRef {
+                app_id: "app1".to_string(),
+                app_name: "api".to_string(),
+                env_id: "env1".to_string(),
+                env_name: "prod".to_string(),
+                path: "/".to_string(),
+                secret_key: "REF_KEY".to_string(),
+            }),
+        );
+        v_phase_ref_disabled.enabled = false;
+        custom_top.vars = vec![v_manual_disabled, v_manual_enabled, v_phase_ref_disabled];
+
+        let mut phase_coll = Collection::new_phase(
+            "phase_prod".to_string(),
+            binding.clone(),
+            vec![
+                ("SHARED".to_string(), "phase_val".to_string(), String::new()),
+                ("PHASE_ON".to_string(), "yes".to_string(), String::new()),
+                ("PHASE_OFF".to_string(), "no".to_string(), String::new()),
+            ],
+        );
+        phase_coll.vars[2].enabled = false;
+
+        let mut state = AppStateData {
+            phase: PhaseConfig::default(),
+            collections: vec![custom_top, phase_coll],
+            settings: AppSettings::default(),
+            last_phase_sync_epoch: 0,
+        };
+
+        // Enabled collections include only individually enabled vars; disabled SHARED in top falls back to phase_coll
+        let eff = state.compute_effective_vars();
+        let map: HashMap<_, _> = eff.iter().map(|v| (v.key.as_str(), v)).collect();
+        assert_eq!(map.len(), 3);
+        assert_eq!(map["TOP_ONLY"].value, "1");
+        assert_eq!(map["SHARED"].value, "phase_val");
+        assert_eq!(map["SHARED"].winning_owner, "phase_prod");
+        assert_eq!(map["PHASE_ON"].value, "yes");
+        assert!(!map.contains_key("REF_KEY"));
+        assert!(!map.contains_key("PHASE_OFF"));
+
+        // Disabling phase_prod disables ALL its variables regardless of individual var.enabled states
+        state.collections[1].enabled = false;
+        let eff_after_disable_phase = state.compute_effective_vars();
+        assert_eq!(eff_after_disable_phase.len(), 1);
+        assert_eq!(eff_after_disable_phase[0].key, "TOP_ONLY");
+
+        // Re-enabling phase_prod restores only individually enabled variables (PHASE_OFF stays disabled)
+        state.collections[1].enabled = true;
+        // Resyncing phase collection preserves individual variable enabled states and defaults new vars to true
+        state.collections[1].set_phase_vars(
+            binding,
+            vec![
+                ("SHARED".to_string(), "phase_val_v2".to_string(), String::new()),
+                ("PHASE_ON".to_string(), "yes_v2".to_string(), String::new()),
+                ("PHASE_OFF".to_string(), "no_v2".to_string(), String::new()),
+                ("PHASE_NEW".to_string(), "new_val".to_string(), String::new()),
+            ],
+        );
+        assert!(state.collections[1].vars[0].enabled);
+        assert!(state.collections[1].vars[1].enabled);
+        assert!(!state.collections[1].vars[2].enabled);
+        assert!(state.collections[1].vars[3].enabled);
+
+        let eff_resynced = state.compute_effective_vars();
+        let map2: HashMap<_, _> = eff_resynced.iter().map(|v| (v.key.as_str(), v)).collect();
+        assert_eq!(map2.len(), 4);
+        assert_eq!(map2["SHARED"].value, "phase_val_v2");
+        assert_eq!(map2["PHASE_NEW"].value, "new_val");
+        assert!(!map2.contains_key("PHASE_OFF"));
     }
 }

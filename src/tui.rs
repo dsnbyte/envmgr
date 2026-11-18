@@ -125,6 +125,7 @@ pub enum Modal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextAction {
     ToggleCollection,
+    ToggleVar,
     Edit,
     Delete,
     MoveUp,
@@ -698,7 +699,7 @@ impl App {
                 if !coll.enabled {
                     continue;
                 }
-                if let Some(v_idx) = coll.vars.iter().position(|v| v.key == ev.key) {
+                if let Some(v_idx) = coll.vars.iter().position(|v| v.enabled && v.key == ev.key) {
                     if coll.is_phase() {
                         let cname = coll.name.clone();
                         let vkey = ev.key.clone();
@@ -764,7 +765,7 @@ impl App {
                 .collections
                 .iter()
                 .filter(|c| c.enabled)
-                .find_map(|c| c.vars.iter().find(|v| v.key == ev.key))
+                .find_map(|c| c.vars.iter().find(|v| v.enabled && v.key == ev.key))
                 .map(|v| v.comment.clone())
                 .unwrap_or_default();
             self.modal = Modal::VarDetail {
@@ -839,7 +840,7 @@ impl App {
                 if !coll.enabled {
                     continue;
                 }
-                if let Some(v_idx) = coll.vars.iter().position(|v| v.key == ev.key) {
+                if let Some(v_idx) = coll.vars.iter().position(|v| v.enabled && v.key == ev.key) {
                     if coll.is_phase() {
                         let cname = coll.name.clone();
                         let vkey = ev.key.clone();
@@ -903,7 +904,19 @@ impl App {
     fn toggle_current_collection(&mut self) {
         if let Some(coll) = self.current_collection_mut() {
             coll.enabled = !coll.enabled;
+            self.clamp_selections();
             self.sync_to_system_silent();
+        }
+    }
+
+    fn toggle_current_var(&mut self) {
+        let var_idx = self.selected_var;
+        if let Some(coll) = self.current_collection_mut() {
+            if let Some(var) = coll.vars.get_mut(var_idx) {
+                var.enabled = !var.enabled;
+                self.clamp_selections();
+                self.sync_to_system_silent();
+            }
         }
     }
 
@@ -970,6 +983,7 @@ impl App {
     pub fn execute_context_action(&mut self, action: ContextAction) {
         match action {
             ContextAction::ToggleCollection => self.toggle_current_collection(),
+            ContextAction::ToggleVar => self.toggle_current_var(),
             ContextAction::Edit => self.handle_edit_action(),
             ContextAction::Delete => self.handle_delete_action(),
             ContextAction::MoveUp => self.move_selected_collection_up(),
@@ -1089,6 +1103,19 @@ impl App {
                         is_danger: true,
                     });
                 }
+                if let Some(var) = self.current_vars().get(self.selected_var) {
+                    let toggle_label = if var.enabled {
+                        "Disable Variable"
+                    } else {
+                        "Enable Variable"
+                    };
+                    items.push(ContextMenuItem {
+                        label: toggle_label.to_string(),
+                        shortcut: "Space",
+                        action: ContextAction::ToggleVar,
+                        is_danger: false,
+                    });
+                }
                 if is_phase {
                     items.push(ContextMenuItem {
                         label: "Sync Environment".to_string(),
@@ -1199,7 +1226,10 @@ impl App {
             KeyCode::Delete => {
                 self.execute_context_action(ContextAction::Delete);
             }
-            KeyCode::Char(' ') => self.execute_context_action(ContextAction::ToggleCollection),
+            KeyCode::Char(' ') => match self.focus {
+                FocusPane::Vars => self.execute_context_action(ContextAction::ToggleVar),
+                _ => self.execute_context_action(ContextAction::ToggleCollection),
+            },
             KeyCode::Char('u') => self.execute_context_action(ContextAction::MoveUp),
             KeyCode::Char('d') => self.execute_context_action(ContextAction::MoveDown),
             KeyCode::Char('P') => self.execute_context_action(ContextAction::PhaseRebind),
@@ -1309,6 +1339,9 @@ impl App {
                 if self.selected_var + 1 < len {
                     self.selected_var += 1;
                 }
+            }
+            KeyCode::Char(' ') => {
+                self.toggle_current_var();
             }
             KeyCode::Enter if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.open_var_detail();
@@ -3151,10 +3184,25 @@ impl App {
         let max_val_width = vars_cols[1].width as usize;
 
         let coll_opt = self.current_collection();
+        let coll_enabled = coll_opt.map(|c| c.enabled).unwrap_or(true);
         let vars = self.current_vars();
         let rows: Vec<Row> = vars
             .iter()
             .map(|v| {
+                let is_active = coll_enabled && v.enabled;
+                let check = if v.enabled { "[✓] " } else { "[ ] " };
+                let check_style = if !coll_enabled {
+                    Style::default().fg(Color::DarkGray)
+                } else if v.enabled {
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let text_style = if is_active {
+                    Style::default()
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
                 let val_display = truncate_with_ellipsis(
                     v.masked_display(self.show_values),
                     max_val_width,
@@ -3163,9 +3211,12 @@ impl App {
                     .map(|c| c.var_source_label(v))
                     .unwrap_or_else(|| "Manual".to_string());
                 Row::new(vec![
-                    Cell::from(v.key.clone()),
-                    Cell::from(val_display),
-                    Cell::from(source_label),
+                    Cell::from(Line::from(vec![
+                        Span::styled(check, check_style),
+                        Span::styled(v.key.clone(), text_style),
+                    ])),
+                    Cell::from(Span::styled(val_display, text_style)),
+                    Cell::from(Span::styled(source_label, text_style)),
                 ])
             })
             .collect();
@@ -4685,7 +4736,7 @@ impl App {
                     ]),
                     Line::from(vec![
                         Span::styled("  [Space]            ", key_style),
-                        Span::styled("Toggle selected collection ON / OFF", desc_style),
+                        Span::styled("Toggle selected collection or variable ON / OFF", desc_style),
                     ]),
                     Line::from(vec![
                         Span::styled("  [u / d]            ", key_style),
@@ -4991,7 +5042,12 @@ impl App {
                     self.focus = FocusPane::Vars;
                     if let Some(idx) = self.var_index_at_row(vars_rect, mouse.row) {
                         self.selected_var = idx;
-                        if self.register_var_click(FocusPane::Vars, idx) {
+                        let check_start = vars_rect.x.saturating_add(4);
+                        let check_end = vars_rect.x.saturating_add(7);
+                        if mouse.column >= check_start && mouse.column < check_end {
+                            self.last_var_click = None;
+                            self.toggle_current_var();
+                        } else if self.register_var_click(FocusPane::Vars, idx) {
                             self.open_var_detail();
                         }
                     } else {
@@ -6897,7 +6953,7 @@ mod tests {
         // 3. Left-click the second variable ("SECOND_KEY" at row vars_rect.y + 4)
         app.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: vars_rect.x + 5,
+            column: vars_rect.x + 8,
             row: vars_rect.y + 4,
             modifiers: KeyModifiers::empty(),
         });
@@ -9151,12 +9207,12 @@ mod tests {
         app.handle_key(KeyEvent::from(KeyCode::Esc));
         assert!(matches!(app.modal, Modal::None));
 
-        // 3. Double-click in Vars pane opens VarDetail
+        // 3. Double-click in Vars pane (on key text, right of checkbox) opens VarDetail
         let (_, _, vars_rect, effective_rect, _) = compute_layout_chunks(area);
         let vars_row_y = vars_rect.y + 3; // border(1) + top padding(1) + header(1) = row 0
         let click_vars = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
-            column: vars_rect.x + 4,
+            column: vars_rect.x + 8,
             row: vars_row_y,
             modifiers: KeyModifiers::NONE,
         };
@@ -9308,5 +9364,119 @@ mod tests {
         assert!(matches!(app.modal, Modal::PhaseVarPicker { picker_step: 1, selected_env: 1, .. }));
         assert!(screen_prod.contains("/payments"));
         assert!(screen_prod.contains("PROD_PAYMENT_KEY"));
+    }
+
+    #[test]
+    fn test_toggle_individual_var_keyboard_mouse_and_context_menu_across_collection_types() {
+        let mut app = make_test_app();
+        let area = Rect::new(0, 0, 120, 30);
+        app.last_area = area;
+
+        // Collection 0 (default, Custom/Manual) has one manual var and one Phase-ref var
+        app.data.collections[0].vars.clear();
+        app.data.collections[0].vars.push(EnvVar::new(
+            "MANUAL_VAR".to_string(),
+            "manual_val".to_string(),
+            VarSource::Custom,
+        ));
+        app.data.collections[0].vars.push(EnvVar::with_phase_ref(
+            "CUSTOM_PHASE_REF".to_string(),
+            "ref_val".to_string(),
+            String::new(),
+            Some(PhaseVarRef {
+                app_id: "app1".to_string(),
+                app_name: "api".to_string(),
+                env_id: "env1".to_string(),
+                env_name: "prod".to_string(),
+                path: "/".to_string(),
+                secret_key: "REF".to_string(),
+            }),
+        ));
+
+        // Collection 1 is a Phase.dev collection with two variables (one overrides MANUAL_VAR if enabled)
+        let phase_coll = Collection::new_phase(
+            "phase_prod".to_string(),
+            PhaseBinding {
+                app_id: "app1".to_string(),
+                app_name: "api".to_string(),
+                env_id: "env1".to_string(),
+                env_name: "prod".to_string(),
+                export_all_paths: true,
+            },
+            vec![
+                ("MANUAL_VAR".to_string(), "from_phase".to_string(), String::new()),
+                ("PHASE_ONLY".to_string(), "p_val".to_string(), String::new()),
+            ],
+        );
+        app.data.collections.push(phase_coll);
+
+        // 1. Toggle manual var OFF with Space in Vars pane -> Effective falls back to phase_prod's MANUAL_VAR
+        app.focus = FocusPane::Vars;
+        app.selected_collection = 0;
+        app.selected_var = 0;
+        app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert!(!app.data.collections[0].vars[0].enabled);
+
+        let eff = app.data.compute_effective_vars();
+        let map: std::collections::HashMap<_, _> = eff.iter().map(|v| (v.key.as_str(), v)).collect();
+        assert_eq!(map["MANUAL_VAR"].value, "from_phase");
+        assert_eq!(map["MANUAL_VAR"].winning_owner, "phase_prod");
+
+        // Pressing Ctrl+E on MANUAL_VAR in Effective pane targets the winning Phase.dev var (blocked from manual edit), NOT the disabled custom var
+        app.focus = FocusPane::Effective;
+        app.selected_effective = eff.iter().position(|v| v.key == "MANUAL_VAR").unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert!(app.is_error_status);
+        app.status_message.clear();
+
+        // 2. Toggle Phase-ref var OFF via mouse click on checkbox [✓] in Vars pane
+        app.focus = FocusPane::Vars;
+        app.selected_collection = 0;
+        let (_, _, vars_rect, _, _) = compute_layout_chunks(area);
+        let row1_y = vars_rect.y + 4; // row 0 is +3, row 1 is +4
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: vars_rect.x + 5,
+            row: row1_y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!app.data.collections[0].vars[1].enabled);
+        assert!(matches!(app.modal, Modal::None));
+
+        // 3. Toggle variable inside Phase.dev collection using context menu & Space
+        app.selected_collection = 1;
+        app.selected_var = 1; // PHASE_ONLY
+        app.open_context_menu_for_pane(FocusPane::Vars, 10, 10);
+        let menu = app.context_menu.as_ref().expect("context menu open");
+        assert!(menu.items.iter().any(|i| i.label == "Disable Variable" && i.action == ContextAction::ToggleVar));
+        app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert!(app.context_menu.is_none());
+        assert!(!app.data.collections[1].vars[1].enabled);
+
+        // Render and verify checkboxes appear in Vars pane
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..buffer.area.height)
+            .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("[✓] MANUAL_VAR"));
+        assert!(screen.contains("[ ] PHASE_ONLY"));
+
+        // 4. Disabling phase_prod collection disables ALL its variables regardless of individual states
+        app.focus = FocusPane::Collections;
+        app.selected_collection = 1;
+        app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert!(!app.data.collections[1].enabled);
+        assert!(app.data.compute_effective_vars().is_empty());
+
+        // Re-enabling phase_prod restores ONLY individually enabled MANUAL_VAR (PHASE_ONLY remains OFF)
+        app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert!(app.data.collections[1].enabled);
+        let eff_re = app.data.compute_effective_vars();
+        assert_eq!(eff_re.len(), 1);
+        assert_eq!(eff_re[0].key, "MANUAL_VAR");
     }
 }

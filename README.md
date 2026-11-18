@@ -51,7 +51,7 @@ When you want to sync secrets from Phase.dev:
 | Key | Action |
 |---|---|
 | `Ctrl+N` | Create a new collection |
-| `Space` | Toggle selected collection ON / OFF |
+| `Space` | Toggle selected collection or variable ON / OFF |
 | `u` / `d` | Move collection priority up / down |
 | `Ctrl+A` | Add a custom environment variable |
 | `Ctrl+E` / `Enter` | Edit selected collection or variable |
