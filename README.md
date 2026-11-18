@@ -1,84 +1,104 @@
 # envmgr
 
-Super lightweight TUI environment manager written in Rust with whole-state AEAD encryption (`ChaCha20-Poly1305`), Phase.dev sync, and zero-plaintext runtime bash shell injection.
+A terminal UI and CLI environment variable manager with layered collections, encrypted local storage, live shell synchronization, and optional [Phase.dev](https://phase.dev) integration.
 
 ---
 
-## Quick Setup
+## Why `envmgr`?
 
-1. **Build & Symlink**:
-   ```bash
-   cargo build --release
-   mkdir -p ~/.local/bin
-   ln -sf "$(pwd)/target/release/envmgr" ~/.local/bin/envmgr
-   ```
-   Now you can run `envmgr` from anywhere.
+If you can already put variables in `~/.bashrc`, system settings, or run a secret manager CLI like `phase` directly, why use another tool?
 
-2. **Shell Integration**:
-   Run `envmgr` once or run `envmgr reload`. It stores your entire state encrypted in `~/.config/envmgr/state.enc` and adds a tiny runtime hook (`eval "$(command envmgr export 2>/dev/null)"`) to `~/.bashrc`.
-   - Plaintext variable names and secret values are **never** written to disk or `.bashrc`.
-   - The `envmgr` shell wrapper function automatically evaluates updated variables in your active terminal session whenever you exit the TUI or run `envmgr reload`—no need to manually run `source ~/.bashrc`.
+- **System & shell configs don't scale across contexts.** Storing variables in `~/.bashrc` or `.env` files leaves secrets in plaintext on disk, makes switching between projects or environments error-prone, and leaves stale variables exported in open terminals until you manually `unset` them or restart your shell.
+- **Secret manager CLIs aren't built for everyday local overrides.** Running commands through `phase run` wraps every invocation, assumes network availability, and makes it awkward to toggle temporary local overrides alongside remote secrets.
 
----
+`envmgr` bridges both workflows:
 
-## How It Works
-
-- **Encrypted State (`state.enc`)**:
-  - Collections, variable keys, values, and Phase.dev tokens are serialized and encrypted with `ChaCha20-Poly1305` using a hardcoded source key (`HARDCODED_MASTER_KEY` in `src/model.rs`). Changing the encryption key requires updating the source code and rebuilding.
-- **Collections & Priority**:
-  - `Collections`: Can be toggled on/off independently. A predefined `default` collection is provided on initial setup and can be edited, renamed, deleted, or toggled like any other collection.
-  - `Priority (Top Wins)`: When multiple collections are enabled, the collection highest in the list (index #1) takes precedence and overwrites duplicate keys from lower collections. Reorder collection priority anytime using `u` (move up) or `d` (move down).
-- **Clean Unsets**:
-  - When you disable a collection, its variables don't linger in your shell session—`envmgr` tracks exported keys via `_ENVMGR_KEYS` and unsets removed ones on reload.
+- **Layered collections with top-wins priority** — Organize variables into independent collections (such as `default`, `staging`, or `local-overrides`), toggle any collection or individual variable on/off, and reorder priority so the highest collection overrides duplicate keys.
+- **Live shell sync without restarting** — Saving updates your active terminal immediately and automatically refreshes other open Bash sessions on their next prompt, cleanly unsetting variables from disabled collections.
+- **Encrypted at rest, offline-first** — Secrets are stored in an encrypted local file (`~/.config/envmgr/state.enc`) rather than plaintext in `~/.bashrc`, so everything works offline while still letting you pull from Phase.dev when needed.
+- **Manual and remote secrets side by side** — Combine custom local variables and Phase.dev-synced collections in one effective environment without mixing or overwriting your manual entries.
 
 ---
 
-## Phase.dev Sync (Optional)
+## Installation
 
-Phase.dev connection is completely optional. You can use `envmgr` 100% offline with manual variables.
+### Quick Install (Prebuilt Binary)
 
-When you want to sync secrets from Phase.dev:
-1. Press `c` to open the connection dialog.
-2. Select **Cloud** (uses `https://console.phase.dev`) or **Self-Hosted** (enter your custom console URL).
-3. Paste your Personal Access Token (PAT) or Service Token (`pss_user:v1:...` / `pss_service:v2:...`).
-4. Pull secrets into an existing collection (`p`) or when creating a new collection (`n`).
-5. Custom manual variables and Phase secrets coexist in the same collection.
+Install the latest release binary for Linux (`x86_64`, `aarch64`) or macOS (`Intel`, `Apple Silicon`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dsnbyte/envmgr/main/install.sh | sh
+```
+
+By default, the binary is installed to `~/.local/bin/envmgr`. You can customize the installation directory or target a specific release version:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dsnbyte/envmgr/main/install.sh | ENVMGR_INSTALL_DIR=/usr/local/bin ENVMGR_VERSION=v0.1.0 sh
+```
+
+### Build from Source
+
+Requires the [Rust toolchain](https://rustup.rs/):
+
+```sh
+git clone https://github.com/dsnbyte/envmgr.git
+cd envmgr
+cargo build --release
+mkdir -p ~/.local/bin
+ln -sf "$(pwd)/target/release/envmgr" ~/.local/bin/envmgr
+```
+
+Ensure `~/.local/bin` is included in your `PATH`.
+
+### Shell Setup
+
+Run `envmgr` once to open the TUI (or run `envmgr reload`). `envmgr` automatically registers a small shell hook in `~/.bashrc` to evaluate active variables in new shells, wrap `envmgr` for instant in-session updates, and sync changes across open terminals. Plaintext secret names and values are never written to `~/.bashrc`.
 
 ---
 
-## Keyboard Shortcuts
+## Usage
+
+### CLI Commands
+
+| Command | Description |
+|---|---|
+| `envmgr` | Launch the interactive TUI |
+| `envmgr reload` | Save encrypted state, verify `~/.bashrc` integration, and reload the active shell |
+| `envmgr apply` | Alias for `envmgr reload` |
+| `envmgr sync` | Sync all Phase.dev-backed collections using configured authentication |
+| `envmgr export` | Print shell `export` / `unset` statements for the effective environment |
+| `envmgr status` | Show store location, Phase.dev status, collections, and effective variables |
+| `envmgr --help` | Print CLI usage information |
+
+### TUI Keyboard Shortcuts
 
 | Key | Action |
 |---|---|
 | `Ctrl+N` | Create a new collection |
-| `Space` | Toggle selected collection or variable ON / OFF |
-| `u` / `d` | Move collection priority up / down |
-| `Ctrl+A` | Add a custom environment variable |
+| `Space` | Toggle selected collection or variable on/off |
+| `u` / `d` | Move selected collection priority up / down (top wins) |
+| `Ctrl+A` | Add a custom variable |
 | `Ctrl+E` / `Enter` | Edit selected collection or variable |
 | `Delete` | Delete selected collection or variable |
 | `Ctrl+R` | Show or hide masked secret values |
-| `Ctrl+B` | Sync selected environment |
-| `Ctrl+Shift+B` | Sync all environments |
+| `Ctrl+B` | Sync selected Phase.dev collection |
+| `Ctrl+Shift+B` | Sync all Phase.dev collections |
 | `Ctrl+S` | Save encrypted state and reload shell environment |
-| `Ctrl+P` | Open application settings |
-| `Tab` / `Shift+Tab` | Cycle focus between panes |
-| `?` | Toggle shortcut info & help |
-| `q` | Quit application |
+| `Ctrl+P` | Open settings (Phase.dev connection & preferences) |
+| `Tab` / `Shift+Tab` | Switch focus between panes |
+| `?` | Toggle help overlay |
+| `q` | Quit |
+
+Mouse navigation and context menus are also supported inside the TUI.
 
 ---
 
-## CLI Subcommands
+## Phase.dev Integration (Optional)
 
-- `envmgr` — Launch interactive TUI.
-- `envmgr reload` (or `envmgr apply`) — Save encrypted `state.enc`, verify `~/.bashrc`, and reload active shell environment.
-- `envmgr export` — Decrypt active variables from `state.enc` and output shell export statements to stdout.
-- `envmgr status` — Print active collections and effective variable breakdown.
+`envmgr` works standalone without an account. When you want to pull secrets from Phase.dev:
 
----
+1. Press `Ctrl+P` to open Settings and configure your Phase.dev connection (either **Phase CLI** authentication or a **Personal / Service Token** for Cloud or Self-Hosted instances).
+2. Press `Ctrl+N` and choose to pull from Phase.dev to bind a new collection to an app and environment.
+3. Press `Ctrl+B` to sync the selected collection, `Ctrl+Shift+B` to sync all Phase.dev collections, or run `envmgr sync` from the CLI.
 
-## Development Note
-
-Because `~/.local/bin/envmgr` points to `target/release/envmgr`, **always build in release mode** after code changes:
-```bash
-cargo test && cargo build --release
-```
+Phase-synced collections and manual collections remain cleanly separated by source so remote syncs never overwrite local custom variables.
