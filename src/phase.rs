@@ -1010,21 +1010,31 @@ pub fn fetch_apps_and_envs(config: &PhaseConfig) -> Result<Vec<PhaseAppInfo>, St
     Ok(apps)
 }
 
-/// Fetches and decrypts all secrets (including folder path and comment) for a given App and Environment from Phase.dev.
-pub fn fetch_detailed_secrets_for_env(
+struct FetchedEnvSecrets {
+    items: Vec<PhaseSecretItem>,
+    app_name: Option<String>,
+    env_name: Option<String>,
+}
+
+fn fetch_detailed_secrets_for_env_with_meta(
     config: &PhaseConfig,
     app_id: &str,
     env_id: &str,
     env_name_hint: Option<&str>,
     export_all_paths: bool,
-) -> Result<Vec<PhaseSecretItem>, String> {
+) -> Result<FetchedEnvSecrets, String> {
     if config.auth_method == PhaseAuthMethod::Cli {
-        return fetch_detailed_secrets_for_env_via_cli(
+        let items = fetch_detailed_secrets_for_env_via_cli(
             app_id,
             env_id,
             env_name_hint,
             export_all_paths,
-        );
+        )?;
+        return Ok(FetchedEnvSecrets {
+            items,
+            app_name: None,
+            env_name: None,
+        });
     }
 
     let pss = PssToken::parse(&config.pat_token)?;
@@ -1136,7 +1146,29 @@ pub fn fetch_detailed_secrets_for_env(
         .unwrap_or(&target_env_name);
     resolve_secret_references(&mut items, &target_app_name, effective_env);
     items.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.path.cmp(&b.path)));
-    Ok(items)
+    Ok(FetchedEnvSecrets {
+        items,
+        app_name: (!target_app_name.is_empty()).then_some(target_app_name),
+        env_name: (!target_env_name.is_empty()).then_some(target_env_name),
+    })
+}
+
+/// Fetches and decrypts all secrets (including folder path and comment) for a given App and Environment from Phase.dev.
+pub fn fetch_detailed_secrets_for_env(
+    config: &PhaseConfig,
+    app_id: &str,
+    env_id: &str,
+    env_name_hint: Option<&str>,
+    export_all_paths: bool,
+) -> Result<Vec<PhaseSecretItem>, String> {
+    Ok(fetch_detailed_secrets_for_env_with_meta(
+        config,
+        app_id,
+        env_id,
+        env_name_hint,
+        export_all_paths,
+    )?
+    .items)
 }
 
 /// Fetches and decrypts all secrets for a given App and Environment from Phase.dev.
@@ -1153,6 +1185,31 @@ pub fn fetch_secrets_for_env(
         .into_iter()
         .map(|it| (it.key, it.value, it.comment))
         .collect())
+}
+
+fn resolve_app_env_names(
+    cli_apps: Option<&[PhaseAppInfo]>,
+    app_id: &str,
+    env_id: &str,
+) -> (Option<String>, Option<String>) {
+    let Some(apps) = cli_apps else {
+        return (None, None);
+    };
+    for app in apps {
+        if !app_id.is_empty() && app.id != app_id {
+            continue;
+        }
+        if let Some(env) = app.environments.iter().find(|e| e.id == env_id) {
+            return (
+                (!app.name.is_empty()).then(|| app.name.clone()),
+                (!env.name.is_empty()).then(|| env.name.clone()),
+            );
+        }
+        if !app_id.is_empty() && app.id == app_id {
+            return ((!app.name.is_empty()).then(|| app.name.clone()), None);
+        }
+    }
+    (None, None)
 }
 
 /// Synchronizes Phase.dev collections and custom Phase-synced variables in `state`.
@@ -1199,20 +1256,47 @@ pub fn sync_phase_collections(
         return Ok((0, 0));
     }
 
+    let cli_apps = if state.phase.auth_method == PhaseAuthMethod::Cli {
+        fetch_apps_and_envs_via_cli().ok()
+    } else {
+        None
+    };
+
     let mut synced_collections = 0;
     let mut total_vars = 0;
-    let mut detailed_cache: HashMap<(String, String), Vec<PhaseSecretItem>> = HashMap::new();
+    let mut detailed_cache: HashMap<(String, String), FetchedEnvSecrets> = HashMap::new();
 
     for target in targets {
         match target {
-            SyncTarget::PhaseCollection(idx, binding) => {
-                let fetched = fetch_secrets_for_env(
+            SyncTarget::PhaseCollection(idx, mut binding) => {
+                let (cli_app_name, cli_env_name) =
+                    resolve_app_env_names(cli_apps.as_deref(), &binding.app_id, &binding.env_id);
+                if let Some(name) = cli_app_name {
+                    binding.app_name = name;
+                }
+                if let Some(name) = cli_env_name {
+                    binding.env_name = name;
+                }
+
+                let fetched_meta = fetch_detailed_secrets_for_env_with_meta(
                     &state.phase,
                     &binding.app_id,
                     &binding.env_id,
                     Some(&binding.env_name),
                     binding.export_all_paths,
                 )?;
+                if let Some(name) = fetched_meta.app_name {
+                    binding.app_name = name;
+                }
+                if let Some(name) = fetched_meta.env_name {
+                    binding.env_name = name;
+                }
+
+                let fetched: Vec<(String, String, String)> = fetched_meta
+                    .items
+                    .into_iter()
+                    .map(|it| (it.key, it.value, it.comment))
+                    .collect();
                 total_vars += fetched.len();
                 if let Some(coll) = state.collections.get_mut(idx) {
                     coll.set_phase_vars(binding, fetched);
@@ -1238,27 +1322,43 @@ pub fn sync_phase_collections(
                 for (app_id, env_id, env_name) in refs {
                     let cache_key = (app_id.clone(), env_id.clone());
                     if !detailed_cache.contains_key(&cache_key) {
-                        let items = fetch_detailed_secrets_for_env(
+                        let (cli_app_name, cli_env_name) =
+                            resolve_app_env_names(cli_apps.as_deref(), &app_id, &env_id);
+                        let effective_hint = cli_env_name.as_deref().unwrap_or(&env_name);
+                        let mut res = fetch_detailed_secrets_for_env_with_meta(
                             &state.phase,
                             &app_id,
                             &env_id,
-                            Some(&env_name),
+                            Some(effective_hint),
                             true,
                         )?;
-                        detailed_cache.insert(cache_key, items);
+                        if res.app_name.is_none() {
+                            res.app_name = cli_app_name;
+                        }
+                        if res.env_name.is_none() {
+                            res.env_name = cli_env_name;
+                        }
+                        detailed_cache.insert(cache_key, res);
                     }
                 }
 
                 if let Some(coll) = state.collections.get_mut(idx) {
                     let mut synced_any = false;
                     for var in &mut coll.vars {
-                        let Some(pref) = &var.phase_ref else {
+                        let Some(pref) = &mut var.phase_ref else {
                             continue;
                         };
                         let cache_key = (pref.app_id.clone(), pref.env_id.clone());
-                        if let Some(items) = detailed_cache.get(&cache_key) {
+                        if let Some(cached) = detailed_cache.get(&cache_key) {
+                            if let Some(app_name) = &cached.app_name {
+                                pref.app_name = app_name.clone();
+                            }
+                            if let Some(env_name) = &cached.env_name {
+                                pref.env_name = env_name.clone();
+                            }
                             let target_path = pref.normalized_path();
-                            let found = items
+                            let found = cached
+                                .items
                                 .iter()
                                 .find(|s| {
                                     normalize_secret_path(&s.path) == target_path
@@ -1266,7 +1366,7 @@ pub fn sync_phase_collections(
                                 })
                                 .or_else(|| {
                                     if target_path == "/" {
-                                        items.iter().find(|s| s.key == pref.secret_key)
+                                        cached.items.iter().find(|s| s.key == pref.secret_key)
                                     } else {
                                         None
                                     }
@@ -1556,5 +1656,204 @@ mod tests {
             Some("pss_service:v1:aa:bb:cc:dd")
         ));
         assert!(!should_strip_phase_service_token(false, None));
+    }
+
+    #[test]
+    fn test_resolve_app_env_names() {
+        let apps = vec![PhaseAppInfo {
+            id: "app-1".to_string(),
+            name: "renamed-app".to_string(),
+            environments: vec![PhaseEnvInfo {
+                id: "env-1".to_string(),
+                name: "renamed-env".to_string(),
+                identity_key: String::new(),
+                wrapped_seed: String::new(),
+                wrapped_salt: String::new(),
+                cached_secrets: Vec::new(),
+            }],
+        }];
+
+        let (app_name, env_name) = resolve_app_env_names(Some(&apps), "app-1", "env-1");
+        assert_eq!(app_name.as_deref(), Some("renamed-app"));
+        assert_eq!(env_name.as_deref(), Some("renamed-env"));
+
+        let (missing_app, missing_env) = resolve_app_env_names(Some(&apps), "app-999", "env-1");
+        assert!(missing_app.is_none());
+        assert!(missing_env.is_none());
+    }
+
+    #[test]
+    fn test_sync_phase_collections_updates_app_name() {
+        use crate::model::{Collection, EnvVar, PhaseBinding, PhaseVarRef, VarSource};
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        fn encrypt_xchacha_raw(plaintext: &[u8], key: &[u8; 32], nonce: &[u8; 24]) -> Vec<u8> {
+            let cipher = XChaCha20Poly1305::new(key.into());
+            let mut ct = cipher
+                .encrypt(XNonce::from_slice(nonce), plaintext)
+                .unwrap();
+            ct.extend_from_slice(nonce);
+            ct
+        }
+
+        fn encrypt_asym(plaintext: &[u8], srv_pub_hex: &str, cli_seed_hex: &str) -> String {
+            let (cli_pub_hex, cli_priv_hex) = generate_env_keypair(cli_seed_hex).unwrap();
+            let srv_pk = decode_hex_32(srv_pub_hex, "srv_pk").unwrap();
+            let cli_pk = decode_hex_32(&cli_pub_hex, "cli_pk").unwrap();
+            let cli_sk = decode_hex_32(&cli_priv_hex, "cli_sk").unwrap();
+            let shared = x25519_dalek::x25519(cli_sk, srv_pk);
+            let mut h = Blake2b512::new();
+            Digest::update(&mut h, shared);
+            Digest::update(&mut h, cli_pk);
+            Digest::update(&mut h, srv_pk);
+            let digest = h.finalize();
+            let mut tx = [0u8; 32];
+            tx.copy_from_slice(&digest[32..64]);
+            let ct = encrypt_xchacha_raw(plaintext, &tx, &[5u8; 24]);
+            format!("ph:v1:{}:{}", cli_pub_hex, BASE64.encode(&ct))
+        }
+
+        // Keypair for user PSS token
+        let keyshare0 = "11".repeat(32);
+        let keyshare1 = "22".repeat(32);
+        let app_priv_hex = reconstruct_secret(&keyshare0, &keyshare1).unwrap();
+        let app_sk = decode_hex_32(&app_priv_hex, "app_sk").unwrap();
+        let app_pk = x25519_dalek::x25519(app_sk, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let app_pub_hex = hex::encode(app_pk);
+
+        let unwrap_key_hex = "33".repeat(32);
+        let unwrap_key = decode_hex_32(&unwrap_key_hex, "unwrap_key").unwrap();
+        let wrapped_key_share_hex = hex::encode(encrypt_xchacha_raw(
+            keyshare1.as_bytes(),
+            &unwrap_key,
+            &[4u8; 24],
+        ));
+
+        let pat_token = format!(
+            "pss_user:v1:{}:{}:{}:{}",
+            "aa".repeat(32),
+            app_pub_hex,
+            keyshare0,
+            unwrap_key_hex
+        );
+
+        let env_seed_hex = "44".repeat(32);
+        let (env_pub_hex, _) = generate_env_keypair(&env_seed_hex).unwrap();
+        let wrapped_seed = encrypt_asym(env_seed_hex.as_bytes(), &app_pub_hex, &"55".repeat(32));
+
+        let enc_key = encrypt_asym(b"API_KEY", &env_pub_hex, &"66".repeat(32));
+        let enc_val = encrypt_asym(b"secret-123", &env_pub_hex, &"66".repeat(32));
+
+        let tokens_body = serde_json::json!({
+            "wrapped_key_share": wrapped_key_share_hex,
+            "apps": [{
+                "id": "app-uuid-1",
+                "name": "new-app-name",
+                "environment_keys": [{
+                    "environment": { "id": "env-uuid-1", "name": "production" },
+                    "identity_key": env_pub_hex,
+                    "wrapped_seed": wrapped_seed,
+                    "wrapped_salt": ""
+                }]
+            }]
+        })
+        .to_string();
+
+        let secrets_body = serde_json::json!([{
+            "key": enc_key,
+            "value": enc_val,
+            "path": "/",
+            "comment": ""
+        }])
+        .to_string();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let first_line = req.lines().next().unwrap_or("");
+                let body = if first_line.contains("/service/secrets/tokens/") {
+                    &tokens_body
+                } else {
+                    &secrets_body
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+
+        let mut state = AppStateData::default();
+        state.phase = PhaseConfig {
+            auth_method: PhaseAuthMethod::Token,
+            host_mode: HostMode::SelfHosted,
+            custom_url: format!("http://{}", addr),
+            pat_token,
+        };
+
+        let phase_coll = Collection::new_phase(
+            "my-phase-coll".to_string(),
+            PhaseBinding {
+                app_id: "app-uuid-1".to_string(),
+                app_name: "old-app-name".to_string(),
+                env_id: "env-uuid-1".to_string(),
+                env_name: "production".to_string(),
+                export_all_paths: true,
+            },
+            vec![("API_KEY".to_string(), "old-val".to_string(), String::new())],
+        );
+
+        let mut custom_coll = Collection::new_custom("my-custom-coll".to_string());
+        custom_coll.vars.push(EnvVar::with_phase_ref(
+            "CUSTOM_KEY".to_string(),
+            "old-val".to_string(),
+            String::new(),
+            Some(PhaseVarRef {
+                app_id: "app-uuid-1".to_string(),
+                app_name: "old-app-name".to_string(),
+                env_id: "env-uuid-1".to_string(),
+                env_name: "production".to_string(),
+                path: "/".to_string(),
+                secret_key: "API_KEY".to_string(),
+            }),
+        ));
+
+        state.collections = vec![phase_coll, custom_coll];
+
+        let (synced_colls, total_vars) = sync_phase_collections(&mut state, None).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(synced_colls, 2);
+        assert_eq!(total_vars, 2);
+
+        let synced_phase = &state.collections[0];
+        assert_eq!(
+            synced_phase.phase_binding.as_ref().unwrap().app_name,
+            "new-app-name"
+        );
+        assert_eq!(synced_phase.source_label(), "Phase (new-app-name/production)");
+        assert_eq!(
+            synced_phase.vars[0].source,
+            VarSource::Phase {
+                app_name: "new-app-name".to_string(),
+                env_name: "production".to_string(),
+            }
+        );
+
+        let synced_custom = &state.collections[1];
+        assert_eq!(
+            synced_custom.vars[0].phase_ref.as_ref().unwrap().app_name,
+            "new-app-name"
+        );
+        assert_eq!(synced_custom.vars[0].value, "secret-123");
     }
 }
