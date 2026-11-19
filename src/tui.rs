@@ -8205,6 +8205,7 @@ mod tests {
     fn test_phase_auth_vertical_arrow_navigation() {
         let mut app = make_test_app();
         app.data.phase.host_mode = HostMode::Cloud;
+        app.data.phase.auth_method = PhaseAuthMethod::Cli;
         app.open_settings_modal_with_tab(SettingsTab::PhaseAuth, None, None);
 
         // Initial state on PhaseAuth: active_field = 0, auth_method = Cli
@@ -8473,6 +8474,8 @@ mod tests {
         assert_eq!(app.pending_phase_sync, None);
 
         // 9. Sync all environments: Ctrl+Shift+B
+        app.data.phase.auth_method = PhaseAuthMethod::Token;
+        app.data.phase.pat_token = "pss_user:test-token".to_string();
         app.data.collections.push(Collection::new_phase(
             "phase_test".to_string(),
             PhaseBinding {
